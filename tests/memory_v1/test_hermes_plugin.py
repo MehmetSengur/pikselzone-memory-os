@@ -84,9 +84,9 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
     def test_permission_bootstrap_keeps_pzmemory_traversal_minimal(self):
         script = (Path(__file__).resolve().parent.parent.parent / "scripts" / "pz-memory-permissions-bootstrap").read_text(encoding="utf-8")
         self.assertIn('u:pzmemory:--x,g::---,m::--x', script)
-        self.assertIn('--clear-groups', script)
-        self.assertIn('/usr/bin/test -x', script)
-        self.assertIn('/usr/bin/test -r', script)
+        self.assertIn("grep -qx 'user:pzmemory:--x'", script)
+        self.assertIn("grep -qx 'group::---'", script)
+        self.assertIn("grep -qx 'mask::--x'", script)
 
     def test_operator_assets_restore_traversal_before_unprivileged_consumers(self):
         root = Path(__file__).resolve().parent.parent.parent
@@ -98,7 +98,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         self.assertIn('Requires=pz-memory-permissions-bootstrap.service', publisher_unit)
         self.assertIn('Requires=pz-memory-permissions-bootstrap.service', compiler_unit)
         self.assertIn('ReadWritePaths=/srv/pz-hermes/hermes-data', bootstrap_unit)
-        self.assertNotIn('NoNewPrivileges=true', bootstrap_unit)
+        self.assertIn('NoNewPrivileges=true', bootstrap_unit)
 
     def test_double_flush_prevention(self):
         plugin = load_hermes_plugin()
