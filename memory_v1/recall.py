@@ -57,7 +57,7 @@ TARGETED_RECALL_DEFAULT_BUDGET = 8000
 
 # High-risk directive patterns to sanitize from recalled memory
 DIRECTIVE_PATTERNS = (
-    re.compile(r"(?i)ignore\s+(all|any|the|previous|prior)\s+(instructions|directives|prompts|rules)"),
+    re.compile(r"(?i)ignore\s+(?:(?:all|any|the|previous|prior)\s+)*(?:instructions|directives|prompts|rules)"),
     re.compile(r"(?i)(system\s+prompt|developer\s+message|developer\s+mode|jailbreak)"),
     re.compile(r"(?i)(run\s+this\s+command|execute\s+this|exec\s+this|eval\b|shell_exec)"),
     re.compile(r"(?i)(disable|bypass|deactivate)\s+(policy|guard|safety|security|overnight)"),

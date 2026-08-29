@@ -224,6 +224,23 @@ class KnowledgeGraphEngine:
 
         return target_path
 
+    def connect_concepts(
+        self,
+        slug_a: str,
+        slug_b: str,
+        relation: str = "bağlantı",
+        strength: float = 0.8,
+        sources: list[str] | None = None,
+    ) -> Path:
+        """Alias to add_or_update_connection for graph integration."""
+        return self.add_or_update_connection(
+            concept_a=slug_a,
+            concept_b=slug_b,
+            relationship=relation,
+            evidence=sources,
+            source=sources[0] if sources else "graph",
+        )
+
     def add_or_update_connection(
         self,
         concept_a: str,

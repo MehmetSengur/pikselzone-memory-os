@@ -26,12 +26,13 @@ logger = logging.getLogger("memory_v1.skill_engine")
 @dataclasses.dataclass
 class WorkflowObservation:
     workflow_name: str
-    goal: str
-    steps: list[str]
-    tools_or_scripts: list[str]
-    session_id: str
+    goal: str = ""
+    steps: list[str] = dataclasses.field(default_factory=list)
+    tools_or_scripts: list[str] = dataclasses.field(default_factory=list)
+    session_id: str = "session"
     success: bool = True
     edge_cases: list[str] = dataclasses.field(default_factory=list)
+    trigger: str = ""
 
 
 @dataclasses.dataclass
@@ -204,6 +205,8 @@ class SkillEngine:
             return self.materialize_skill(spec)
 
         return None
+
+    record_workflow = record_workflow_observation
 
     def materialize_skill(self, spec: SkillSpec) -> Path:
         """Render and save a standard production-ready SKILL.md."""
