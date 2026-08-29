@@ -268,8 +268,82 @@ CLAUDE_TO_CODEX_NATIVE_RECALL=PASS
 CODEX_TO_CLAUDE_NATIVE_RECALL=PASS
 DOCTOR_NATIVE_EVIDENCE_PASS=PASS
 LOCAL_SECOND_BRAIN_V2=PASS
-HERMES_V2_DEPLOY_REQUIRED=YES
-REMAINING_BLOCKERS=NONE (Hermes VPS deployment held pending user authorization)
+HERMES_V2_DEPLOY_REQUIRED=NO (Deployed to production pz-hermes)
+REMAINING_BLOCKERS=NONE
 ```
+
+---
+
+## 17. Hermes Production Deployment & Three-Runtime Acceptance
+
+### 17.1 Preflight & Bounded Rollback Checkpoint
+- **Target Host**: `pz-hermes` (Ubuntu 24.04, Linux 6.8.0, uptime 36+ days).
+- **Rollback Checkpoint Created**: `/var/backups/pz-memory-rollback-20260829-v1`
+  - Preserved `/opt/pz-memory-v1`, all 5 plugin copies in `/srv/pz-hermes/hermes-data/`, systemd unit files, `/etc/pz-memory-v1/engine.json`, and `/srv/pz-hermes/policy/`.
+  - Checkpoint integrity: `MANIFEST.sha256` (87 files validated) and executable `rollback.sh`.
+
+### 17.2 Deployed Code & Plugin Drift Alignment
+- **Application Core**: `/opt/pz-memory-v1/memory_v1/` updated with Second Brain V2 pipeline (publisher auto-promotes to companion Last-Session/Journal, RuleLearner, KnowledgeGraphEngine, SkillEngine).
+- **Hermes Plugins (5 copies)**:
+  - Base: `/srv/pz-hermes/hermes-data/plugins/pz-memory-v1`
+  - Profile 1: `.../profiles/pz-orchestrator/plugins/pz-memory-v1`
+  - Profile 2: `.../profiles/pz-agency-analyst/plugins/pz-memory-v1`
+  - Profile 3: `.../profiles/pz-engineering-planner/plugins/pz-memory-v1`
+  - Profile 4: `.../profiles/pz-reviewer/plugins/pz-memory-v1`
+  - Plugin SHA256: `086b09dcb5a8156c1e4deb0ce0228a3209fa05539e4265da695ee08fafa99cdf` across all 5 locations (`drift=0`).
+- **Policy Integrity**: `/srv/pz-hermes/policy/policy-manifest.tsv` updated and verified.
+  - `/usr/local/sbin/pz-policy-guard` exits `0` (clean, 0 violations).
+  - Container `pz-hermes`: `Up (healthy)`.
+
+### 17.3 Hermes Native Canary & Knowledge Growth
+- **Canary 1 (Durable Rule)**: `SB2-HERMES-CANARY-9a2e5f`
+  - Hermes Session: `20260829_205637_bea9b6`
+  - Lifecycle Receipt: Recorded natively by `/opt/hermes/hermes_cli/plugins.py:invoke_hook` (`native_invoke=true`).
+  - Summarizer: Hermes native `PluginLlm` (`gpt-5.4-mini-2026-03-17`, isolated provider `custom`).
+  - Outbox -> Vault: Published to `/srv/pz-hermes/vault/daily/2026-08-29/hermes-708e9cfb9b85b30a8726f2de26ff0b58.md`.
+  - Rule Learned: Added to `companion/Kurallar.md`:
+    `- **kural:** Yeni kalıcı tercihim: ORION etiketli deployment raporlarında rollback durumunu her zaman sonuç bölümünün hemen ardına ekle | **neden:** Kullanıcının açık kalıcı direktifi | **kaynak:** hermes-20260829_205637_bea9b6 | **durum:** aktif`
+- **Canary 2 (Knowledge Graph Growth)**: `SB2-HERMES-NOVA-BRIDGE-5f21a4`
+  - Hermes Session: `20260829_205721_b97c68`
+  - Staged & Published: `/srv/pz-hermes/vault/daily/2026-08-29/hermes-7a2eca1fdf6304335d391380cd5e6dc7.md`.
+  - Concept Materialized: `/srv/pz-hermes/vault/knowledge/concepts/sb2-hermes-nova-bridge-5f21a4.md`.
+  - Connection Materialized: `/srv/pz-hermes/vault/knowledge/connections/orion--sb2-hermes-nova-bridge-5f21a4.md` (`orion ↔ sb2-hermes-nova-bridge-5f21a4`).
+
+### 17.4 Three-Runtime Cross-Recall Verification
+1. **Hermes -> Claude**:
+   - Query in fresh unprimed `claude -p`: *"ORION etiketli deployment raporları için hafızada kayıtlı kural veya kullanıcı tercihi nedir? Kuralı ve kanıtını hafızandan aktar."*
+   - Result: Claude returned the exact rule verbatim, citing `companion/Kurallar.md`, provenance `hermes-20260829_205637_bea9b6`, daily events `hermes-05c712668026f5d73caa52e55a6c0184.md` and `hermes-708e9cfb9b85b30a8726f2de26ff0b58.md`, and knowledge nodes `concepts/orion` and `connections/orion--sb2-hermes-nova-bridge-5f21a4`.
+2. **Hermes -> Codex**:
+   - Query in fresh unprimed Codex session: *"Hafızada (veya startup context'inde) ORION etiketli deployment raporları hakkında kayıtlı kural ve kanıt nedir? Hafızandan aktar."*
+   - Result: Codex triggered `SessionStart` hook, loaded startup bundle, and returned the rule verbatim, citing `companion/Kurallar.md` and source session `hermes-20260829_205637_bea9b6`.
+3. **Claude/Codex -> Hermes**:
+   - Query in fresh unprimed Hermes session: *"Hafızanda Dockerfile hazırlama veya teknik rapor formatlama konusunda kayıtlı kalıcı kurallar nelerdir? Kuralları ve kaynaklarını hafızandan aktar."*
+   - Result: Hermes quoted the Dockerfile multi-stage build rule (`claude-07272cd423a3e22150561d37236f517b`), technical report conclusion-first rule (`claude-3af4731dc331427aea379791e1558917`), and Mercury report rule (`codex-test`), while noting that memory is derived and subject to operational truth hierarchy.
+
+### 17.5 Production Acceptance Variables
+```
+PROD_DEPLOY_STATUS=PASS
+PROD_ROLLBACK_CHECKPOINT_PATH=/var/backups/pz-memory-rollback-20260829-v1
+PROD_POLICY_GUARD=PASS
+PROD_CONTAINER_STATUS=Up (healthy)
+PROD_HERMES_DRIFT=0 (5/5 identical)
+HERMES_NATIVE_CANARY_SESSION=20260829_205637_bea9b6
+HERMES_NATIVE_EVENT_PATH=/srv/pz-hermes/vault/daily/2026-08-29/hermes-708e9cfb9b85b30a8726f2de26ff0b58.md
+HERMES_PROVENANCE=hermes-native-lifecycle
+HERMES_RULE_LEARNED=Yeni kalıcı tercihim: ORION etiketli deployment raporlarında rollback durumunu her zaman sonuç bölümünün hemen ardına ekle
+HERMES_KNOWLEDGE_CANARY_SESSION=20260829_205721_b97c68
+HERMES_CONCEPT_PATH=/srv/pz-hermes/vault/knowledge/concepts/sb2-hermes-nova-bridge-5f21a4.md
+HERMES_CONNECTION_PATH=/srv/pz-hermes/vault/knowledge/connections/orion--sb2-hermes-nova-bridge-5f21a4.md
+CROSS_RECALL_HERMES_TO_CLAUDE=PASS
+CROSS_RECALL_HERMES_TO_CODEX=PASS
+CROSS_RECALL_CLAUDE_TO_HERMES=PASS
+CROSS_RECALL_CODEX_TO_HERMES=PASS
+LOCAL_DOCTOR_STATUS=ok (fail: 0, blocked: 0, warning: 3)
+VPS_DOCTOR_STATUS=ok (fail: 0, blocked: 0, warning: 1)
+FULL_TESTS_LOCAL=PASS (211/211 passed in 6.574s)
+SECOND_BRAIN_V2_PRODUCTION=PASS
+REMAINING_BLOCKERS=NONE
+```
+
 
 
