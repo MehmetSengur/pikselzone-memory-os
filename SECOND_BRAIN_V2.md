@@ -29,7 +29,7 @@ Transform Pikselzone Memory OS from a passive, overly restrictive session logger
 - Memory engine failure resilience: child failures degrade gracefully without blocking agent sessions.
 
 ## Current Task
-SB2-09: Claude / Codex / Hermes shared-brain parity (same vault truth, cross-runtime recall across all three runtimes, unified router symlinks).
+SB2-10: Provider hardening, secret isolation & degraded resilience (scrub API envs in child processes, remove raw stdin dumps in hook_runner, prevent silent OpenAI API fallback, Hermes degraded mode on staged bundle failure).
 
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
@@ -41,9 +41,9 @@ SB2-09: Claude / Codex / Hermes shared-brain parity (same vault truth, cross-run
 - **SB2-06**: Self-generating & self-updating skills (`SkillEngine` tracking workflow repetition, auto-synthesizing standard `skills/<slug>/SKILL.md` upon 2+ repetitions, iterative version bumping and edge-case recording, seeding `beyin-doktor` and `gecmis-import`, with 3 targeted tests PASS).
 - **SB2-07**: Doctor -> Self-healing maintenance engine (`run_self_healing` with safe non-destructive repair of index.md, orphan wikilinks placeholder generation, stale lock/temporary cleanup, session state recovery, thread archiving, chronic health reset, and signed audit receipt generation, with 6 targeted tests PASS).
 - **SB2-08**: Controlled memory-engine self-modification (`SelfEvolutionEngine` with protected branch guards, pre-modification git checkpointing, test gating, automatic rollback on test failures, commit justification, and signed evolution receipts, with 3 targeted tests PASS).
+- **SB2-09**: Claude / Codex / Hermes shared-brain parity (`SharedBrainParityManager` linking CLAUDE.md/AGENTS.md, canonical skills store, shared companion and knowledge graph, cross-runtime recall across all runtimes, with 3 targeted tests PASS).
 
 ## Remaining Work
-- **SB2-09**: Claude / Codex / Hermes shared-brain parity (same vault truth, cross-runtime recall).
 - **SB2-10**: Provider hardening, secret isolation & degraded resilience (no silent API fallback, subprocess env scrubbing, hook retention cleanup).
 - **SB2-11**: History import engine (Claude, ChatGPT, Codex, Gemini, Markdown).
 - **SB2-12**: Red Teaming & Final multi-runtime acceptance verification.

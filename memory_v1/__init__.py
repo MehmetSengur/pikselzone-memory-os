@@ -9,6 +9,7 @@ from .companion import CompanionManager, LastSessionData, RuleItem, ThreadItem
 from .core import MemoryConfig, MemoryError
 from .doctor import run_doctor, run_self_healing
 from .graph_engine import ConceptData, KnowledgeGraphEngine
+from .parity import ParityReport, SharedBrainParityManager
 from .rule_learner import RuleLearner
 from .self_evolution import EvolutionProposal, EvolutionResult, SelfEvolutionEngine
 from .skill_engine import SkillEngine, SkillSpec, WorkflowObservation
@@ -22,9 +23,11 @@ __all__ = [
     "LastSessionData",
     "MemoryConfig",
     "MemoryError",
+    "ParityReport",
     "RuleItem",
     "RuleLearner",
     "SelfEvolutionEngine",
+    "SharedBrainParityManager",
     "SkillEngine",
     "SkillSpec",
     "ThreadItem",
