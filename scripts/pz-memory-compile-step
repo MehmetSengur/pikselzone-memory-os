@@ -11,6 +11,8 @@ if ! flock -n 200; then
     exit 75
 fi
 
+/usr/local/sbin/pz-memory-permissions-bootstrap
+
 STAGE_JSON=$(setpriv --reuid=pzmemory --regid=pzvault --clear-groups /usr/local/sbin/pz-memory --config /etc/pz-memory-v1/engine.json stage-knowledge-batch)
 STATUS=$(python3 -c "import sys, json; print(json.loads(sys.argv[1]).get('status', ''))" "$STAGE_JSON")
 
@@ -25,6 +27,10 @@ fi
 
 # Run container generator using isolated Hermes PluginLlm
 /usr/bin/docker exec -u 999:987 pz-hermes /opt/hermes/.venv/bin/python3 /opt/data/plugins/pz-memory-v1/knowledge_generator.py
+
+# The container-side runtime can modify its bind-mounted parent ACL. Restore
+# the minimal named traversal grant before the unprivileged host promoter.
+/usr/local/sbin/pz-memory-permissions-bootstrap
 
 # Run host promoter to validate candidates and advance ingestion ledger
 setpriv --reuid=pzmemory --regid=pzvault --clear-groups /usr/local/sbin/pz-memory --config /etc/pz-memory-v1/engine.json promote-knowledge

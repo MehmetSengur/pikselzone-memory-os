@@ -1,6 +1,7 @@
 [Unit]
 Description=Pikselzone Memory V1 Knowledge Compiler Pipeline
-After=network-online.target pz-obsidian-sync.service
+After=network-online.target pz-obsidian-sync.service pz-memory-permissions-bootstrap.service
+Requires=pz-memory-permissions-bootstrap.service
 Wants=network-online.target
 
 [Service]

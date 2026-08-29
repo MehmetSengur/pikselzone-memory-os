@@ -1,0 +1,18 @@
+[Unit]
+Description=Restore minimal pzmemory traversal for Hermes memory outbox
+Before=pz-memory-publisher.service pz-memory-compiler.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/pz-memory-permissions-bootstrap
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/pz-hermes/hermes-data
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true

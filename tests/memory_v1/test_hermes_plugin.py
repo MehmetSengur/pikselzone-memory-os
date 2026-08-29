@@ -88,6 +88,17 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         self.assertIn('/usr/bin/test -x', script)
         self.assertIn('/usr/bin/test -r', script)
 
+    def test_operator_assets_restore_traversal_before_unprivileged_consumers(self):
+        root = Path(__file__).resolve().parent.parent.parent
+        compiler_step = (root / "scripts" / "pz-memory-compile-step").read_text(encoding="utf-8")
+        publisher_unit = (root / "memory_v1" / "operator" / "pz-memory-publisher.service").read_text(encoding="utf-8")
+        compiler_unit = (root / "scripts" / "pz-memory-compiler.service").read_text(encoding="utf-8")
+        bootstrap_unit = (root / "memory_v1" / "operator" / "pz-memory-permissions-bootstrap.service").read_text(encoding="utf-8")
+        self.assertEqual(2, compiler_step.count('/usr/local/sbin/pz-memory-permissions-bootstrap'))
+        self.assertIn('Requires=pz-memory-permissions-bootstrap.service', publisher_unit)
+        self.assertIn('Requires=pz-memory-permissions-bootstrap.service', compiler_unit)
+        self.assertIn('ReadWritePaths=/srv/pz-hermes/hermes-data', bootstrap_unit)
+
     def test_double_flush_prevention(self):
         plugin = load_hermes_plugin()
         plugin._IN_MEMORY_COMPLETED.clear()
