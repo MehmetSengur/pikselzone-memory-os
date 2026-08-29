@@ -834,6 +834,38 @@ class RuntimeNativeTests(unittest.TestCase):
         self.assertEqual(event_path1, event_path2)
         self.assertFalse(qpath2.is_file())
 
+    def test_claude_hook_registration_rejects_empty_matcher(self):
+        from memory_v1.doctor import _hook_registration_row
+        settings_file = self.root / "claude-settings-test.json"
+
+        # 1. Valid hook with no matcher
+        valid_hooks = {
+            "hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "python3 -m memory_v1.hook_runner --runtime claude --event SessionStart"}]}],
+                "PreCompact": [{"hooks": [{"type": "command", "command": "python3 -m memory_v1.hook_runner --runtime claude --event PreCompact"}]}],
+                "SessionEnd": [{"hooks": [{"type": "command", "command": "python3 -m memory_v1.hook_runner --runtime claude --event SessionEnd"}]}],
+            }
+        }
+        settings_file.write_text(json.dumps(valid_hooks), encoding="utf-8")
+        row = _hook_registration_row("claude_hook_registration", settings_file, "claude")
+        self.assertEqual("pass", row["status"])
+
+        # 2. Hook with invalid empty matcher
+        invalid_hooks = {
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": "python3 -m memory_v1.hook_runner --runtime claude --event SessionStart"}]
+                }],
+                "PreCompact": [{"hooks": [{"type": "command", "command": "python3 -m memory_v1.hook_runner --runtime claude --event PreCompact"}]}],
+                "SessionEnd": [{"hooks": [{"type": "command", "command": "python3 -m memory_v1.hook_runner --runtime claude --event SessionEnd"}]}],
+            }
+        }
+        settings_file.write_text(json.dumps(invalid_hooks), encoding="utf-8")
+        row_invalid = _hook_registration_row("claude_hook_registration", settings_file, "claude")
+        self.assertEqual("fail", row_invalid["status"])
+        self.assertIn("invalid-empty-matcher", row_invalid["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

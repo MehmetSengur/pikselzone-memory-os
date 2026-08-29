@@ -374,6 +374,15 @@ def _hook_registration_row(
         ):
             registered = False
             break
+        # Guard against invalid/empty matchers that silence Claude lifecycle hooks
+        if runtime == "claude" and registered:
+            event_entries = hooks.get(event, [])
+            if isinstance(event_entries, list):
+                for entry in event_entries:
+                    if isinstance(entry, dict) and "matcher" in entry:
+                        val = entry.get("matcher")
+                        if val is not None and not str(val).strip():
+                            return _row(name, "fail", f"invalid-empty-matcher:{event}")
     return _row(name, "pass" if registered else "blocked", "registered" if registered else "not-registered")
 
 
