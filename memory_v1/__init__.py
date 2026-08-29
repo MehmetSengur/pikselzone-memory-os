@@ -7,6 +7,7 @@ derived context only.
 
 from .companion import CompanionManager, LastSessionData, RuleItem, ThreadItem
 from .core import MemoryConfig, MemoryError
+from .rule_learner import RuleLearner
 
 __all__ = [
     "CompanionManager",
@@ -14,5 +15,6 @@ __all__ = [
     "MemoryConfig",
     "MemoryError",
     "RuleItem",
+    "RuleLearner",
     "ThreadItem",
 ]

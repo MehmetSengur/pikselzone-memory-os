@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .companion import CompanionManager, LastSessionData
 from .core import (
     EVENTS, RUNTIMES, SUMMARY_FIELDS, DuplicateEvent, MemoryConfig, NoMemory,
     NormalizedTranscript, PolicyError, ProviderBlocked, SchemaError, atomic_json, atomic_write,
@@ -14,6 +15,7 @@ from .core import (
     path_within, session_key, summary_json_schema, validate_summary, write_health,
 )
 from .provider import StructuredResponsesProvider
+from .rule_learner import RuleLearner
 
 
 SECTION_TITLES = {
@@ -170,6 +172,45 @@ class EventWriter:
                 "updated_at": iso_now(),
             })
             write_health(self.config.state_path, f"flush-{runtime}", "ok")
+
+            # Second Brain: Learn rules, update Last-Session, and append Journal entry
+            try:
+                companion_mgr = CompanionManager(self.config.vault_path)
+                rule_learner = RuleLearner(companion_mgr)
+                turn_pairs = []
+                for line in normalized.splitlines():
+                    if line.startswith("USER: "):
+                        turn_pairs.append(("user", line[6:]))
+                    elif line.startswith("ASSISTANT: "):
+                        turn_pairs.append(("assistant", line[11:]))
+                if turn_pairs:
+                    rule_learner.learn_from_transcript(turn_pairs, source_session=f"{runtime}-{state_key}")
+
+                if summary and summary.get("status") == "ok":
+                    ls_data = LastSessionData(
+                        runtime=runtime,
+                        session_id=session_id,
+                        completed_items=summary.get("important_conversations", [])[:5],
+                        decisions=summary.get("decisions", [])[:5],
+                        pending_items=summary.get("open_items", [])[:5],
+                        next_steps=summary.get("open_items", [])[:3],
+                        active_project=self.config.vault_path.name,
+                        updated_at=timestamp,
+                    )
+                    companion_mgr.write_last_session(ls_data)
+
+                    decisions = summary.get("decisions", [])
+                    learnings = summary.get("learnings", [])
+                    if decisions or learnings:
+                        narrative = " ".join(decisions[:2] + learnings[:2])
+                        companion_mgr.append_journal_entry(
+                            title=f"{event.replace('_', ' ').capitalize()} Özeti",
+                            narrative=narrative,
+                            runtime=runtime,
+                        )
+            except Exception:
+                pass
+
             return event_path
 
     def _event_path(self, runtime: str, state_key: str, timestamp: str) -> Path:
