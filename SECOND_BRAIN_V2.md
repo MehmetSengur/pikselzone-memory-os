@@ -29,13 +29,13 @@ Transform Pikselzone Memory OS from a passive, overly restrictive session logger
 - Memory engine failure resilience: child failures degrade gracefully without blocking agent sessions.
 
 ## Current Task
-Awaiting User Approval on Implementation Plan (`implementation_plan.md`) to begin Checkpoint SB2-01.
+SB2-02: Second-brain memory schema (Identity `Core.md`, Rules `Kurallar.md`, Last Session `Last-Session.md`, Threads `Threads.md`, Journal `Journal.md`).
 
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
+- **SB2-01**: Codex old + new rollout format compatibility (both legacy `user_message`/`agent_message` and modern `item_completed` with `UserMessage`/`AgentMessage`, case-insensitive `text`/`Text` block extraction, complete filtering of `Reasoning`/`CommandExecution`/`FileChange`/internal events, and regression check against silent 0-turn failure with 10 targeted tests PASS).
 
 ## Remaining Work
-- **SB2-01**: Codex old + new rollout format compatibility (item_completed, UserMessage/AgentMessage, Text/text casing, zero-turn detection, fixtures).
 - **SB2-02**: Second-brain memory schema (Identity `Core.md`, Rules `Kurallar.md`, Last Session `Last-Session.md`, Threads `Threads.md`, Journal `Journal.md`).
 - **SB2-03**: Startup context & targeted recall redesign (relevance > recency, clean bounded context <= 16k chars).
 - **SB2-04**: Automatic rules learning (detection, deduplication, conflict reconciliation).
@@ -51,3 +51,5 @@ Awaiting User Approval on Implementation Plan (`implementation_plan.md`) to begi
 ## Validation Evidence
 - Initial test baseline: 149/149 tests PASS in 1.865s (`python3 -m unittest discover -s tests/memory_v1`).
 - Target branch created: `feat/self-evolving-second-brain-v2` at `31f89d7`.
+- SB2-01: 10/10 targeted tests PASS in 0.010s (`tests/memory_v1/test_codex_rollout.py`).
+- SB2-01 Full regression: 159/159 tests PASS in 1.719s (`python3 -m unittest discover -s tests/memory_v1`).

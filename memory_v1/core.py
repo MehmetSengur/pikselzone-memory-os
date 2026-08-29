@@ -729,42 +729,181 @@ def write_health(state_path: Path, component: str, status: str, detail: str = ""
         pass
 
 
+INTERNAL_ITEM_TYPES = {
+    "reasoning",
+    "commandexecution",
+    "command_execution",
+    "filechange",
+    "file_change",
+    "tool",
+    "tool_output",
+    "tool_use",
+    "tool_result",
+    "token_count",
+    "task_started",
+    "task_complete",
+    "task_update",
+    "internal",
+    "internal_state",
+    "thought",
+    "thinking",
+}
+
+USER_ROLES = {"user", "usermessage", "user_message"}
+AGENT_ROLES = {"assistant", "agent", "agentmessage", "agent_message"}
+
+
+def _normalize_role(raw_role: Any) -> str:
+    r = str(raw_role or "").strip().lower()
+    if r in USER_ROLES:
+        return "user"
+    if r in AGENT_ROLES:
+        return "assistant"
+    return ""
+
+
 def _text_blocks(content: Any) -> list[str]:
     if isinstance(content, str):
-        return [content]
+        return [content] if content.strip() else []
+    if isinstance(content, dict):
+        item_type = str(content.get("type", "")).strip().lower()
+        if item_type in {"text", "input_text", "output_text", ""}:
+            text = content.get("text")
+            if isinstance(text, str) and text.strip():
+                return [text]
+            val = content.get("value")
+            if isinstance(val, str) and val.strip():
+                return [val]
+            cnt = content.get("content")
+            if cnt and cnt is not content:
+                return _text_blocks(cnt)
+        return []
     if not isinstance(content, list):
         return []
     blocks: list[str] = []
     for item in content:
+        if isinstance(item, str):
+            if item.strip():
+                blocks.append(item)
+            continue
         if not isinstance(item, dict):
             continue
-        item_type = str(item.get("type", ""))
-        if item_type not in {"text", "input_text", "output_text"}:
-            continue
-        text = item.get("text")
-        if isinstance(text, str):
-            blocks.append(text)
+        item_type = str(item.get("type", "")).strip().lower()
+        if item_type in {"text", "input_text", "output_text", ""}:
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                blocks.append(text)
+            else:
+                val = item.get("value")
+                if isinstance(val, str) and val.strip():
+                    blocks.append(val)
+                elif "content" in item:
+                    sub = _text_blocks(item.get("content"))
+                    blocks.extend(sub)
     return blocks
 
 
-def _message_from_record(record: dict[str, Any]) -> tuple[str, Any]:
+def _message_from_record(record: dict[str, Any]) -> tuple[str, Any, bool]:
+    """Extract conversational role and content from transcript record.
+    Returns: (role, content, is_candidate)
+    - role: 'user', 'assistant', or ''
+    - content: text or list of content blocks
+    - is_candidate: True if this record was shaped like a conversational message
+    """
+    rec_type = str(record.get("type", "")).strip()
+    rec_type_lower = rec_type.lower()
+
+    # 1. Codex event_msg wrapper
+    if rec_type_lower == "event_msg":
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return "", None, False
+        ptype = str(payload.get("type", "")).strip().lower()
+
+        # Old format: payload.type == "user_message" / "agent_message"
+        if ptype in {"user_message", "agent_message", "usermessage", "agentmessage"}:
+            role = "user" if "user" in ptype else "assistant"
+            content = payload.get("message")
+            if content is None:
+                content = payload.get("content")
+            return role, content, True
+
+        # New format: payload.type == "item_completed" / "item.completed"
+        if ptype in {"item_completed", "item.completed"}:
+            item = payload.get("item")
+            if isinstance(item, dict):
+                itype = str(item.get("type", "")).strip()
+                itype_lower = itype.lower()
+                if itype_lower in INTERNAL_ITEM_TYPES:
+                    return "", None, False
+                norm_role = _normalize_role(itype_lower) or _normalize_role(item.get("role"))
+                if norm_role:
+                    content = (
+                        item.get("content")
+                        if item.get("content") is not None
+                        else (item.get("text") if item.get("text") is not None else item.get("message"))
+                    )
+                    return norm_role, content, True
+                if any(k in itype_lower for k in ("message", "user", "agent", "assistant")):
+                    return "", None, True
+            return "", None, False
+
+        # Nested role/message inside payload
+        msg = payload.get("message")
+        if isinstance(msg, dict):
+            norm_role = _normalize_role(msg.get("role"))
+            if norm_role:
+                return norm_role, msg.get("content"), True
+        if "role" in payload:
+            norm_role = _normalize_role(payload.get("role"))
+            if norm_role:
+                return norm_role, payload.get("content"), True
+        return "", None, False
+
+    # 2. Direct item_completed (unwrapped)
+    if rec_type_lower in {"item_completed", "item.completed"}:
+        item = record.get("item")
+        if isinstance(item, dict):
+            itype_lower = str(item.get("type", "")).strip().lower()
+            if itype_lower in INTERNAL_ITEM_TYPES:
+                return "", None, False
+            norm_role = _normalize_role(itype_lower) or _normalize_role(item.get("role"))
+            if norm_role:
+                content = (
+                    item.get("content")
+                    if item.get("content") is not None
+                    else (item.get("text") if item.get("text") is not None else item.get("message"))
+                )
+                return norm_role, content, True
+            if any(k in itype_lower for k in ("message", "user", "agent", "assistant")):
+                return "", None, True
+        return "", None, False
+
+    # 3. Standard Claude / Hermes / generic record
     message = record.get("message")
     if isinstance(message, dict):
-        return str(message.get("role", "")), message.get("content")
-    payload = record.get("payload")
-    if isinstance(payload, dict):
-        message = payload.get("message")
-        if isinstance(message, dict):
-            return str(message.get("role", "")), message.get("content")
-        if "role" in payload:
-            return str(payload.get("role", "")), payload.get("content")
-    return str(record.get("role", "")), record.get("content")
+        role_key = message.get("role") or record.get("type")
+        norm_role = _normalize_role(role_key)
+        if norm_role:
+            return norm_role, message.get("content"), True
+
+    role_key = record.get("role") or record.get("type")
+    norm_role = _normalize_role(role_key)
+    if norm_role:
+        return norm_role, record.get("content"), True
+
+    raw_check = f"{rec_type_lower} {str(record.get('role', '')).lower()}"
+    if any(k in raw_check for k in ("user_message", "agent_message", "usermessage", "agentmessage")):
+        return "", None, True
+
+    return "", None, False
 
 
 def normalize_transcript(
     source: Path | str | Sequence[dict[str, Any]], *,
     max_turns: int = 200, max_chars: int = 120000,
     allowed_roots: Sequence[Path] | None = None,
+    state_path: Path | None = None,
 ) -> tuple[str, int, str]:
     """Extract user/assistant prose only; tool results and reasoning are ignored."""
     records: list[dict[str, Any]] = []
@@ -807,8 +946,11 @@ def normalize_transcript(
         records = [item for item in source if isinstance(item, dict)]
 
     turns: list[tuple[str, str]] = []
+    candidates_count = 0
     for record in records:
-        role, content = _message_from_record(record)
+        role, content, is_candidate = _message_from_record(record)
+        if is_candidate:
+            candidates_count += 1
         if role not in {"user", "assistant"}:
             continue
         text = " ".join(_text_blocks(content))
@@ -816,6 +958,17 @@ def normalize_transcript(
         flattened = re.sub(r"\s+", " ", redacted).strip()
         if flattened:
             turns.append((role, flattened))
+
+    if candidates_count > 0 and not turns:
+        if state_path:
+            write_health(
+                state_path,
+                "codex-parser",
+                "warn",
+                f"0 turns extracted from {candidates_count} conversation-shaped candidate records",
+            )
+        raise SchemaError(f"transcript-zero-turns-from-{candidates_count}-candidates")
+
     turns = turns[-max_turns:]
     rendered = "\n".join(f"{role.upper()}: {text}" for role, text in turns)
     if len(rendered) > max_chars:
