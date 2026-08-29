@@ -7,10 +7,13 @@ derived context only.
 
 from .companion import CompanionManager, LastSessionData, RuleItem, ThreadItem
 from .core import MemoryConfig, MemoryError
+from .graph_engine import ConceptData, KnowledgeGraphEngine
 from .rule_learner import RuleLearner
 
 __all__ = [
     "CompanionManager",
+    "ConceptData",
+    "KnowledgeGraphEngine",
     "LastSessionData",
     "MemoryConfig",
     "MemoryError",
