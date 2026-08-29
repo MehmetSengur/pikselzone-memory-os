@@ -37,6 +37,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = MemoryConfig.load(args.config)
     try:
+        raw_stdin = sys.stdin.read()
+        try:
+            log_dir = config.state_path / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            (log_dir / f"hook-{args.runtime}-{args.event}-stdin.json").write_text(raw_stdin, encoding="utf-8")
+        except OSError:
+            pass
+
         if args.event == "SessionStart":
             try:
                 from .parity import SharedBrainParityManager
@@ -49,7 +57,6 @@ def main(argv: list[str] | None = None) -> int:
                 write_recall_evidence,
                 RECALL_EVIDENCE_PROVENANCE_NATIVE,
             )
-            raw_stdin = sys.stdin.read()
             payload = load_hook_input(None, raw_stdin)
             transcript_p = (
                 payload.get("transcript_path")
@@ -98,7 +105,6 @@ def main(argv: list[str] | None = None) -> int:
             }
             print(json.dumps(wire, ensure_ascii=False))
             return 0
-        raw_stdin = sys.stdin.read()
         payload = load_hook_input(None, raw_stdin)
         queue_path = checkpoint_hook(
             config, runtime=args.runtime, payload=payload, event_override=args.event

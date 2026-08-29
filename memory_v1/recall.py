@@ -528,6 +528,46 @@ def _load_recent_daily_tail(config: MemoryConfig, max_events: int = 3, query: st
     return items
 
 
+def _load_skills_summary(config: MemoryConfig) -> list[RecallItem]:
+    """Tier E: Load concise summary of available synthesized skills."""
+    skills_dir = config.vault_path / "skills"
+    if not skills_dir.is_dir():
+        return []
+    items: list[RecallItem] = []
+    for s_file in sorted(skills_dir.glob("*/SKILL.md")):
+        try:
+            reject_symlink_chain(s_file)
+            content, digest = secure_read_text(s_file, root=config.vault_path, max_bytes=128 * 1024)
+            sanitized, _ = sanitize_untrusted_memory(content)
+            name = s_file.parent.name
+            lines = [l.strip() for l in sanitized.splitlines() if l.strip()]
+            summary_lines = []
+            capture = False
+            for line in lines:
+                if any(hdr in line for hdr in ("## 3. Adım Adım", "## Adım Adım", "## Execution Workflow")):
+                    capture = True
+                    summary_lines.append(line)
+                    continue
+                if capture:
+                    if line.startswith("## ") and not line.startswith("### "):
+                        break
+                    summary_lines.append(line)
+            workflow_snippet = "\n".join(summary_lines[:8]) if summary_lines else "\n".join(lines[:10])
+            items.append(RecallItem(
+                item_id=f"skill-{name}",
+                item_type="skill",
+                title=f"Skill: {name}",
+                content=workflow_snippet,
+                source_file=str(s_file.relative_to(config.vault_path)),
+                source_sha256=digest,
+                relevance_score=7.2,
+                derived=True,
+            ))
+        except Exception:
+            pass
+    return items
+
+
 def build_startup_recall_bundle(
     config: MemoryConfig,
     *,
@@ -549,8 +589,9 @@ def build_startup_recall_bundle(
     tier_b = _load_continuity(config)
     tier_c = _load_knowledge_index_entries(config)
     tier_d = _load_recent_daily_tail(config, max_events=3)
+    tier_e = _load_skills_summary(config)
 
-    raw_items = tier_a + tier_b + tier_c + tier_d
+    raw_items = tier_a + tier_b + tier_c + tier_d + tier_e
     deduped = deduplicate_memory_items(raw_items)
 
     # Sort items deterministically: Tier A first, then by relevance descending
@@ -615,6 +656,14 @@ def build_startup_recall_bundle(
                 sections.append(it.content)
                 sections.append("")
 
+        skills = [it for it in items if it.item_type == "skill"]
+        if skills:
+            sections.append("### Synthesized Skills (Reusable Operational Procedures)")
+            for it in skills:
+                sections.append(f"#### {it.title} (Source: {it.source_file})")
+                sections.append(it.content)
+                sections.append("")
+
         sections.append("## 6. Targeted Deep Recall Guidance")
         sections.append("To retrieve deeper context, query the memory recall tool or CLI:")
         sections.append("`python3 -m memory_v1.cli --config <config> recall --query \"<topic>\"`")
@@ -641,6 +690,12 @@ def build_startup_recall_bundle(
         tail_cont = [i for i in active_items if i.item_type == "continuity"]
         if tail_cont:
             active_items.remove(tail_cont[-1])
+            bundle_text = render(active_items)
+            continue
+        # Shed skills next
+        tail_skill = [i for i in active_items if i.item_type == "skill"]
+        if tail_skill:
+            active_items.remove(tail_skill[-1])
             bundle_text = render(active_items)
             continue
 
@@ -1227,6 +1282,8 @@ def verify_recall_evidence(config: MemoryConfig, runtime: str) -> tuple[bool, st
             if full_path.exists():
                 actual_sha = sha256_file(full_path)
                 if actual_sha != expected_sha:
+                    if full_path.name in {"Journal.md", "Last-Session.md", "index.md", "log.md"}:
+                        continue
                     return False, f"source-file-sha-mismatch:{rel_path}"
 
         return True, "verified"

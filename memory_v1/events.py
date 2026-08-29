@@ -251,14 +251,28 @@ class EventWriter:
                                     source=f"{runtime}:{state_key}",
                                 )
 
-                    # Skill Engine: Observe multi-step workflows in conversations
-                    for conv in summary.get("important_conversations", []):
-                        if any(marker in conv.lower() for marker in ("adımlar", "komut", "workflow", "deploy", "build", "test", "kurulum", "ayarla", "görev")):
-                            w_name = conv.split(":", 1)[0].strip(" -:") if ":" in conv else conv[:40].strip(" -:")
-                            w_steps = [s.strip() for s in re.split(r"[;\n,]+", conv.split(":", 1)[1] if ":" in conv else conv) if len(s.strip()) > 3][:5]
+                    # Skill Engine: Observe multi-step workflows in conversations and summaries
+                    workflow_candidates = []
+                    for item in summary.get("important_conversations", []) + summary.get("decisions", []):
+                        if any(marker in item.lower() for marker in ("adımlar", "komut", "workflow", "prosedür", "deploy", "build", "test", "kontrol", "kurulum", "ayarla", "görev")):
+                            workflow_candidates.append(item)
+
+                    # Also extract from user conversation turns if numbered steps exist
+                    for role, text in turn_pairs:
+                        if role == "user" and any(m in text.lower() for m in ("1.", "adım", "workflow", "prosedür", "kontrol et")):
+                            if "1." in text and ("2." in text or "sonra" in text):
+                                workflow_candidates.append(text)
+
+                    for cand in workflow_candidates:
+                        w_name = cand.split(":", 1)[0].strip(" -:\n") if ":" in cand else cand[:40].strip(" -:\n")
+                        if ":" in w_name:
+                            w_name = w_name.split(":")[-1].strip()
+                        body = cand.split(":", 1)[1] if ":" in cand else cand
+                        w_steps = [s.strip() for s in re.split(r"(?:[0-9]+\.|\n|;|,)+", body) if len(s.strip()) > 5][:6]
+                        if len(w_steps) >= 2:
                             skill_engine.record_workflow_observation(WorkflowObservation(
-                                workflow_name=w_name,
-                                goal=conv[:120],
+                                workflow_name=w_name[:50],
+                                goal=cand[:120].strip(),
                                 steps=w_steps,
                                 session_id=f"{runtime}-{state_key}",
                             ))
