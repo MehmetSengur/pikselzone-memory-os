@@ -7,7 +7,6 @@ Type=oneshot
 User=root
 Group=root
 ExecStart=/usr/local/sbin/pz-memory-permissions-bootstrap
-NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict

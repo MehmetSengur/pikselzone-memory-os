@@ -98,6 +98,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         self.assertIn('Requires=pz-memory-permissions-bootstrap.service', publisher_unit)
         self.assertIn('Requires=pz-memory-permissions-bootstrap.service', compiler_unit)
         self.assertIn('ReadWritePaths=/srv/pz-hermes/hermes-data', bootstrap_unit)
+        self.assertNotIn('NoNewPrivileges=true', bootstrap_unit)
 
     def test_double_flush_prevention(self):
         plugin = load_hermes_plugin()
