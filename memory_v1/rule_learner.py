@@ -24,9 +24,10 @@ logger = logging.getLogger("memory_v1.rule_learner")
 EXPLICIT_DIRECTIVE_PATTERNS = (
     re.compile(r"(?i)\b(?:bundan sonra|artık|şundan sonra)\b\s+(.+)", re.UNICODE),
     re.compile(r"(?i)\b(?:bunu bir daha|bir daha bana|asla bunu)\s+(?:yapma|sorma|kullanma|etme)\b", re.UNICODE),
-    re.compile(r"(?i)\b(?:her zaman|daima|kesinlikle)\s+([^.!?]+)\s+(?:yap|kullan|uygula|yaz|çalıştır|et)\b", re.UNICODE),
+    re.compile(r"(?i)\b(?:her zaman|daima|kesinlikle)\s+([^.!?]+)\s+(?:yap|kullan|uygula|yaz|çalıştır|et|koy|göster|yerleştir|ekle|getir)\b", re.UNICODE),
     re.compile(r"(?i)\b(?:asla|kesinlikle)\s+([^.!?]+)\s+(?:yapma|kullanma|dokunma|silme|çalıştırma|etme|başlatma)\b", re.UNICODE),
-    re.compile(r"(?i)\b(?:benim tercihim|şunu tercih ediyorum|tercih ederim)\b[:\s]+([^.!?]+)", re.UNICODE),
+    re.compile(r"(?i)\b(?:(?:benim|kalıcı|ikinci beyin|second brain|test)?\s*tercihim|şunu tercih ediyorum|tercih ederim)\b[:\s]+([^.!?]+)", re.UNICODE),
+    re.compile(r"(?i)\b(?:görmek istiyorum|olmasını istiyorum|yapılmasını istiyorum)\b", re.UNICODE),
     re.compile(r"(?i)\bfrom now on\b[,:\s]+([^.!?]+)", re.UNICODE),
     re.compile(r"(?i)\balways\s+([^.!?]+)\b", re.UNICODE),
     re.compile(r"(?i)\bnever\s+([^.!?]+)\b", re.UNICODE),

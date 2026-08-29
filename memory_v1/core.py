@@ -936,14 +936,26 @@ def normalize_transcript(
     elif isinstance(source, str):
         try:
             value = json.loads(source)
-        except json.JSONDecodeError as exc:
-            raise SchemaError("transcript-json-invalid") from exc
-        if isinstance(value, dict) and "messages" in value and isinstance(value["messages"], list):
-            records = [item for item in value["messages"] if isinstance(item, dict)]
-        elif not isinstance(value, list):
-            raise SchemaError("transcript-not-list")
-        else:
-            records = [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict) and "messages" in value and isinstance(value["messages"], list):
+                records = [item for item in value["messages"] if isinstance(item, dict)]
+            elif not isinstance(value, list):
+                raise SchemaError("transcript-not-list")
+            else:
+                records = [item for item in value if isinstance(item, dict)]
+        except json.JSONDecodeError:
+            records = []
+            for raw_line in source.splitlines():
+                if not raw_line.strip():
+                    continue
+                try:
+                    val = json.loads(raw_line)
+                    if isinstance(val, dict):
+                        if "messages" in val and isinstance(val["messages"], list):
+                            records.extend(item for item in val["messages"] if isinstance(item, dict))
+                        else:
+                            records.append(val)
+                except json.JSONDecodeError as exc:
+                    raise SchemaError("transcript-jsonl-invalid") from exc
     else:
         records = [item for item in source if isinstance(item, dict)]
 
