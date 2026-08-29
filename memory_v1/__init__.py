@@ -9,6 +9,7 @@ from .companion import CompanionManager, LastSessionData, RuleItem, ThreadItem
 from .core import MemoryConfig, MemoryError
 from .graph_engine import ConceptData, KnowledgeGraphEngine
 from .rule_learner import RuleLearner
+from .skill_engine import SkillEngine, SkillSpec, WorkflowObservation
 
 __all__ = [
     "CompanionManager",
@@ -19,5 +20,8 @@ __all__ = [
     "MemoryError",
     "RuleItem",
     "RuleLearner",
+    "SkillEngine",
+    "SkillSpec",
     "ThreadItem",
+    "WorkflowObservation",
 ]

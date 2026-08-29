@@ -29,7 +29,7 @@ Transform Pikselzone Memory OS from a passive, overly restrictive session logger
 - Memory engine failure resilience: child failures degrade gracefully without blocking agent sessions.
 
 ## Current Task
-SB2-06: Self-generating & self-updating skills (detect repeated workflows 2+ times, synthesize standard skills with `SKILL.md`, trigger conditions, execution steps, iterative improvements).
+SB2-07: Doctor -> Self-healing maintenance engine (safe autonomous self-repair: index rebuild, orphan wikilinks, stale locks/state, thread archiving, receipts).
 
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
@@ -38,9 +38,9 @@ SB2-06: Self-generating & self-updating skills (detect repeated workflows 2+ tim
 - **SB2-03**: Startup context / targeted recall redesigned for living second-brain behavior (clean bounded context <= 16k chars, companion memory sections injection, relevance > recency deep recall across companion files and skills, with 4 targeted tests PASS).
 - **SB2-04**: Automatic rules learning (`RuleLearner` detecting explicit commands and corrections, semantic deduplication, conflict reconciliation archiving old rules with provenance, integrated into `EventWriter` flush lifecycle with 5 targeted tests PASS).
 - **SB2-05**: Knowledge graph auto-growth & reconciliation (`KnowledgeGraphEngine` with concept creation/in-place expansion, canonical sorted bidirectional connection files `a--b.md`, reciprocal wikilinks cross-linking, table indexing in `index.md`, audit in `log.md`, with 5 targeted tests PASS).
+- **SB2-06**: Self-generating & self-updating skills (`SkillEngine` tracking workflow repetition, auto-synthesizing standard `skills/<slug>/SKILL.md` upon 2+ repetitions, iterative version bumping and edge-case recording, seeding `beyin-doktor` and `gecmis-import`, with 3 targeted tests PASS).
 
 ## Remaining Work
-- **SB2-06**: Self-generating & self-updating skills (candidate detection, generation, retrieval, iterative improvement).
 - **SB2-07**: Doctor -> self-healing maintenance engine (safe self-repair: index rebuild, orphan wikilinks, stale locks, thread archiving, receipts).
 - **SB2-08**: Controlled memory-engine self-modification (git-checkpointed, test-gated, rollback-capable).
 - **SB2-09**: Claude / Codex / Hermes shared-brain parity (same vault truth, cross-runtime recall).
@@ -61,3 +61,5 @@ SB2-06: Self-generating & self-updating skills (detect repeated workflows 2+ tim
 - SB2-04 Full regression: 177/177 tests PASS in 2.084s (`python3 -m unittest discover -s tests/memory_v1`).
 - SB2-05: 5/5 targeted tests PASS in 0.048s (`tests/memory_v1/test_graph_engine.py`).
 - SB2-05 Full regression: 182/182 tests PASS in 1.851s (`python3 -m unittest discover -s tests/memory_v1`).
+- SB2-06: 3/3 targeted tests PASS in 0.020s (`tests/memory_v1/test_skill_engine.py`).
+- SB2-06 Full regression: 185/185 tests PASS in 2.350s (`python3 -m unittest discover -s tests/memory_v1`).
