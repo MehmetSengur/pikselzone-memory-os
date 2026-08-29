@@ -73,14 +73,14 @@ class KnowledgeGraphEngine:
                 "| Article | Summary | Source | Updated |\n"
                 "|---|---|---|---|\n"
             )
-            atomic_write(self.index_file, initial_index)
+            atomic_write(self.index_file, initial_index, mode=0o660)
 
         if not self.log_file.is_file():
             initial_log = (
                 "# Knowledge Mutation Log\n\n"
                 "Chronological record of second-brain knowledge growth and reconciliation.\n\n"
             )
-            atomic_write(self.log_file, initial_log)
+            atomic_write(self.log_file, initial_log, mode=0o660)
 
     def find_concept(self, title_or_alias: str) -> Optional[Path]:
         """Find an existing concept file matching title or aliases."""
@@ -179,7 +179,7 @@ class KnowledgeGraphEngine:
                 updated_content,
             )
 
-            atomic_write(target_path, updated_content)
+            atomic_write(target_path, updated_content, mode=0o660)
             self._log_mutation("UPDATE_CONCEPT", f"Expanded concept '{clean_title}' in {target_path.name}")
         else:
             # Create fresh concept file
@@ -211,7 +211,7 @@ class KnowledgeGraphEngine:
                 f"## İlgili Bağlantılar\n{wikilinks_lines or '- Henüz bağlı kavram yok.'}\n\n"
                 f"## Kaynaklar & Kanıtlar\n" + "\n".join(f"- {s}" for s in data.sources) + "\n"
             )
-            atomic_write(target_path, content)
+            atomic_write(target_path, content, mode=0o660)
             self._log_mutation("CREATE_CONCEPT", f"Created concept '{clean_title}' in {target_path.name}")
 
         # Update index.md
@@ -274,7 +274,7 @@ class KnowledgeGraphEngine:
             old = target_path.read_text(encoding="utf-8")
             if clean_rel not in old:
                 updated = old + f"\n- **İlişki Güncellemesi ({today_str}):** {clean_rel}\n"
-                atomic_write(target_path, updated)
+                atomic_write(target_path, updated, mode=0o660)
                 self._log_mutation("UPDATE_CONNECTION", f"Updated connection {conn_filename}")
         else:
             # Create new connection
@@ -290,7 +290,7 @@ class KnowledgeGraphEngine:
                 f"## İlişki Niteliği\n{clean_rel}\n\n"
                 f"## Kanıtlar & Bağlam\n{ev_lines}\n"
             )
-            atomic_write(target_path, content)
+            atomic_write(target_path, content, mode=0o660)
             self._log_mutation("CREATE_CONNECTION", f"Created connection {conn_filename}")
 
         # Cross-link in both concept files if they exist
@@ -326,7 +326,7 @@ class KnowledgeGraphEngine:
             else:
                 content += f"\n\n## İlgili Bağlantılar{injection}"
 
-            atomic_write(c_file, content)
+            atomic_write(c_file, content, mode=0o660)
         except Exception as exc:
             logger.warning("Error injecting connection wikilink into %s: %s", source_slug, exc)
 
@@ -354,7 +354,7 @@ class KnowledgeGraphEngine:
         if not replaced:
             new_lines.append(new_row)
 
-        atomic_write(self.index_file, "\n".join(new_lines) + "\n")
+        atomic_write(self.index_file, "\n".join(new_lines) + "\n", mode=0o660)
 
     def _log_mutation(self, action: str, description: str) -> None:
         """Append chronological audit entry to knowledge/log.md."""
@@ -367,7 +367,7 @@ class KnowledgeGraphEngine:
             f"- **Açıklama:** {description}\n\n"
         )
         content = self.log_file.read_text(encoding="utf-8")
-        atomic_write(self.log_file, content + entry)
+        atomic_write(self.log_file, content + entry, mode=0o660)
 
     def grow_from_session_summary(self, summary: dict[str, Any], session_id: str = "session") -> int:
         """Extract durable concepts and connections from a completed session summary."""

@@ -16,7 +16,7 @@
     "api_base": "https://api.openai.com/v1",
     "key_env": "OPENAI_API_KEY"
   },
-  "context_budget_chars": 16000,
+  "context_budget_chars": 9500,
   "sync_evidence_path": "/var/lib/pz-memory-v1/evidence/last-sync-ok",
   "backup_evidence_path": "/var/lib/pz-memory-v1/evidence/last-backup-ok",
   "activation": {

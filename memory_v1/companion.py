@@ -219,7 +219,7 @@ class CompanionManager:
         for filename, content in seeds.items():
             target = self.companion_dir / filename
             if not target.exists():
-                atomic_write(target, content)
+                atomic_write(target, content, mode=0o660)
 
     # -------------------------------------------------------------------------
     # Core / Identity Management
@@ -234,7 +234,7 @@ class CompanionManager:
     def update_core(self, content: str) -> None:
         core_path = self.companion_dir / "Core.md"
         redacted, _ = redact_sensitive_text(content)
-        atomic_write(core_path, redacted)
+        atomic_write(core_path, redacted, mode=0o660)
 
     # -------------------------------------------------------------------------
     # Kurallar (Learned Rules & Preferences)
@@ -317,7 +317,7 @@ class CompanionManager:
             new_lines.append("\n## Aktif Kurallar")
             new_lines.append(new_entry)
 
-        atomic_write(rules_path, "\n".join(new_lines) + "\n")
+        atomic_write(rules_path, "\n".join(new_lines) + "\n", mode=0o660)
         return True
 
     # -------------------------------------------------------------------------
@@ -369,7 +369,7 @@ updated_at: {now_str}
 {questions_str}
 """
         redacted, _ = redact_sensitive_text(doc)
-        atomic_write(p, redacted)
+        atomic_write(p, redacted, mode=0o660)
 
     # -------------------------------------------------------------------------
     # Threads Management
@@ -416,7 +416,7 @@ updated_at: {now_str}
                 new_text = text + f"\n\n{target_section}\n{thread_block}"
 
         redacted, _ = redact_sensitive_text(new_text)
-        atomic_write(p, redacted)
+        atomic_write(p, redacted, mode=0o660)
 
     def archive_resolved_threads(self) -> int:
         """Move resolved threads from Threads.md to Threads-Archive.md."""
@@ -443,7 +443,7 @@ updated_at: {now_str}
                 archived_count += 1
 
         if archived_count > 0:
-            atomic_write(threads_path, remaining_text.strip() + "\n")
+            atomic_write(threads_path, remaining_text.strip() + "\n", mode=0o660)
             archive_header = "# İkinci Beyin — Arşivlenmiş Konular (Threads Archive)\n\n"
             existing_archive = ""
             if archive_path.is_file():
@@ -451,7 +451,7 @@ updated_at: {now_str}
             if not existing_archive:
                 existing_archive = archive_header
             updated_archive = existing_archive.rstrip() + "\n\n" + "\n\n".join(archived_blocks) + "\n"
-            atomic_write(archive_path, updated_archive)
+            atomic_write(archive_path, updated_archive, mode=0o660)
 
         return archived_count
 
@@ -470,7 +470,7 @@ updated_at: {now_str}
 
         entry = f"\n\n## {now_str} — [{runtime}] {clean_title}\n{clean_narrative}\n"
         updated = text.rstrip() + entry
-        atomic_write(p, updated)
+        atomic_write(p, updated, mode=0o660)
 
     def read_latest_journal_entry(self, max_lines: int = 15) -> str:
         p = self.companion_dir / "Journal.md"

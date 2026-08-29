@@ -107,7 +107,7 @@ class SkillEngine:
                 "## 6. Hata Durumunda Kurtarma Adımı\n"
                 "Hata durumunda `doctor --fix` veya companion restore çalıştırılır.\n"
             )
-            atomic_write(doktor_file, doktor_content)
+            atomic_write(doktor_file, doktor_content, mode=0o660)
 
         # 2. gecmis-import
         import_dir = self.skills_dir / "gecmis-import"
@@ -142,7 +142,7 @@ class SkillEngine:
                 "## 6. Hata Durumunda Kurtarma Adımı\n"
                 "Bozuk JSON kayıtları atlanır, sağlam konuşmalar kaydedilir ve hata raporlanır.\n"
             )
-            atomic_write(import_file, import_content)
+            atomic_write(import_file, import_content, mode=0o660)
 
     def record_workflow_observation(self, obs: WorkflowObservation) -> Optional[Path]:
         """Record an observed workflow pattern; auto-synthesize SKILL.md on 2nd repetition."""
@@ -252,7 +252,7 @@ class SkillEngine:
             f"## 7. Sürüm Geçmişi ve Öğrenilen İyileştirmeler (Changelog)\n"
             f"{changelog_lines}\n"
         )
-        atomic_write(skill_file, content)
+        atomic_write(skill_file, content, mode=0o660)
         logger.info("Materialized skill '%s' at %s", spec.name, skill_file)
         return skill_file
 
@@ -325,6 +325,6 @@ class SkillEngine:
         log_entry = f"- v{new_version} ({today_str}): " + "; ".join(changes)
         content = content.strip() + f"\n{log_entry}\n"
 
-        atomic_write(skill_file, content)
+        atomic_write(skill_file, content, mode=0o660)
         logger.info("Updated skill '%s' to version %s with %d improvements", slug, new_version, len(changes))
         return True

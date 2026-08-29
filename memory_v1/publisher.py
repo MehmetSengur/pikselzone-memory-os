@@ -143,7 +143,14 @@ def publish_outbox(
                     raw_user_turns: list[tuple[str, str]] = []
                     roots = config.transcript_roots.get("hermes", [])
                     base_data = Path(roots[0]) if roots else config.state_path.parent / "hermes-data"
-                    candidate_dbs = list(base_data.glob("profiles/*/state.db")) + [base_data / "state.db"]
+                    prof_dir = base_data / "profiles"
+                    candidate_dbs: list[Path] = []
+                    if prof_dir.is_dir():
+                        try:
+                            candidate_dbs.extend([p / "state.db" for p in prof_dir.iterdir() if (p / "state.db").is_file()])
+                        except Exception:
+                            pass
+                    candidate_dbs.append(base_data / "state.db")
                     for sdb in candidate_dbs:
                         if sdb.is_file():
                             try:
@@ -164,10 +171,11 @@ def publish_outbox(
                     learnings = [x for x in (sections.get("learnings") or event.get("learnings", [])) if x != "unknown"]
                     conversations = [x for x in (sections.get("important_conversations") or event.get("important_conversations", [])) if x != "unknown"]
                     open_items = [x for x in (sections.get("open_items") or event.get("open_items", [])) if x != "unknown"]
+                    evidence_items = [x for x in (sections.get("evidence") or event.get("evidence", [])) if x != "unknown"]
 
                     turn_pairs = raw_user_turns or [
                         ("user", cand)
-                        for cand in (context_items + conversations + decisions + learnings)
+                        for cand in (context_items + conversations + decisions + learnings + evidence_items)
                     ]
                     if turn_pairs:
                         rule_learner.learn_from_transcript(turn_pairs, source_session=f"hermes-{session_hash}")
