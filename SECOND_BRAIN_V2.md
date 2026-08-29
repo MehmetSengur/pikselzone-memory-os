@@ -392,4 +392,81 @@ SECOND_BRAIN_V2_PRODUCTION=FAIL
 REMAINING_BLOCKERS=explicit approval required to deploy the narrow CAP_FOWNER sync metadata capability, then rerun fresh reverse-sync and recall canaries
 ```
 
+---
+
+## 19. 2026-08-30 Final Sync / Provider Closure Evidence
+
+This section supersedes the stale-backlog count in section 18.  It records the
+capability-free experiments and does **not** authorize or deploy `CAP_FOWNER`.
+
+### 19.1 Canonical shared-vault mode repair
+
+- Commit `b3e6b14098184da521ddcc3087a2a794b1d6da5b` makes `atomic_write()`
+  apply its explicitly requested file mode after `open()` has been filtered by
+  the process umask.  It also makes rule reconciliation write `Kurallar.md`
+  through the same atomic `0660` path.
+- Targeted rule-learner validation and the full local suite passed
+  (`214/214`).  The deployed production copy was backed up before the narrow
+  update.  Only `companion/` and its existing `Kurallar.md`, `Last-Session.md`,
+  and `Journal.md` received the bounded shared-`pzvault` ACL/model repair;
+  vault root and canonical files were not made broadly writable.
+
+### 19.2 Capability-free sync probes and root cause
+
+- A VPS-created disposable daily file reached the workstation automatically,
+  with identical content hash and mtime.  A workstation-created disposable
+  daily file reached the VPS automatically, with identical content hash and
+  mtime.  The VPS copy was `pzobsidian:pzvault`, proving the SGID/default-ACL
+  model works for future files.  Both probes were then removed through the
+  normal sync path; no manual rsync was used.
+- Existing files atomically owned by `pzmemory` accept content replacement by
+  `pzobsidian` through their shared group ACL, but Obsidian Headless then calls
+  `fsPromises.utimes()` with the remote mtime.  Linux rejects that metadata
+  operation with `EPERM` for a non-owner even when group-write content access
+  succeeds.  `ob sync` has no timestamp-preservation switch, and the extracted
+  sync implementation uses mtimes in initial/conflict decisions.  It does not
+  attempt `chown`; rename is only a conflict-copy branch.
+- The active service is `/usr/local/bin/ob sync --path
+  /srv/pz-hermes/vault --continuous` as `pzobsidian:pzobsidian` with
+  supplementary group `pzvault`, `UMask=0027`, `NoNewPrivileges=yes`, and no
+  capability bounding or ambient capability set.
+
+### 19.3 Backlog and provider provenance
+
+- Two normal bounded compiler cycles consumed all 16 ledger-missing valid
+  session-end events (first batch 10, second batch 6).  The production doctor
+  now reports `stale_uningested_events=0`, ingestion ledger and knowledge
+  outbox clear.
+- Memory OS invokes `agent.plugin_llm.PluginLlm`; neither the Hermes plugin nor
+  `memory_v1.hermes_compiler` reads OpenAI credentials, API endpoints, or an
+  HTTP client directly.  Hermes config selects `custom:pz-openai-serial`, and
+  that provider legitimately emits the observed OpenAI-compatible HTTP request.
+  Runtime-native fallback is fail-closed (`ProviderBlocked`) when PluginLlm is
+  unavailable; its hardening test is part of the local suite.
+
+### 19.4 Closure decision
+
+`CAP_FOWNER` remains undeployed.  For the current vendor daemon and mixed-owner
+model it is required only to apply arbitrary source mtimes on already-existing
+`pzmemory` files; it is not required for content or new-file synchronization.
+Running the daemon as `pzmemory` would require exposing the `pzobsidian` sync
+credentials, and a root daemon would be broader.  A tiny path-whitelisted
+metadata helper would be safer in principle, but no such authenticated helper
+exists and adding one would create a new privileged IPC boundary.  Deployment
+of either privileged design requires explicit approval.
+
+```
+AUTO_SYNC_VPS_TO_WORKSTATION=PASS (new-file content/hash/mtime probe)
+AUTO_SYNC_WORKSTATION_TO_VPS=PARTIAL (new-file probe PASS; existing pzmemory-file utime FAIL)
+CONTENT_WRITE=PASS
+MTIME_WRITE=FAIL (EPERM on existing pzmemory-owned files)
+OWNER_WRITE=NOT_ATTEMPTED (not needed; no chown operation)
+RENAME=NOT_REQUIRED (conflict-only vendor branch)
+DIRECTORY_WRITE=PASS
+STALE_UNINGESTED_EVENTS_AFTER=0
+DIRECT_API_FALLBACK=NO
+CAP_FOWNER_DEPLOYED=NO
+SECOND_BRAIN_V2_PRODUCTION=FAIL
+REMAINING_BLOCKERS=explicit approval for the proven metadata capability or a separately designed path-whitelisted helper; then fresh four-way recall acceptance and fresh native receipt lifecycle verification
+```
 
