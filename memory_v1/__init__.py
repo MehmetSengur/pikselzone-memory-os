@@ -10,17 +10,21 @@ from .core import MemoryConfig, MemoryError
 from .doctor import run_doctor, run_self_healing
 from .graph_engine import ConceptData, KnowledgeGraphEngine
 from .rule_learner import RuleLearner
+from .self_evolution import EvolutionProposal, EvolutionResult, SelfEvolutionEngine
 from .skill_engine import SkillEngine, SkillSpec, WorkflowObservation
 
 __all__ = [
     "CompanionManager",
     "ConceptData",
+    "EvolutionProposal",
+    "EvolutionResult",
     "KnowledgeGraphEngine",
     "LastSessionData",
     "MemoryConfig",
     "MemoryError",
     "RuleItem",
     "RuleLearner",
+    "SelfEvolutionEngine",
     "SkillEngine",
     "SkillSpec",
     "ThreadItem",

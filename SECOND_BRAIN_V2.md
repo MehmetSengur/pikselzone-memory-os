@@ -29,7 +29,7 @@ Transform Pikselzone Memory OS from a passive, overly restrictive session logger
 - Memory engine failure resilience: child failures degrade gracefully without blocking agent sessions.
 
 ## Current Task
-SB2-08: Controlled memory-engine self-modification (git-checkpointed, test-gated, rollback-capable modifications to engine heuristics and prompt templates).
+SB2-09: Claude / Codex / Hermes shared-brain parity (same vault truth, cross-runtime recall across all three runtimes, unified router symlinks).
 
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
@@ -40,9 +40,9 @@ SB2-08: Controlled memory-engine self-modification (git-checkpointed, test-gated
 - **SB2-05**: Knowledge graph auto-growth & reconciliation (`KnowledgeGraphEngine` with concept creation/in-place expansion, canonical sorted bidirectional connection files `a--b.md`, reciprocal wikilinks cross-linking, table indexing in `index.md`, audit in `log.md`, with 5 targeted tests PASS).
 - **SB2-06**: Self-generating & self-updating skills (`SkillEngine` tracking workflow repetition, auto-synthesizing standard `skills/<slug>/SKILL.md` upon 2+ repetitions, iterative version bumping and edge-case recording, seeding `beyin-doktor` and `gecmis-import`, with 3 targeted tests PASS).
 - **SB2-07**: Doctor -> Self-healing maintenance engine (`run_self_healing` with safe non-destructive repair of index.md, orphan wikilinks placeholder generation, stale lock/temporary cleanup, session state recovery, thread archiving, chronic health reset, and signed audit receipt generation, with 6 targeted tests PASS).
+- **SB2-08**: Controlled memory-engine self-modification (`SelfEvolutionEngine` with protected branch guards, pre-modification git checkpointing, test gating, automatic rollback on test failures, commit justification, and signed evolution receipts, with 3 targeted tests PASS).
 
 ## Remaining Work
-- **SB2-08**: Controlled memory-engine self-modification (git-checkpointed, test-gated, rollback-capable).
 - **SB2-09**: Claude / Codex / Hermes shared-brain parity (same vault truth, cross-runtime recall).
 - **SB2-10**: Provider hardening, secret isolation & degraded resilience (no silent API fallback, subprocess env scrubbing, hook retention cleanup).
 - **SB2-11**: History import engine (Claude, ChatGPT, Codex, Gemini, Markdown).
@@ -65,3 +65,5 @@ SB2-08: Controlled memory-engine self-modification (git-checkpointed, test-gated
 - SB2-06 Full regression: 185/185 tests PASS in 2.350s (`python3 -m unittest discover -s tests/memory_v1`).
 - SB2-07: 6/6 targeted tests PASS in 0.065s (`tests/memory_v1/test_self_healing.py`).
 - SB2-07 Full regression: 191/191 tests PASS in 2.247s (`python3 -m unittest discover -s tests/memory_v1`).
+- SB2-08: 3/3 targeted tests PASS in 0.832s (`tests/memory_v1/test_self_evolution.py`).
+- SB2-08 Full regression: 194/194 tests PASS in 3.126s (`python3 -m unittest discover -s tests/memory_v1`).
