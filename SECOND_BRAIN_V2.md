@@ -29,14 +29,14 @@ Transform Pikselzone Memory OS from a passive, overly restrictive session logger
 - Memory engine failure resilience: child failures degrade gracefully without blocking agent sessions.
 
 ## Current Task
-SB2-02: Second-brain memory schema (Identity `Core.md`, Rules `Kurallar.md`, Last Session `Last-Session.md`, Threads `Threads.md`, Journal `Journal.md`).
+SB2-03: Startup context / targeted recall'u gerçek second-brain davranışına dönüştür (relevance > recency, clean bounded context <= 16k chars, companion memory sections injection, eliminate noisy authority warnings).
 
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
 - **SB2-01**: Codex old + new rollout format compatibility (both legacy `user_message`/`agent_message` and modern `item_completed` with `UserMessage`/`AgentMessage`, case-insensitive `text`/`Text` block extraction, complete filtering of `Reasoning`/`CommandExecution`/`FileChange`/internal events, and regression check against silent 0-turn failure with 10 targeted tests PASS).
+- **SB2-02**: Second-brain memory schema & companion manager (`Core.md` identity/user model, `Kurallar.md` learned rules/preferences, `Last-Session.md` operational continuity, `Threads.md` multi-session topics & archiving to `Threads-Archive.md`, and `Journal.md` narrative log, with 9 targeted tests PASS).
 
 ## Remaining Work
-- **SB2-02**: Second-brain memory schema (Identity `Core.md`, Rules `Kurallar.md`, Last Session `Last-Session.md`, Threads `Threads.md`, Journal `Journal.md`).
 - **SB2-03**: Startup context & targeted recall redesign (relevance > recency, clean bounded context <= 16k chars).
 - **SB2-04**: Automatic rules learning (detection, deduplication, conflict reconciliation).
 - **SB2-05**: Knowledge graph auto-growth & reconciliation (concepts, connections `a--b.md`, index/log, wikilinks).
@@ -53,3 +53,5 @@ SB2-02: Second-brain memory schema (Identity `Core.md`, Rules `Kurallar.md`, Las
 - Target branch created: `feat/self-evolving-second-brain-v2` at `31f89d7`.
 - SB2-01: 10/10 targeted tests PASS in 0.010s (`tests/memory_v1/test_codex_rollout.py`).
 - SB2-01 Full regression: 159/159 tests PASS in 1.719s (`python3 -m unittest discover -s tests/memory_v1`).
+- SB2-02: 9/9 targeted tests PASS in 0.050s (`tests/memory_v1/test_companion.py`).
+- SB2-02 Full regression: 168/168 tests PASS in 1.846s (`python3 -m unittest discover -s tests/memory_v1`).

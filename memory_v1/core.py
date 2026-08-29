@@ -571,9 +571,10 @@ def ensure_safe_directory(path: Path, *, create: bool = False) -> None:
     os.close(descriptor)
 
 
-def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+def atomic_write(path: Path, data: bytes | str, mode: int = 0o600) -> None:
     if not path.is_absolute() or path.name in {"", ".", ".."}:
         raise PolicyError("atomic-write-path-invalid")
+    payload = data if isinstance(data, (bytes, bytearray)) else data.encode("utf-8")
     try:
         parent_descriptor = _open_directory_nofollow(path.parent, create=True)
     except OSError as exc:
@@ -591,7 +592,7 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
         )
         with os.fdopen(descriptor, "wb") as output:
             descriptor = None
-            output.write(data)
+            output.write(payload)
             output.flush()
             os.fsync(output.fileno())
         try:
