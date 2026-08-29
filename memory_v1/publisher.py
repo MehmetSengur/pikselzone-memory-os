@@ -138,21 +138,42 @@ def publish_outbox(
                     graph_engine = KnowledgeGraphEngine(config.vault_path)
                     skill_engine = SkillEngine(config.vault_path)
 
-                    # 1. Learn rules from event summary & text
-                    rule_candidates = (
-                        event.get("important_conversations", [])
-                        + event.get("decisions", [])
-                        + event.get("learnings", [])
-                    )
-                    turn_pairs = [("user", cand) for cand in rule_candidates]
+                    # 1. Learn rules from Hermes SessionDB turns or event context
+                    session_id_val = str(event.get("session_id", ""))
+                    raw_user_turns: list[tuple[str, str]] = []
+                    roots = config.transcript_roots.get("hermes", [])
+                    base_data = Path(roots[0]) if roots else config.state_path.parent / "hermes-data"
+                    candidate_dbs = list(base_data.glob("profiles/*/state.db")) + [base_data / "state.db"]
+                    for sdb in candidate_dbs:
+                        if sdb.is_file():
+                            try:
+                                import sqlite3
+                                with sqlite3.connect(f"file:{sdb}?immutable=1", uri=True) as con:
+                                    cur = con.cursor()
+                                    cur.execute("SELECT role, content FROM messages WHERE session_id=? ORDER BY id ASC", (session_id_val,))
+                                    rows = cur.fetchall()
+                                    if rows:
+                                        raw_user_turns = [(str(r[0]), str(r[1])) for r in rows if r[1]]
+                                        break
+                            except Exception:
+                                pass
+
+                    sections = event.get("sections", {}) if isinstance(event.get("sections"), dict) else {}
+                    context_items = [x for x in (sections.get("context") or event.get("context", [])) if x != "unknown"]
+                    decisions = [x for x in (sections.get("decisions") or event.get("decisions", [])) if x != "unknown"]
+                    learnings = [x for x in (sections.get("learnings") or event.get("learnings", [])) if x != "unknown"]
+                    conversations = [x for x in (sections.get("important_conversations") or event.get("important_conversations", [])) if x != "unknown"]
+                    open_items = [x for x in (sections.get("open_items") or event.get("open_items", [])) if x != "unknown"]
+
+                    turn_pairs = raw_user_turns or [
+                        ("user", cand)
+                        for cand in (context_items + conversations + decisions + learnings)
+                    ]
                     if turn_pairs:
                         rule_learner.learn_from_transcript(turn_pairs, source_session=f"hermes-{session_hash}")
 
                     # 2. Update Last-Session continuity & Journal
-                    summary_context = event.get("context", []) or event.get("important_conversations", [])
-                    decisions = event.get("decisions", [])
-                    learnings = event.get("learnings", [])
-                    open_items = event.get("open_items", [])
+                    summary_context = context_items or conversations
                     ls_data = LastSessionData(
                         runtime="hermes",
                         session_id=str(event.get("session_id", session_hash)),
@@ -165,8 +186,8 @@ def publish_outbox(
                     )
                     companion_mgr.write_last_session(ls_data)
 
-                    if decisions or learnings:
-                        narrative = " ".join(decisions[:2] + learnings[:2])
+                    if decisions or learnings or context_items:
+                        narrative = " ".join((decisions or context_items)[:2] + learnings[:2])
                         companion_mgr.append_journal_entry(
                             title=f"{str(event.get('event', 'session_end')).replace('_', ' ').capitalize()} Özeti",
                             narrative=narrative,
@@ -175,7 +196,7 @@ def publish_outbox(
 
                     # 3. Knowledge Graph concepts & connections
                     created_slugs: list[str] = []
-                    for item_text in decisions + learnings:
+                    for item_text in context_items + decisions + learnings:
                         terms = re.findall(r"\b[A-Z][a-zA-Z0-9_\-\.]{2,}\b", item_text)
                         for term in terms:
                             if term.lower() not in {
