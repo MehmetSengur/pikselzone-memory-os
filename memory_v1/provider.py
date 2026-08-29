@@ -228,6 +228,36 @@ def _extract_json_block(text: str) -> str:
     return text
 
 
+SENSITIVE_ENV_KEYS = {
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "HERMES_API_KEY",
+    "CLAUDE_API_KEY",
+    "PZ_OPENAI_API_KEY",
+    "OPENAI_KEY",
+    "AWS_SECRET_ACCESS_KEY",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+}
+
+
+def scrubbed_subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Scrub sensitive API tokens and credentials from environment before passing to child subprocesses."""
+    clean = {}
+    for k, v in os.environ.items():
+        k_upper = k.upper()
+        if k in SENSITIVE_ENV_KEYS or k_upper in SENSITIVE_ENV_KEYS:
+            continue
+        if k_upper.endswith("_API_KEY") or k_upper.endswith("_SECRET") or k_upper.endswith("_TOKEN"):
+            continue
+        clean[k] = v
+    clean["PZ_MEMORY_INVOKED_BY"] = "memory-v1"
+    if extra:
+        clean.update(extra)
+    return clean
+
+
 def summarize_with_claude(
     *,
     instruction: str,
@@ -257,7 +287,7 @@ def summarize_with_claude(
         "--model", claude_model,
         prompt,
     ]
-    env = {**os.environ, "PZ_MEMORY_INVOKED_BY": "memory-v1"}
+    env = scrubbed_subprocess_env()
     run_func = runner or subprocess.run
     try:
         res = run_func(
@@ -345,7 +375,7 @@ def summarize_with_codex(
             cmd.extend(["-m", codex_model])
             cmd.append(prompt)
 
-            env = {**os.environ, "PZ_MEMORY_INVOKED_BY": "memory-v1"}
+            env = scrubbed_subprocess_env()
             run_func = runner or subprocess.run
             try:
                 res = run_func(
@@ -422,6 +452,8 @@ def summarize_with_hermes(
     if runner:
         return runner(instruction=instruction, untrusted_input=untrusted_input, schema=schema)
     if config is not None:
+        if config.provider_mode == "runtime-native":
+            raise ProviderBlocked("runtime-native-mode-prohibits-silent-api-fallback")
         try:
             actual_model = model or (
                 config.luna_model

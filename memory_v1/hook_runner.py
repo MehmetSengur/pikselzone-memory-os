@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .adapters import checkpoint_hook, load_hook_input
 from .core import MemoryConfig, MemoryError, ensure_safe_directory, write_health
+from .provider import scrubbed_subprocess_env
 
 
 def build_drain_command(
@@ -44,10 +45,6 @@ def main(argv: list[str] | None = None) -> int:
                 RECALL_EVIDENCE_PROVENANCE_NATIVE,
             )
             raw_stdin = sys.stdin.read()
-            try:
-                (config.state_path / "logs" / f"hook-{args.runtime}-{args.event}-stdin.json").write_text(raw_stdin, encoding="utf-8")
-            except OSError:
-                pass
             payload = load_hook_input(None, raw_stdin)
             transcript_p = (
                 payload.get("transcript_path")
@@ -97,10 +94,6 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(wire, ensure_ascii=False))
             return 0
         raw_stdin = sys.stdin.read()
-        try:
-            (config.state_path / "logs" / f"hook-{args.runtime}-{args.event}-stdin.json").write_text(raw_stdin, encoding="utf-8")
-        except OSError:
-            pass
         payload = load_hook_input(None, raw_stdin)
         queue_path = checkpoint_hook(
             config, runtime=args.runtime, payload=payload, event_override=args.event
@@ -108,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         log_dir = config.state_path / "logs"
         ensure_safe_directory(log_dir, create=True)
         repo_root = Path(__file__).resolve().parents[1]
-        env = {**os.environ, "PYTHONPATH": str(repo_root)}
+        env = scrubbed_subprocess_env({"PYTHONPATH": str(repo_root)})
         env.pop("PZ_MEMORY_INVOKED_BY", None)
         cmd = build_drain_command(args.config, queue_path)
         with (log_dir / f"drain-{args.runtime}.log").open("ab") as log:

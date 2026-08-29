@@ -785,18 +785,22 @@ def pre_llm_call(
                 lines.append("====================================================")
                 bundle_text = "\n".join(lines)
 
-            _write_hermes_recall_evidence(
-                session_id or "startup",
-                bundle_text,
-                source_files,
-                source_shas=source_shas if "source_shas" in locals() else {},
-                selected_item_ids=selected_item_ids if "selected_item_ids" in locals() else [],
-            )
+            try:
+                _write_hermes_recall_evidence(
+                    session_id or "startup",
+                    bundle_text,
+                    source_files,
+                    source_shas=source_shas if "source_shas" in locals() else {},
+                    selected_item_ids=selected_item_ids if "selected_item_ids" in locals() else [],
+                )
+            except Exception as ev_exc:
+                logger.warning("pz-memory-v1: non-fatal error recording recall evidence: %s", ev_exc)
+
             logger.info("pz-memory-v1: pre_llm_call injected startup recall bundle (%d chars) for session %s", len(bundle_text), session_id)
             return {"context": bundle_text}
     except Exception as exc:
-        logger.warning("pz-memory-v1: pre_llm_call failed: %s", exc)
-    return None
+        logger.warning("pz-memory-v1: pre_llm_call failed (entering degraded mode): %s", exc)
+        return {"context": "<!-- pz-memory: degraded-mode active due to staged bundle failure -->\n"}
 
 
 def on_session_end(**kwargs: Any) -> None:
