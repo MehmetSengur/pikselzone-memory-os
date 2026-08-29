@@ -94,12 +94,16 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         publisher_unit = (root / "memory_v1" / "operator" / "pz-memory-publisher.service").read_text(encoding="utf-8")
         compiler_unit = (root / "scripts" / "pz-memory-compiler.service").read_text(encoding="utf-8")
         bootstrap_unit = (root / "memory_v1" / "operator" / "pz-memory-permissions-bootstrap.service").read_text(encoding="utf-8")
+        sync_metadata_unit = (root / "memory_v1" / "operator" / "pz-obsidian-sync.service.d" / "20-file-metadata.conf").read_text(encoding="utf-8")
         self.assertEqual(1, compiler_step.count('/usr/local/sbin/pz-memory-permissions-bootstrap'))
         self.assertIn('/usr/bin/systemctl start --wait pz-memory-permissions-bootstrap.service', compiler_step)
         self.assertIn('Requires=pz-memory-permissions-bootstrap.service', publisher_unit)
         self.assertIn('Requires=pz-memory-permissions-bootstrap.service', compiler_unit)
         self.assertIn('ReadWritePaths=/srv/pz-hermes/hermes-data', bootstrap_unit)
         self.assertIn('NoNewPrivileges=true', bootstrap_unit)
+        self.assertIn('CapabilityBoundingSet=CAP_FOWNER', sync_metadata_unit)
+        self.assertIn('AmbientCapabilities=CAP_FOWNER', sync_metadata_unit)
+        self.assertNotIn('CAP_DAC_OVERRIDE', sync_metadata_unit)
 
     def test_double_flush_prevention(self):
         plugin = load_hermes_plugin()
