@@ -212,3 +212,64 @@ Natural conversational turn pairs yielded automated rule extraction without prom
 - **Local Second Brain V2**: **PASS** (Claude + Codex real lifecycle, cross-runtime recall, auto-growth, rule learning verified).
 - **Hermes VPS**: **HERMES_V2_DEPLOY_REQUIRED=YES** (Production deploy held).
 
+---
+
+## 16. Final Native Lifecycle Acceptance & Audit Closure (Canary Run)
+
+### 16.1 Proof Gap 1: Native SessionEnd Acceptance
+- **Harness**: Standard invocation (`claude -p --no-chrome`).
+- **Discovery**: In `settings.local.json`, `"matcher": ""` was blocking native `SessionStart` and `SessionEnd` hooks. Once removed, Claude Code automatically fires `SessionStart` on boot and `SessionEnd` on shutdown without ANY manual Python or CLI trigger.
+- **Canary Session**: `claude-07272cd423a3e22150561d37236f517b`
+  - Inbound Stdin: Verified in `.state/logs/hook-claude-SessionEnd-stdin.json` (`reason: other` / `prompt_input_exit`).
+  - Worker: Spawns `drain-claude` background worker automatically via `subprocess.Popen`.
+  - Artifacts: Daily event `daily/2026-08-29/claude-07272cd423a3e22150561d37236f517b.md` written natively.
+  - Rule Learned: `Yeni kalıcı tercihim: Dockerfile'larda her zaman multi-stage build adımlarını kullan` added to `companion/Kurallar.md` with source `claude-07272cd423a3e22150561d37236f517b`.
+  - **Manual Hook Runner Used**: **NO**.
+
+### 16.2 Proof Gap 2: Native SessionStart Evidence & Doctor
+- **Evidence Files**:
+  - Claude: `.state/evidence/recall-claude.json` (Native provenance, cryptographic receipt digest verified).
+  - Codex: `.state/evidence/recall-codex.json` (Native provenance, cryptographic receipt digest verified).
+- **Doctor Verification**:
+  - `python3 -m memory_v1.cli --config config-examples/memory-v1-workstation.json doctor`
+  - Status: **`ok`**
+  - Summary: **`fail: 0, blocked: 0, warning: 3`**
+  - Checks: `claude_startup_recall: pass (verified)`, `codex_startup_recall: pass (verified)`, `cross_runtime_continuity: pass (verified)`.
+  - **Manual Recall Evidence Used**: **NO**.
+
+### 16.3 Proof Gap 3: Skill Auto-Generation & Fresh Session Reuse
+- **Workflow**: `Aura Cache Sync çalıştırma adımları` (Steps: redis ping, cache flush, cache warmup).
+- **Session 1 (Claude Native)**: Session `claude-bc775c2f65a915aeb10ae452fe6c206c` executed procedure naturally -> native drain worker recorded candidate observation #1 in `.state/skill_candidates.json`.
+- **Session 2 (Codex Native)**: Session `01a04f33-c203-7f90-a565-1f3866cb04d5` executed procedure naturally -> native drain worker detected repetition (count >= 2) -> automatically materialized `skills/aura-cache-sync-calstrma-admlar/SKILL.md`.
+- **Session 3 (Fresh Claude Session)**: Session `claude -p` opened with prompt: *"Aura cache sync adımları nelerdir? Startup bundle'ındaki ek context dosyasını oku ve adımları söyle."*
+  - Output: Agent discovered `skills/aura-cache-sync-calstrma-admlar/SKILL.md` from the startup recall bundle and returned the exact 3 steps verbatim, citing the authority notice that derived memory requires operational verification.
+- **Python Function Calls (`record_workflow_observation` / `create_skill`)**: **NONE**. 100% automatic through background drain.
+
+### 16.4 Cross-Runtime Recall Verification
+- **Claude -> Codex**: Codex query *"Dockerfile'larda neyi tercih ediyorum? Hafızandaki kuralı doğrudan söyle."* -> Codex responded: *"Dockerfile’larda her zaman multi-stage build adımlarını kullanmayı tercih ediyorsun."*
+- **Codex -> Claude**: Claude query *"Mercury raporlarında sonuç bölümü nerede olmalı? Startup bundle'ındaki kuralı doğrudan söyle."* -> Claude responded: *"Mercury raporlarında sonuç bölümü her zaman en üstte olmalı."* (citing `SB2-CODEX-CANARY-7a91bf`).
+
+### 16.5 Final Audit Closure Variables
+```
+CURRENT_HEAD=1cb3cd97f5c2dff918ab9d6ac56383f68b321d33
+FULL_TESTS=PASS (210/210 passed in 4.740s)
+CLAUDE_SESSIONSTART_NATIVE=PASS
+CLAUDE_SESSIONEND_NATIVE=PASS
+CODEX_SESSIONSTART_NATIVE=PASS
+CODEX_SESSIONEND_NATIVE=PASS
+MANUAL_HOOK_RUNNER_USED_FOR_FINAL_CANARY=NO
+MANUAL_RECALL_EVIDENCE_USED=NO
+AUTO_RULE_NATIVE=PASS
+KNOWLEDGE_GROWTH_NATIVE=PASS
+SKILL_OBSERVATION_AUTOMATIC=PASS
+SKILL_GENERATION_NATIVE=PASS
+SKILL_REUSED_IN_FRESH_SESSION=PASS
+CLAUDE_TO_CODEX_NATIVE_RECALL=PASS
+CODEX_TO_CLAUDE_NATIVE_RECALL=PASS
+DOCTOR_NATIVE_EVIDENCE_PASS=PASS
+LOCAL_SECOND_BRAIN_V2=PASS
+HERMES_V2_DEPLOY_REQUIRED=YES
+REMAINING_BLOCKERS=NONE (Hermes VPS deployment held pending user authorization)
+```
+
+
