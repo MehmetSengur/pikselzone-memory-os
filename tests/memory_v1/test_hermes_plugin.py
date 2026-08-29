@@ -75,6 +75,19 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         self.assertIn("on_session_end", registered)
         self.assertIn("on_session_finalize", registered)
 
+    def test_plugin_never_chmods_shared_hermes_data_root(self):
+        plugin_source = (Path(__file__).resolve().parent.parent.parent / "hermes_plugins" / "pz-memory-v1" / "__init__.py").read_text(encoding="utf-8")
+        generator_source = (Path(__file__).resolve().parent.parent.parent / "hermes_plugins" / "pz-memory-v1" / "knowledge_generator.py").read_text(encoding="utf-8")
+        self.assertNotIn('os.chmod(p, 0o750)', plugin_source)
+        self.assertNotIn('os.chmod(p, 0o750)', generator_source)
+
+    def test_permission_bootstrap_keeps_pzmemory_traversal_minimal(self):
+        script = (Path(__file__).resolve().parent.parent.parent / "scripts" / "pz-memory-permissions-bootstrap").read_text(encoding="utf-8")
+        self.assertIn('u:pzmemory:--x,g::---,m::--x', script)
+        self.assertIn('--clear-groups', script)
+        self.assertIn('/usr/bin/test -x', script)
+        self.assertIn('/usr/bin/test -r', script)
+
     def test_double_flush_prevention(self):
         plugin = load_hermes_plugin()
         plugin._IN_MEMORY_COMPLETED.clear()
@@ -409,4 +422,3 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

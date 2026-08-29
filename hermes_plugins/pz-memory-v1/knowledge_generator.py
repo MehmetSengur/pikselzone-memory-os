@@ -57,24 +57,6 @@ COMPILER_JSON_SCHEMA: dict[str, Any] = {
 }
 
 
-def _ensure_permissions() -> None:
-    for p in ["/opt/data", "/opt/data/profiles"]:
-        try:
-            if os.path.isdir(p):
-                os.chmod(p, 0o750)
-        except OSError:
-            pass
-    try:
-        profiles_dir = "/opt/data/profiles"
-        if os.path.isdir(profiles_dir):
-            for entry in os.listdir(profiles_dir):
-                full = os.path.join(profiles_dir, entry)
-                if os.path.isdir(full):
-                    os.chmod(full, 0o750)
-    except OSError:
-        pass
-
-
 def _is_allowed_knowledge_path(rel_path: str) -> bool:
     if not rel_path or rel_path.startswith("/") or ".." in rel_path.split("/"):
         return False
@@ -91,7 +73,6 @@ def generate_knowledge(
     base_dir: str | None = None,
     llm_client: Any | None = None,
 ) -> dict[str, Any]:
-    _ensure_permissions()
     base = base_dir or os.environ.get("PZ_MEMORY_BASE_DIR") or "/opt/data/memory-v1"
     inbox_file = posixpath.join(base, "inbox", "knowledge-batch.json")
     outbox_dir = posixpath.join(base, "outbox", "knowledge")

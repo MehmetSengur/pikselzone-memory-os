@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The Hermes container bind-mounts this directory as /opt/data.  Do not chmod
+# it from the container: POSIX chmod recalculates ACL masks and can silently
+# revoke the named pzmemory traversal grant.
+HERMES_DATA_ROOT="/srv/pz-hermes/hermes-data"
+
+setfacl -m u:pzmemory:--x,g::---,m::--x "$HERMES_DATA_ROOT"
+
+if ! setpriv --reuid=pzmemory --regid=pzvault --clear-groups \
+    /usr/bin/test -x "$HERMES_DATA_ROOT"; then
+    echo "pz-memory-permissions-bootstrap: pzmemory traversal verification failed" >&2
+    exit 1
+fi
+
+if setpriv --reuid=pzmemory --regid=pzvault --clear-groups \
+    /usr/bin/test -r "$HERMES_DATA_ROOT"; then
+    echo "pz-memory-permissions-bootstrap: pzmemory unexpectedly gained directory read access" >&2
+    exit 1
+fi

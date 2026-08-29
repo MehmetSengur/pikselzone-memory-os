@@ -92,25 +92,6 @@ def _is_internal_call() -> bool:
     return os.environ.get("PZ_MEMORY_INTERNAL_CALL") == "1"
 
 
-def _ensure_outbox_permissions() -> None:
-    """Ensure /opt/data, profile dirs, and outbox have mode 0750/0770 so host pzmemory can access."""
-    for p in ["/opt/data", "/opt/data/profiles"]:
-        try:
-            if os.path.isdir(p):
-                os.chmod(p, 0o750)
-        except OSError:
-            pass
-    try:
-        profiles_dir = "/opt/data/profiles"
-        if os.path.isdir(profiles_dir):
-            for entry in os.listdir(profiles_dir):
-                full = os.path.join(profiles_dir, entry)
-                if os.path.isdir(full):
-                    os.chmod(full, 0o750)
-    except OSError:
-        pass
-
-
 def _record_lifecycle_receipt(
     session_id: str,
     hook_name: str,
@@ -475,7 +456,6 @@ def _render_and_stage_event(
     event_text = "\n".join(frontmatter + body).rstrip() + "\n"
     event_sha = hashlib.sha256(event_text.encode("utf-8")).hexdigest()
 
-    _ensure_outbox_permissions()
     base = os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR
     outbox_events_dir = posixpath.join(base, "outbox", "events")
     outbox_evidence_dir = posixpath.join(base, "outbox", "evidence")
@@ -557,7 +537,6 @@ def _render_and_stage_event(
         except OSError:
             pass
 
-    _ensure_outbox_permissions()
     logger.info("pz-memory-v1: successfully staged %s to outbox", filename)
     return final_path
 
@@ -812,7 +791,6 @@ def on_session_finalize(**kwargs: Any) -> None:
 
 
 def register(ctx: Any) -> None:
-    _ensure_outbox_permissions()
     ctx.register_hook("on_session_start", on_session_start)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("on_session_end", on_session_end)
