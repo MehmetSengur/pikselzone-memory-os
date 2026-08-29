@@ -258,61 +258,111 @@ def deduplicate_memory_items(items: list[RecallItem]) -> list[RecallItem]:
     return deduped
 
 
+def _find_candidate_path(vault_path: Path, filename: str) -> tuple[Path, str] | None:
+    """Find a file across companion/, 🔮 850-Companion/, or vault root."""
+    for parent in ("companion", "🔮 850-Companion", ""):
+        rel = f"{parent}/{filename}" if parent else filename
+        full = vault_path / rel
+        if full.is_file():
+            return full, rel
+    return None
+
+
 def _load_identity_and_rules(config: MemoryConfig) -> list[RecallItem]:
     """Tier A: Load identity, operating context, and core rules."""
     items: list[RecallItem] = []
-    candidates = (
-        ("Core.md", "identity", False),
-        ("canonical/Pikselzone Agency Operating Context.md", "identity", False),
-        ("Kurallar.md", "rule", False),
-        ("Rules.md", "rule", False),
-    )
 
-    for rel_path, item_type, is_derived in candidates:
-        full_path = config.vault_path / rel_path
-        if not full_path.exists():
-            continue
+    # 1. Identity / Core
+    identity_hit = _find_candidate_path(config.vault_path, "Core.md")
+    if not identity_hit:
+        canon = config.vault_path / "canonical/Pikselzone Agency Operating Context.md"
+        if canon.is_file():
+            identity_hit = (canon, "canonical/Pikselzone Agency Operating Context.md")
+
+    if identity_hit:
+        full_path, rel_path = identity_hit
         try:
             reject_symlink_chain(full_path)
             content, digest = secure_read_text(full_path, root=config.vault_path, max_bytes=1024 * 1024)
             sanitized, _ = sanitize_untrusted_memory(content)
-            
-            # For operating context, take the summary / purpose and boundaries (bounded extract)
             lines = [l for l in sanitized.splitlines() if l.strip()]
             extract = "\n".join(lines[:35]) if len(lines) > 35 else sanitized
-
             items.append(RecallItem(
                 item_id=f"tier-a-{rel_path}",
-                item_type=item_type,
+                item_type="identity",
                 title=full_path.stem,
                 content=extract,
                 source_file=rel_path,
                 source_sha256=digest,
                 relevance_score=10.0,
-                derived=is_derived,
+                derived=False,
             ))
         except Exception as exc:
-            logger.warning("Error reading identity/rule file %s: %s", rel_path, exc)
+            logger.warning("Error reading identity file %s: %s", rel_path, exc)
+
+    # 2. Kurallar / Learned Rules
+    rules_hit = _find_candidate_path(config.vault_path, "Kurallar.md") or _find_candidate_path(config.vault_path, "Rules.md")
+    if rules_hit:
+        full_path, rel_path = rules_hit
+        try:
+            reject_symlink_chain(full_path)
+            content, digest = secure_read_text(full_path, root=config.vault_path, max_bytes=1024 * 1024)
+            sanitized, _ = sanitize_untrusted_memory(content)
+            lines = [l for l in sanitized.splitlines() if l.strip()]
+            extract = "\n".join(lines[:35]) if len(lines) > 35 else sanitized
+            items.append(RecallItem(
+                item_id=f"tier-a-{rel_path}",
+                item_type="rule",
+                title=full_path.stem,
+                content=extract,
+                source_file=rel_path,
+                source_sha256=digest,
+                relevance_score=9.5,
+                derived=False,
+            ))
+        except Exception as exc:
+            logger.warning("Error reading rules file %s: %s", rel_path, exc)
 
     return items
 
 
 def _load_continuity(config: MemoryConfig) -> list[RecallItem]:
-    """Tier B: Load most recent legitimate continuity note or open threads."""
+    """Tier B: Load most recent session continuity, active threads, and latest journal."""
     items: list[RecallItem] = []
-    candidates = ("Last-Session.md", "Threads.md", "knowledge/log.md")
 
-    for rel_path in candidates:
-        full_path = config.vault_path / rel_path
-        if not full_path.exists():
-            continue
+    # 1. Last Session
+    ls_hit = _find_candidate_path(config.vault_path, "Last-Session.md")
+    if ls_hit:
+        full_path, rel_path = ls_hit
+        try:
+            reject_symlink_chain(full_path)
+            content, digest = secure_read_text(full_path, root=config.vault_path, max_bytes=512 * 1024)
+            sanitized, _ = sanitize_untrusted_memory(content)
+            lines = [l for l in sanitized.splitlines() if l.strip()]
+            extract = "\n".join(lines[:30]) if len(lines) > 30 else sanitized
+            items.append(RecallItem(
+                item_id=f"tier-b-{rel_path}",
+                item_type="continuity",
+                title=full_path.stem,
+                content=extract,
+                source_file=rel_path,
+                source_sha256=digest,
+                relevance_score=8.5,
+                derived=True,
+            ))
+        except Exception as exc:
+            logger.warning("Error reading Last-Session file %s: %s", rel_path, exc)
+
+    # 2. Threads
+    th_hit = _find_candidate_path(config.vault_path, "Threads.md")
+    if th_hit:
+        full_path, rel_path = th_hit
         try:
             reject_symlink_chain(full_path)
             content, digest = secure_read_text(full_path, root=config.vault_path, max_bytes=512 * 1024)
             sanitized, _ = sanitize_untrusted_memory(content)
             lines = [l for l in sanitized.splitlines() if l.strip()]
             extract = "\n".join(lines[:25]) if len(lines) > 25 else sanitized
-
             items.append(RecallItem(
                 item_id=f"tier-b-{rel_path}",
                 item_type="continuity",
@@ -324,7 +374,56 @@ def _load_continuity(config: MemoryConfig) -> list[RecallItem]:
                 derived=True,
             ))
         except Exception as exc:
-            logger.warning("Error reading continuity file %s: %s", rel_path, exc)
+            logger.warning("Error reading Threads file %s: %s", rel_path, exc)
+
+    # 3. Journal (Latest entry snippet)
+    jn_hit = _find_candidate_path(config.vault_path, "Journal.md")
+    if jn_hit:
+        full_path, rel_path = jn_hit
+        try:
+            reject_symlink_chain(full_path)
+            content, digest = secure_read_text(full_path, root=config.vault_path, max_bytes=512 * 1024)
+            sanitized, _ = sanitize_untrusted_memory(content)
+            entries = re.split(r"\n(?=##\s+)", sanitized)
+            latest_entry = entries[-1].strip() if len(entries) > 1 else sanitized
+            lines = [l for l in latest_entry.splitlines() if l.strip()][:15]
+            extract = "\n".join(lines)
+            if extract:
+                items.append(RecallItem(
+                    item_id=f"tier-b-{rel_path}",
+                    item_type="continuity",
+                    title="Son Journal",
+                    content=extract,
+                    source_file=rel_path,
+                    source_sha256=digest,
+                    relevance_score=7.5,
+                    derived=True,
+                ))
+        except Exception as exc:
+            logger.warning("Error reading Journal file %s: %s", rel_path, exc)
+
+    # 4. Knowledge log fallback
+    if not items:
+        klog = config.vault_path / "knowledge/log.md"
+        if klog.is_file():
+            try:
+                reject_symlink_chain(klog)
+                content, digest = secure_read_text(klog, root=config.vault_path, max_bytes=512 * 1024)
+                sanitized, _ = sanitize_untrusted_memory(content)
+                lines = [l for l in sanitized.splitlines() if l.strip()]
+                extract = "\n".join(lines[:20]) if len(lines) > 20 else sanitized
+                items.append(RecallItem(
+                    item_id="tier-b-knowledge-log",
+                    item_type="continuity",
+                    title="Knowledge Log",
+                    content=extract,
+                    source_file="knowledge/log.md",
+                    source_sha256=digest,
+                    relevance_score=7.0,
+                    derived=True,
+                ))
+            except Exception as exc:
+                logger.warning("Error reading knowledge log: %s", exc)
 
     return items
 
@@ -654,6 +753,59 @@ def targeted_recall(
                         source_file=str(path.relative_to(config.vault_path)),
                         source_sha256=digest,
                         relevance_score=score,
+                        derived=True,
+                    ))
+            except Exception:
+                pass
+
+    # 2.5 Search companion documents (Core, Kurallar, Last-Session, Threads, Journal)
+    for parent in ("companion", "🔮 850-Companion", ""):
+        comp_dir = (config.vault_path / parent) if parent else config.vault_path
+        if not comp_dir.is_dir():
+            continue
+        for fname in ("Core.md", "Kurallar.md", "Last-Session.md", "Threads.md", "Journal.md"):
+            c_file = comp_dir / fname
+            if not c_file.is_file():
+                continue
+            try:
+                reject_symlink_chain(c_file)
+                content, digest = secure_read_text(c_file, root=config.vault_path, max_bytes=1024 * 1024)
+                sanitized, _ = sanitize_untrusted_memory(content)
+                score = score_text_relevance(sanitized, query, title=c_file.stem)
+                if score > 0:
+                    candidates.append(RecallItem(
+                        item_id=f"companion-{c_file.stem}",
+                        item_type="rule" if "kural" in c_file.stem.lower() else "continuity",
+                        title=f"Companion: {c_file.stem}",
+                        content=sanitized[:2500],
+                        source_file=str(c_file.relative_to(config.vault_path)),
+                        source_sha256=digest,
+                        relevance_score=score + 3.0,
+                        derived=False if c_file.stem == "Core" else True,
+                    ))
+            except Exception:
+                pass
+
+    # 2.6 Search skills
+    for skills_dir_name in ("skills", ".claude/skills", ".codex/skills"):
+        s_folder = config.vault_path / skills_dir_name
+        if not s_folder.is_dir():
+            continue
+        for path in s_folder.glob("**/SKILL.md"):
+            try:
+                reject_symlink_chain(path)
+                content, digest = secure_read_text(path, root=config.vault_path, max_bytes=512 * 1024)
+                sanitized, _ = sanitize_untrusted_memory(content)
+                score = score_text_relevance(sanitized, query, title=path.parent.name)
+                if score > 0:
+                    candidates.append(RecallItem(
+                        item_id=f"skill-{path.parent.name}",
+                        item_type="rule",
+                        title=f"Skill: {path.parent.name}",
+                        content=sanitized[:2500],
+                        source_file=str(path.relative_to(config.vault_path)),
+                        source_sha256=digest,
+                        relevance_score=score + 2.5,
                         derived=True,
                     ))
             except Exception:

@@ -29,15 +29,15 @@ Transform Pikselzone Memory OS from a passive, overly restrictive session logger
 - Memory engine failure resilience: child failures degrade gracefully without blocking agent sessions.
 
 ## Current Task
-SB2-03: Startup context / targeted recall'u gerçek second-brain davranışına dönüştür (relevance > recency, clean bounded context <= 16k chars, companion memory sections injection, eliminate noisy authority warnings).
+SB2-04: Automatic rules learning (detection of user correction signals like 'bundan sonra...', 'bunu böyle yapma', rule candidate vs durable promotion, conflict reconciliation, deduplication).
 
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
 - **SB2-01**: Codex old + new rollout format compatibility (both legacy `user_message`/`agent_message` and modern `item_completed` with `UserMessage`/`AgentMessage`, case-insensitive `text`/`Text` block extraction, complete filtering of `Reasoning`/`CommandExecution`/`FileChange`/internal events, and regression check against silent 0-turn failure with 10 targeted tests PASS).
 - **SB2-02**: Second-brain memory schema & companion manager (`Core.md` identity/user model, `Kurallar.md` learned rules/preferences, `Last-Session.md` operational continuity, `Threads.md` multi-session topics & archiving to `Threads-Archive.md`, and `Journal.md` narrative log, with 9 targeted tests PASS).
+- **SB2-03**: Startup context / targeted recall redesigned for living second-brain behavior (clean bounded context <= 16k chars, companion memory sections injection, relevance > recency deep recall across companion files and skills, with 4 targeted tests PASS).
 
 ## Remaining Work
-- **SB2-03**: Startup context & targeted recall redesign (relevance > recency, clean bounded context <= 16k chars).
 - **SB2-04**: Automatic rules learning (detection, deduplication, conflict reconciliation).
 - **SB2-05**: Knowledge graph auto-growth & reconciliation (concepts, connections `a--b.md`, index/log, wikilinks).
 - **SB2-06**: Self-generating & self-updating skills (candidate detection, generation, retrieval, iterative improvement).
@@ -55,3 +55,5 @@ SB2-03: Startup context / targeted recall'u gerçek second-brain davranışına 
 - SB2-01 Full regression: 159/159 tests PASS in 1.719s (`python3 -m unittest discover -s tests/memory_v1`).
 - SB2-02: 9/9 targeted tests PASS in 0.050s (`tests/memory_v1/test_companion.py`).
 - SB2-02 Full regression: 168/168 tests PASS in 1.846s (`python3 -m unittest discover -s tests/memory_v1`).
+- SB2-03: 4/4 targeted tests PASS in 0.051s (`tests/memory_v1/test_second_brain_recall.py`).
+- SB2-03 Full regression: 172/172 tests PASS in 1.802s (`python3 -m unittest discover -s tests/memory_v1`).
