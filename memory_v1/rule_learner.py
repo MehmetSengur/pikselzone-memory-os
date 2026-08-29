@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Set, Tuple
 
 from .companion import CompanionManager, RuleItem
-from .core import iso_now, redact_sensitive_text
+from .core import atomic_write, iso_now, redact_sensitive_text
 
 logger = logging.getLogger("memory_v1.rule_learner")
 
@@ -274,5 +274,5 @@ class RuleLearner:
             elif line.strip() == "## Arşivlenmiş / Geçersiz Kılınmış Kurallar":
                 final_lines.append(archive_entry)
 
-        rules_path.write_text("\n".join(final_lines) + "\n", encoding="utf-8")
+        atomic_write(rules_path, "\n".join(final_lines) + "\n", mode=0o660)
         logger.info("Reconciled rule: replaced '%s' with '%s'", old_rule.text, clean_new)

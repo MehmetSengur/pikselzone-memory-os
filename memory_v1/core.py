@@ -591,6 +591,10 @@ def atomic_write(path: Path, data: bytes | str, mode: int = 0o600) -> None:
             mode,
             dir_fd=parent_descriptor,
         )
+        # `open(..., mode)` is filtered by the process umask.  Callers use
+        # explicit modes to preserve bounded shared-vault group access, so
+        # apply the requested mode to the newly-created, still-private FD.
+        os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as output:
             descriptor = None
             output.write(payload)

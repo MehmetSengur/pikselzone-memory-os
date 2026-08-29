@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import stat
 from pathlib import Path
 
 from memory_v1.companion import CompanionManager
@@ -72,6 +73,10 @@ class TestRuleLearner(unittest.TestCase):
         content = (self.companion.companion_dir / "Kurallar.md").read_text(encoding="utf-8")
         self.assertIn("## Arşivlenmiş / Geçersiz Kılınmış Kurallar", content)
         self.assertIn("unittest", content)
+        self.assertEqual(
+            stat.S_IMODE((self.companion.companion_dir / "Kurallar.md").stat().st_mode),
+            0o660,
+        )
 
     # 5. Overlap calculation
     def test_calculate_overlap(self):
