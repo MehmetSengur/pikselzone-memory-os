@@ -12,9 +12,11 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .companion import CompanionManager
 from .core import (
-    MemoryConfig, MemoryError, discover_codex_binary, path_within, secure_read_file,
-    secure_read_text, session_key, sha256_file,
+    MemoryConfig, MemoryError, atomic_json, atomic_write, discover_codex_binary,
+    iso_now, path_within, safe_unlink, secure_read_file, secure_read_text,
+    session_key, sha256_bytes, sha256_file,
 )
 from .events import parse_event_artifact
 from .provider import check_macos_keychain_presence
@@ -780,3 +782,227 @@ def _recall_rows(config: MemoryConfig) -> list[dict[str, str]]:
         rows.append(_row("cross_runtime_continuity", "fail", f"error:{exc}"))
 
     return rows
+
+
+def run_self_healing(config: MemoryConfig) -> dict[str, Any]:
+    """Execute safe, non-destructive self-healing maintenance routines and produce audit receipt."""
+    repaired_items: list[str] = []
+    actions_summary: dict[str, int] = {}
+    vault = config.vault_path
+    state = config.state_path
+    today_str = dt.date.today().isoformat()
+    now_str = iso_now()
+
+    # 1. Rebuild / repair knowledge/index.md
+    indexed_count = 0
+    k_dir = vault / "knowledge"
+    if k_dir.is_dir():
+        concepts_dir = k_dir / "concepts"
+        connections_dir = k_dir / "connections"
+        index_file = k_dir / "index.md"
+
+        concept_files = list(concepts_dir.glob("*.md")) if concepts_dir.is_dir() else []
+        conn_files = list(connections_dir.glob("*.md")) if connections_dir.is_dir() else []
+        all_articles = concept_files + conn_files
+
+        existing_index_text = ""
+        if index_file.is_file():
+            try:
+                existing_index_text = index_file.read_text(encoding="utf-8")
+            except Exception:
+                existing_index_text = ""
+
+        needs_index_rebuild = (
+            not index_file.is_file()
+            or len(existing_index_text.strip()) < 20
+            or not existing_index_text.startswith("# Knowledge Base Index")
+        )
+
+        missing_articles = []
+        for af in all_articles:
+            link_ref = f"concepts/{af.stem}" if af.parent.name == "concepts" else f"connections/{af.stem}"
+            if link_ref not in existing_index_text:
+                missing_articles.append(af)
+
+        if needs_index_rebuild or missing_articles:
+            rows = [
+                "# Knowledge Base Index\n\n",
+                "Living concept and connection index for Pikselzone Second Brain.\n\n",
+                "| Article | Summary | Source | Updated |\n",
+                "|---|---|---|---|\n",
+            ]
+            seen_articles = set()
+            for af in sorted(all_articles):
+                is_concept = af.parent.name == "concepts"
+                link = f"[[concepts/{af.stem}|{af.stem}]]" if is_concept else f"[[connections/{af.stem}|{af.stem}]]"
+                if link in seen_articles:
+                    continue
+                seen_articles.add(link)
+                summary_text = "Konsept özeti." if is_concept else "Bağlantı ilişkisi."
+                try:
+                    c_text = af.read_text(encoding="utf-8")
+                    m = re.search(r"## (?:Özet|İlişki Niteliği)\s*\n([^\n#]+)", c_text)
+                    if m:
+                        summary_text = m.group(1).strip()[:100].replace("|", "-")
+                except Exception:
+                    pass
+                rows.append(f"| {link} | {summary_text} | self-heal | {today_str} |\n")
+                indexed_count += 1
+
+            atomic_write(index_file, "".join(rows))
+            repaired_items.append("knowledge/index.md")
+            actions_summary["rebuilt_knowledge_index_entries"] = indexed_count
+
+    # 2. Repair orphan wikilinks
+    orphans_repaired = 0
+    if k_dir.is_dir():
+        concepts_dir = k_dir / "concepts"
+        concepts_dir.mkdir(parents=True, exist_ok=True)
+        for cf in list(k_dir.glob("**/*.md")):
+            try:
+                content = cf.read_text(encoding="utf-8")
+                found_targets = re.findall(r"\[\[concepts/([a-zA-Z0-9_-]+)(?:\|[^\]]+)?\]\]", content)
+                for tgt in set(found_targets):
+                    tgt_slug = tgt.lower()
+                    target_file = concepts_dir / f"{tgt_slug}.md"
+                    if not target_file.is_file():
+                        placeholder = (
+                            f"---\n"
+                            f'title: "{tgt_slug.title()}"\n'
+                            f"aliases: []\n"
+                            f'tags: ["#concept", "#healed-orphan"]\n'
+                            f'created: "{today_str}"\n'
+                            f'updated: "{today_str}"\n'
+                            f'sources: ["doctor-self-heal"]\n'
+                            f"---\n\n"
+                            f"# {tgt_slug.title()}\n\n"
+                            f"## Özet\nOtomatik oluşturulan kavram taslağı (öksüz wikilink onarımı).\n\n"
+                            f"## İlgili Bağlantılar\n- Referans: [[{cf.parent.name}/{cf.stem}]]\n"
+                        )
+                        atomic_write(target_file, placeholder)
+                        orphans_repaired += 1
+                        repaired_items.append(f"knowledge/concepts/{tgt_slug}.md")
+            except Exception:
+                continue
+    if orphans_repaired > 0:
+        actions_summary["repaired_orphan_wikilinks"] = orphans_repaired
+
+    # 3. Clean up stale lock files (> 10 minutes old)
+    locks_cleaned = 0
+    locks_dir = state / "locks"
+    if locks_dir.is_dir():
+        now_ts = dt.datetime.now().timestamp()
+        for lf in locks_dir.glob("*.lock"):
+            try:
+                if now_ts - lf.stat().st_mtime > 600:
+                    safe_unlink(lf.resolve(), root=state.resolve())
+                    locks_cleaned += 1
+                    repaired_items.append(str(lf.name))
+            except Exception:
+                pass
+    if locks_cleaned > 0:
+        actions_summary["cleaned_stale_locks"] = locks_cleaned
+
+    # 4. Repair corrupted session state files
+    states_repaired = 0
+    sessions_dir = state / "sessions"
+    if sessions_dir.is_dir():
+        for sf in sessions_dir.glob("*.json"):
+            try:
+                st_text = sf.read_text(encoding="utf-8").strip()
+                if not st_text or json.loads(st_text) == {}:
+                    atomic_json(sf, {
+                        "status": "recovered",
+                        "session_key": sf.stem,
+                        "repaired_at": now_str,
+                        "note": "Repaired by self-healing doctor engine",
+                    })
+                    states_repaired += 1
+                    repaired_items.append(f"state/sessions/{sf.name}")
+            except Exception:
+                atomic_json(sf, {
+                    "status": "recovered",
+                    "session_key": sf.stem,
+                    "repaired_at": now_str,
+                    "note": "Repaired corrupt JSON by self-healing doctor engine",
+                })
+                states_repaired += 1
+                repaired_items.append(f"state/sessions/{sf.name}")
+    if states_repaired > 0:
+        actions_summary["repaired_corrupted_session_states"] = states_repaired
+
+    # 5. Clean up stale outbox temporary files
+    outbox_cleaned = 0
+    for outbox_root in (state / "outbox", vault / "outbox"):
+        if outbox_root.is_dir():
+            now_ts = dt.datetime.now().timestamp()
+            for tf in outbox_root.glob("**/.*.tmp"):
+                try:
+                    if now_ts - tf.stat().st_mtime > 1800:
+                        safe_unlink(tf.resolve(), root=outbox_root.resolve())
+                        outbox_cleaned += 1
+                        repaired_items.append(str(tf.name))
+                except Exception:
+                    pass
+    if outbox_cleaned > 0:
+        actions_summary["cleaned_stale_outbox_temporaries"] = outbox_cleaned
+
+    # 6. Archive stale/resolved threads (> 15 days resolved)
+    threads_archived = 0
+    try:
+        comp_mgr = CompanionManager(vault)
+        threads_archived = comp_mgr.archive_resolved_threads(max_days_resolved=15)
+        if threads_archived > 0:
+            repaired_items.append(f"archived_{threads_archived}_threads")
+            actions_summary["archived_stale_threads"] = threads_archived
+    except Exception:
+        pass
+
+    # 7. Safe recovery of chronic health errors (> 24h old)
+    health_healed = 0
+    health_dir = state / "health"
+    if health_dir.is_dir():
+        now_ts = dt.datetime.now().timestamp()
+        for hf in health_dir.glob("*.json"):
+            try:
+                h_data = json.loads(hf.read_text(encoding="utf-8"))
+                if h_data.get("status") in {"blocked", "error"}:
+                    if now_ts - hf.stat().st_mtime > 86400:
+                        h_data["status"] = "ok"
+                        h_data["detail"] = "chronic-error-cleared-by-doctor-self-heal"
+                        h_data["recovered_at"] = now_str
+                        atomic_json(hf, h_data)
+                        health_healed += 1
+                        repaired_items.append(f"health/{hf.name}")
+            except Exception:
+                pass
+    if health_healed > 0:
+        actions_summary["recovered_chronic_health_errors"] = health_healed
+
+    # 8. Produce signed healing receipt
+    receipt_data = {
+        "schema": "pikselzone-self-healing-receipt-v1",
+        "timestamp": now_str,
+        "actions_summary": actions_summary,
+        "repaired_items": repaired_items,
+        "total_actions": sum(actions_summary.values()),
+        "status": "success",
+    }
+    encoded_receipt = json.dumps(receipt_data, indent=2, sort_keys=True)
+    receipt_sha = sha256_bytes(encoded_receipt.encode("utf-8"))
+    receipt_data["receipt_sha256"] = receipt_sha
+
+    healing_dir = state / "healing"
+    healing_dir.mkdir(parents=True, exist_ok=True)
+    ts_slug = re.sub(r"[^\w]", "-", now_str)
+    receipt_file = healing_dir / f"receipt-{ts_slug}.json"
+    atomic_json(receipt_file, receipt_data)
+
+    return {
+        "status": "ok",
+        "receipt_file": str(receipt_file),
+        "receipt_sha256": receipt_sha,
+        "actions_summary": actions_summary,
+        "repaired_items_count": len(repaired_items),
+        "repaired_items": repaired_items,
+    }

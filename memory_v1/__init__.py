@@ -7,6 +7,7 @@ derived context only.
 
 from .companion import CompanionManager, LastSessionData, RuleItem, ThreadItem
 from .core import MemoryConfig, MemoryError
+from .doctor import run_doctor, run_self_healing
 from .graph_engine import ConceptData, KnowledgeGraphEngine
 from .rule_learner import RuleLearner
 from .skill_engine import SkillEngine, SkillSpec, WorkflowObservation
@@ -24,4 +25,6 @@ __all__ = [
     "SkillSpec",
     "ThreadItem",
     "WorkflowObservation",
+    "run_doctor",
+    "run_self_healing",
 ]

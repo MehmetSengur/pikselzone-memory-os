@@ -29,7 +29,8 @@ def _parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("--hook-input", type=Path)
     drain = commands.add_parser("drain")
     drain.add_argument("--queue", required=True, type=Path)
-    commands.add_parser("doctor")
+    doc_cmd = commands.add_parser("doctor")
+    doc_cmd.add_argument("--heal", "--fix", action="store_true", dest="heal", help="Run self-healing maintenance and produce audit receipt")
     compile_cmd = commands.add_parser("compile")
     compile_cmd.add_argument("--max-events", type=int, default=50)
     compile_cmd.add_argument("--outbox", type=Path)
@@ -142,6 +143,11 @@ def main(argv: list[str] | None = None) -> int:
                         print(json.dumps(wire, ensure_ascii=False))
                 return 0
         if args.command == "doctor":
+            if getattr(args, "heal", False):
+                from .doctor import run_self_healing
+                result = run_self_healing(config)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 0
             result = run_doctor(config)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0 if result["status"] == "ok" else 2
