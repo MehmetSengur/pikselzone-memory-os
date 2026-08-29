@@ -51,6 +51,11 @@ def _parser() -> argparse.ArgumentParser:
     recall_cmd.add_argument("--format", choices=("wire", "markdown", "json"), default="wire")
     recall_cmd.add_argument("--record-evidence", action="store_true")
     recall_cmd.add_argument("--session-key", type=str, default="cli-recall")
+    import_cmd = commands.add_parser("import-history")
+    import_cmd.add_argument("--file", required=True, type=Path)
+    import_cmd.add_argument("--format", choices=("claude", "chatgpt", "codex", "gemini", "markdown"), default=None)
+    parity_cmd = commands.add_parser("parity")
+    parity_cmd.add_argument("--align", action="store_true", default=True)
     return parser
 
 
@@ -163,6 +168,20 @@ def main(argv: list[str] | None = None) -> int:
             from .compiler import promote_knowledge_outbox
             res = promote_knowledge_outbox(config, outbox_root=args.outbox)
             print(json.dumps(res, ensure_ascii=False))
+            return 0
+        if args.command == "import-history":
+            import dataclasses
+            from .importers import HistoryImportEngine
+            engine = HistoryImportEngine(config)
+            receipt = engine.import_file(args.file, source_format=args.format)
+            print(json.dumps(dataclasses.asdict(receipt), ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "parity":
+            import dataclasses
+            from .parity import SharedBrainParityManager
+            mgr = SharedBrainParityManager(config.vault_path)
+            report = mgr.align_shared_brain()
+            print(json.dumps(dataclasses.asdict(report), ensure_ascii=False, indent=2))
             return 0
     except DuplicateEvent as exc:
         print(json.dumps({"status": "duplicate", "event_path": str(exc)}))

@@ -14,8 +14,10 @@ from .core import (
     exclusive_lock, iso_now, normalize_transcript, reject_symlink_chain,
     path_within, session_key, summary_json_schema, validate_summary, write_health,
 )
+from .graph_engine import ConceptData, KnowledgeGraphEngine
 from .provider import StructuredResponsesProvider
 from .rule_learner import RuleLearner
+from .skill_engine import SkillEngine, WorkflowObservation
 
 
 SECTION_TITLES = {
@@ -173,10 +175,17 @@ class EventWriter:
             })
             write_health(self.config.state_path, f"flush-{runtime}", "ok")
 
-            # Second Brain: Learn rules, update Last-Session, and append Journal entry
+            # Second Brain Pipeline:
+            # 1. Rule learning & deduplication / reconciliation
+            # 2. Companion continuity: Last-Session update & Journal log
+            # 3. Knowledge Graph auto-growth (concepts & connections)
+            # 4. Skill candidate observation & auto-synthesis
             try:
                 companion_mgr = CompanionManager(self.config.vault_path)
                 rule_learner = RuleLearner(companion_mgr)
+                graph_engine = KnowledgeGraphEngine(self.config.vault_path)
+                skill_engine = SkillEngine(self.config.vault_path)
+
                 turn_pairs = []
                 for line in normalized.splitlines():
                     if line.startswith("USER: "):
@@ -186,7 +195,8 @@ class EventWriter:
                 if turn_pairs:
                     rule_learner.learn_from_transcript(turn_pairs, source_session=f"{runtime}-{state_key}")
 
-                if summary and summary.get("status") == "ok":
+                if summary and summary.get("status") in {"memory", "ok"}:
+                    # Update Last-Session continuity
                     ls_data = LastSessionData(
                         runtime=runtime,
                         session_id=session_id,
@@ -199,6 +209,7 @@ class EventWriter:
                     )
                     companion_mgr.write_last_session(ls_data)
 
+                    # Append to Journal
                     decisions = summary.get("decisions", [])
                     learnings = summary.get("learnings", [])
                     if decisions or learnings:
@@ -208,6 +219,49 @@ class EventWriter:
                             narrative=narrative,
                             runtime=runtime,
                         )
+
+                    # Knowledge Graph: Auto-extract concepts from decisions and learnings
+                    created_slugs: list[str] = []
+                    for item_text in decisions + learnings:
+                        terms = re.findall(r"\b[A-Z][a-zA-Z0-9_\-\.]{2,}\b", item_text)
+                        for term in terms:
+                            if term.lower() not in {
+                                "the", "this", "that", "with", "from", "when", "then",
+                                "true", "false", "none", "null", "user", "assistant"
+                            }:
+                                c_path = graph_engine.add_or_update_concept(ConceptData(
+                                    title=term,
+                                    summary=item_text[:140],
+                                    details=[f"{event} ({runtime}): {item_text}"],
+                                    sources=[f"{runtime}:{state_key}"],
+                                ))
+                                if c_path.stem not in created_slugs:
+                                    created_slugs.append(c_path.stem)
+
+                    # Connect concepts co-occurring in this session
+                    if len(created_slugs) >= 2:
+                        for i in range(len(created_slugs) - 1):
+                            sa, sb = created_slugs[i], created_slugs[i + 1]
+                            if sa != sb:
+                                graph_engine.add_or_update_connection(
+                                    concept_a=sa,
+                                    concept_b=sb,
+                                    relationship="aynı oturumda birlikte kararlaştırıldı",
+                                    evidence=[f"{runtime}:{state_key}"],
+                                    source=f"{runtime}:{state_key}",
+                                )
+
+                    # Skill Engine: Observe multi-step workflows in conversations
+                    for conv in summary.get("important_conversations", []):
+                        if any(marker in conv.lower() for marker in ("adımlar", "komut", "workflow", "deploy", "build", "test", "kurulum", "ayarla", "görev")):
+                            w_name = conv.split(":", 1)[0].strip(" -:") if ":" in conv else conv[:40].strip(" -:")
+                            w_steps = [s.strip() for s in re.split(r"[;\n,]+", conv.split(":", 1)[1] if ":" in conv else conv) if len(s.strip()) > 3][:5]
+                            skill_engine.record_workflow_observation(WorkflowObservation(
+                                workflow_name=w_name,
+                                goal=conv[:120],
+                                steps=w_steps,
+                                session_id=f"{runtime}-{state_key}",
+                            ))
             except Exception:
                 pass
 

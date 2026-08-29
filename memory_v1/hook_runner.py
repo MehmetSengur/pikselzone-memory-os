@@ -38,6 +38,11 @@ def main(argv: list[str] | None = None) -> int:
     config = MemoryConfig.load(args.config)
     try:
         if args.event == "SessionStart":
+            try:
+                from .parity import SharedBrainParityManager
+                SharedBrainParityManager(config.vault_path).align_shared_brain()
+            except Exception:
+                pass
             from .recall import (
                 build_startup_recall_bundle,
                 find_runtime_session_artifact,
