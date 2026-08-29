@@ -126,6 +126,103 @@ def publish_outbox(
                     "sha256": event_digest,
                 })
 
+                # Second Brain Pipeline for promoted Hermes event
+                try:
+                    from .companion import CompanionManager, LastSessionData
+                    from .graph_engine import KnowledgeGraphEngine, ConceptData
+                    from .rule_learner import RuleLearner
+                    from .skill_engine import SkillEngine, WorkflowObservation
+
+                    companion_mgr = CompanionManager(config.vault_path)
+                    rule_learner = RuleLearner(companion_mgr)
+                    graph_engine = KnowledgeGraphEngine(config.vault_path)
+                    skill_engine = SkillEngine(config.vault_path)
+
+                    # 1. Learn rules from event summary & text
+                    rule_candidates = (
+                        event.get("important_conversations", [])
+                        + event.get("decisions", [])
+                        + event.get("learnings", [])
+                    )
+                    turn_pairs = [("user", cand) for cand in rule_candidates]
+                    if turn_pairs:
+                        rule_learner.learn_from_transcript(turn_pairs, source_session=f"hermes-{session_hash}")
+
+                    # 2. Update Last-Session continuity & Journal
+                    summary_context = event.get("context", []) or event.get("important_conversations", [])
+                    decisions = event.get("decisions", [])
+                    learnings = event.get("learnings", [])
+                    open_items = event.get("open_items", [])
+                    ls_data = LastSessionData(
+                        runtime="hermes",
+                        session_id=str(event.get("session_id", session_hash)),
+                        completed_items=summary_context[:5],
+                        decisions=decisions[:5],
+                        pending_items=open_items[:5],
+                        next_steps=open_items[:3],
+                        active_project=str(event.get("root_task_id", config.vault_path.name)),
+                        updated_at=created_at,
+                    )
+                    companion_mgr.write_last_session(ls_data)
+
+                    if decisions or learnings:
+                        narrative = " ".join(decisions[:2] + learnings[:2])
+                        companion_mgr.append_journal_entry(
+                            title=f"{str(event.get('event', 'session_end')).replace('_', ' ').capitalize()} Özeti",
+                            narrative=narrative,
+                            runtime="hermes",
+                        )
+
+                    # 3. Knowledge Graph concepts & connections
+                    created_slugs: list[str] = []
+                    for item_text in decisions + learnings:
+                        terms = re.findall(r"\b[A-Z][a-zA-Z0-9_\-\.]{2,}\b", item_text)
+                        for term in terms:
+                            if term.lower() not in {
+                                "the", "this", "that", "with", "from", "when", "then",
+                                "true", "false", "none", "null", "user", "assistant"
+                            }:
+                                c_path = graph_engine.add_or_update_concept(ConceptData(
+                                    title=term,
+                                    summary=item_text[:140],
+                                    details=[f"{event.get('event', 'session_end')} (hermes): {item_text}"],
+                                    sources=[f"hermes:{session_hash}"],
+                                ))
+                                if c_path.stem not in created_slugs:
+                                    created_slugs.append(c_path.stem)
+                    if len(created_slugs) >= 2:
+                        for i in range(len(created_slugs) - 1):
+                            sa, sb = created_slugs[i], created_slugs[i + 1]
+                            if sa != sb:
+                                graph_engine.add_or_update_connection(
+                                    concept_a=sa,
+                                    concept_b=sb,
+                                    relationship="aynı oturumda birlikte kararlaştırıldı",
+                                    evidence=[f"hermes:{session_hash}"],
+                                    source=f"hermes:{session_hash}",
+                                )
+
+                    # 4. Skill candidate observation
+                    workflow_candidates = []
+                    for item in event.get("important_conversations", []) + decisions:
+                        if any(marker in item.lower() for marker in ("adımlar", "komut", "workflow", "prosedür", "deploy", "build", "test", "kontrol", "kurulum", "ayarla", "görev")):
+                            workflow_candidates.append(item)
+                    for cand in workflow_candidates:
+                        w_name = cand.split(":", 1)[0].strip(" -:\n") if ":" in cand else cand[:40].strip(" -:\n")
+                        if ":" in w_name:
+                            w_name = w_name.split(":")[-1].strip()
+                        body = cand.split(":", 1)[1] if ":" in cand else cand
+                        w_steps = [s.strip() for s in re.split(r"(?:[0-9]+\.|\n|;|,)+", body) if len(s.strip()) > 5][:6]
+                        if len(w_steps) >= 2:
+                            skill_engine.record_workflow_observation(WorkflowObservation(
+                                workflow_name=w_name[:50],
+                                goal=cand[:120].strip(),
+                                steps=w_steps,
+                                session_id=f"hermes-{session_hash}",
+                            ))
+                except Exception as sb_exc:
+                    logger.warning("Second brain pipeline warning during event publish: %s", sb_exc)
+
             # Check and promote corresponding evidence receipt if available
             evidence_file = evidence_dir / f"hermes-{session_hash}.json"
             if evidence_file.exists():
