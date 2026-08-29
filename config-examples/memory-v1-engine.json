@@ -1,0 +1,25 @@
+{
+  "role": "memory-engine",
+  "vault_path": "/srv/pz-hermes/vault",
+  "state_path": "/var/lib/pz-memory-v1",
+  "runtimes": ["hermes"],
+  "transcript_roots": {
+    "hermes": ["/srv/pz-hermes/hermes-data"]
+  },
+  "can_write_event_memory": true,
+  "can_run_compiler": true,
+  "models": {
+    "flush": "gpt-5.6-luna",
+    "compiler": "gpt-5.6-terra"
+  },
+  "provider": {
+    "api_base": "https://api.openai.com/v1",
+    "key_env": "OPENAI_API_KEY"
+  },
+  "context_budget_chars": 16000,
+  "sync_evidence_path": "/var/lib/pz-memory-v1/evidence/last-sync-ok",
+  "backup_evidence_path": "/var/lib/pz-memory-v1/evidence/last-backup-ok",
+  "activation": {
+    "hermes_lifecycle_evidence_path": "/var/lib/pz-memory-v1/evidence/hermes-lifecycle-smoke.json"
+  }
+}

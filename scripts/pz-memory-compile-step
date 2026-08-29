@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pikselzone Memory V1 - Pipeline-Wide Locked Compilation Step
+LOCK_FILE="/var/lib/pz-memory-v1/locks/pipeline.lock"
+mkdir -p "$(dirname "$LOCK_FILE")"
+exec 200>"$LOCK_FILE"
+
+if ! flock -n 200; then
+    echo '{"status": "lock_busy", "reason": "pipeline-already-running"}'
+    exit 75
+fi
+
+STAGE_JSON=$(setpriv --reuid=pzmemory --regid=pzvault --clear-groups /usr/local/sbin/pz-memory --config /etc/pz-memory-v1/engine.json stage-knowledge-batch)
+STATUS=$(python3 -c "import sys, json; print(json.loads(sys.argv[1]).get('status', ''))" "$STAGE_JSON")
+
+if [ "$STATUS" = "no_new_events" ]; then
+    exit 0
+fi
+
+if [ "$STATUS" != "staged" ]; then
+    echo "pz-memory-compile-step: unexpected stage status: $STAGE_JSON" >&2
+    exit 1
+fi
+
+# Run container generator using isolated Hermes PluginLlm
+/usr/bin/docker exec -u 999:987 pz-hermes /opt/hermes/.venv/bin/python3 /opt/data/plugins/pz-memory-v1/knowledge_generator.py
+
+# Run host promoter to validate candidates and advance ingestion ledger
+setpriv --reuid=pzmemory --regid=pzvault --clear-groups /usr/local/sbin/pz-memory --config /etc/pz-memory-v1/engine.json promote-knowledge

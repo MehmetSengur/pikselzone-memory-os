@@ -1,0 +1,23 @@
+[Unit]
+Description=Pikselzone Memory V1 Outbox Publisher
+After=network-online.target pz-obsidian-sync.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pzmemory
+Group=pzvault
+ExecStart=/usr/local/sbin/pz-memory --config /etc/pz-memory-v1/engine.json publish-outbox
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/pz-memory-v1
+ReadWritePaths=/srv/pz-hermes/vault/daily /srv/pz-hermes/hermes-data/memory-v1 /var/lib/pz-memory-v1
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

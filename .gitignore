@@ -1,0 +1,39 @@
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+auth.json
+*.key
+*.pem
+*.p12
+*id_rsa*
+*age-key*
+*identity*
+secrets/
+
+# Live agent configuration and local hooks
+.codex/
+.claude/
+
+# Runtime state, generated memory, and evidence
+state/
+daily/
+knowledge/
+evidence/
+vault/
+logs/
+sessions/
+memories/
+*.log
+*.sqlite
+*.sqlite3
+state.db*
+
+# Python and operating-system artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.DS_Store

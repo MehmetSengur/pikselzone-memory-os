@@ -1,0 +1,10 @@
+name: pz-memory-v1
+version: 1.0.0
+description: "Pikselzone Memory V1 native lifecycle adapter, outbox writer, and recall provider."
+author: PZ local operations
+kind: standalone
+hooks:
+  - on_session_end
+  - on_session_finalize
+  - on_session_start
+  - pre_llm_call

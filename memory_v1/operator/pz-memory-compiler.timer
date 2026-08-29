@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Pikselzone Memory V1 compiler when changed events exist
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+Unit=pz-memory-compiler.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,18 @@
+{
+  "activation_status": "BLOCKED_UNVERIFIED_HERMES_LIFECYCLE_API",
+  "install": false,
+  "verified_callbacks": [],
+  "candidate_callbacks_requiring_vps_version_smoke": [
+    "on_session_end",
+    "on_session_finalize",
+    "on_session_reset",
+    "on_session_compress"
+  ],
+  "command_template": "cd /srv/pz-hermes/operations-repo && python3 -m memory_v1.hook_runner --config /etc/pz-memory-v1/engine.json --runtime hermes --event <VERIFIED_EVENT>",
+  "forbidden_authority": [
+    "docker-socket",
+    "root",
+    "secrets-readback",
+    "live-policy-write"
+  ]
+}

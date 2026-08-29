@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Pikselzone Memory V1 Outbox Publisher periodically
+
+[Timer]
+OnBootSec=1m
+OnUnitActiveSec=2m
+Unit=pz-memory-publisher.service
+
+[Install]
+WantedBy=timers.target

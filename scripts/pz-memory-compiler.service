@@ -1,0 +1,32 @@
+[Unit]
+Description=Pikselzone Memory V1 Knowledge Compiler Pipeline
+After=network-online.target pz-obsidian-sync.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pz-memory-compile-step
+User=root
+Group=pzvault
+StandardOutput=journal
+StandardError=journal
+
+# Strict capabilities & sandbox boundaries
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_SETUID CAP_SETGID
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+LockPersonality=true
+
+# Explicit file system access
+ReadOnlyPaths=/opt/pz-memory-v1 /usr/local/sbin/pz-memory /usr/local/sbin/pz-memory-compile-step
+ReadWritePaths=/run/docker.sock /var/lib/pz-memory-v1 /srv/pz-hermes/hermes-data/memory-v1 /srv/pz-hermes/vault/knowledge /srv/pz-hermes/vault/daily /tmp
+
+# Fixed path environment, zero provider secrets
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target

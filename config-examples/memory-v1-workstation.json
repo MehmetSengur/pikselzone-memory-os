@@ -1,0 +1,26 @@
+{
+  "role": "workstation",
+  "vault_path": "/Users/mehmeteminsengur/Documents/Obsidian Admin Temp",
+  "state_path": "/Users/mehmeteminsengur/Library/Application Support/Pikselzone Memory V1",
+  "runtimes": ["codex", "claude"],
+  "transcript_roots": {
+    "codex": ["/Users/mehmeteminsengur/.codex/sessions"],
+    "claude": ["/Users/mehmeteminsengur/.claude/projects"]
+  },
+  "can_write_event_memory": true,
+  "can_run_compiler": false,
+  "models": {
+    "flush": "runtime-native",
+    "compiler": "vps-hermes-runtime"
+  },
+  "provider": {
+    "mode": "runtime-native"
+  },
+  "context_budget_chars": 16000,
+  "activation": {
+    "codex_hooks_path": "/Users/mehmeteminsengur/Documents/Pikselzone-Hermes-AI-OS/operations-repo/.codex/hooks.json",
+    "claude_settings_path": "/Users/mehmeteminsengur/Documents/Pikselzone-Hermes-AI-OS/operations-repo/.claude/settings.local.json",
+    "codex_smoke_evidence_path": "/Users/mehmeteminsengur/Library/Application Support/Pikselzone Memory V1/evidence/codex-smoke.json",
+    "claude_smoke_evidence_path": "/Users/mehmeteminsengur/Library/Application Support/Pikselzone Memory V1/evidence/claude-smoke.json"
+  }
+}
