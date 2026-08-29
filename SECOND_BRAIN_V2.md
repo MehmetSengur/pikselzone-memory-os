@@ -29,7 +29,7 @@ Transform Pikselzone Memory OS from a passive, overly restrictive session logger
 - Memory engine failure resilience: child failures degrade gracefully without blocking agent sessions.
 
 ## Current Task
-SB2-11: History import engine (Claude, ChatGPT, Codex, Gemini, and raw Markdown transcript/history importers).
+SB2-12: Red Teaming & Final Acceptance Verification (multi-runtime canary tests, stress testing, prompt injection resistance verification, and final sign-off).
 
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
@@ -43,9 +43,9 @@ SB2-11: History import engine (Claude, ChatGPT, Codex, Gemini, and raw Markdown 
 - **SB2-08**: Controlled memory-engine self-modification (`SelfEvolutionEngine` with protected branch guards, pre-modification git checkpointing, test gating, automatic rollback on test failures, commit justification, and signed evolution receipts, with 3 targeted tests PASS).
 - **SB2-09**: Claude / Codex / Hermes shared-brain parity (`SharedBrainParityManager` linking CLAUDE.md/AGENTS.md, canonical skills store, shared companion and knowledge graph, cross-runtime recall across all runtimes, with 3 targeted tests PASS).
 - **SB2-10**: Provider hardening, secret isolation & degraded resilience (`scrubbed_subprocess_env` purging API tokens before child subprocess execution, removal of raw stdin logging in `hook_runner.py`, strict block against silent OpenAI API fallback in `runtime-native` mode, and Hermes graceful degradation on corrupt bundle, with 3 targeted tests PASS).
+- **SB2-11**: History import engine (`HistoryImportEngine` parsing ChatGPT, Claude, Codex, Gemini, and Markdown transcripts, redacting tokens, distilling rules to `Kurallar.md` and concepts to `knowledge/`, with 4 targeted tests PASS).
 
 ## Remaining Work
-- **SB2-11**: History import engine (Claude, ChatGPT, Codex, Gemini, Markdown).
 - **SB2-12**: Red Teaming & Final multi-runtime acceptance verification.
 
 ## Validation Evidence

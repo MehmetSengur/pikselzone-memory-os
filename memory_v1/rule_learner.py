@@ -24,8 +24,8 @@ logger = logging.getLogger("memory_v1.rule_learner")
 EXPLICIT_DIRECTIVE_PATTERNS = (
     re.compile(r"(?i)\b(?:bundan sonra|artık|şundan sonra)\b\s+(.+)", re.UNICODE),
     re.compile(r"(?i)\b(?:bunu bir daha|bir daha bana|asla bunu)\s+(?:yapma|sorma|kullanma|etme)\b", re.UNICODE),
-    re.compile(r"(?i)\b(?:her zaman|daima|kesinlikle)\s+([^.!?]+)\s+(?:yap|kullan|uygula|yaz)\b", re.UNICODE),
-    re.compile(r"(?i)\b(?:asla|kesinlikle)\s+([^.!?]+)\s+(?:yapma|kullanma|dokunma|silme)\b", re.UNICODE),
+    re.compile(r"(?i)\b(?:her zaman|daima|kesinlikle)\s+([^.!?]+)\s+(?:yap|kullan|uygula|yaz|çalıştır|et)\b", re.UNICODE),
+    re.compile(r"(?i)\b(?:asla|kesinlikle)\s+([^.!?]+)\s+(?:yapma|kullanma|dokunma|silme|çalıştırma|etme|başlatma)\b", re.UNICODE),
     re.compile(r"(?i)\b(?:benim tercihim|şunu tercih ediyorum|tercih ederim)\b[:\s]+([^.!?]+)", re.UNICODE),
     re.compile(r"(?i)\bfrom now on\b[,:\s]+([^.!?]+)", re.UNICODE),
     re.compile(r"(?i)\balways\s+([^.!?]+)\b", re.UNICODE),
@@ -185,6 +185,47 @@ class RuleLearner:
                         learned_count += 1
 
         return learned_count
+
+    def learn_from_user_message(self, user_text: str, source: str = "session") -> list[str]:
+        """Process a single user message and learn any persistent rules."""
+        learned: list[str] = []
+        extracted_rules = self.extract_rules_from_text(user_text)
+        existing_rules = self.companion.read_rules()
+
+        for item in extracted_rules:
+            rule_text = item.rule_text
+            duplicate = False
+            for r in existing_rules:
+                if calculate_overlap(rule_text, r.text) > 0.65:
+                    duplicate = True
+                    break
+            if duplicate:
+                continue
+
+            conflicted_rule: RuleItem | None = None
+            for r in existing_rules:
+                if self.check_conflict(rule_text, r.text):
+                    conflicted_rule = r
+                    break
+
+            if conflicted_rule:
+                self._reconcile_and_replace_rule(
+                    old_rule=conflicted_rule,
+                    new_rule_text=rule_text,
+                    reason=item.reason,
+                    source=source,
+                )
+                learned.append(rule_text)
+            else:
+                added = self.companion.add_or_update_rule(
+                    rule_text=rule_text,
+                    reason=item.reason,
+                    source=source,
+                    is_direct_command=item.is_explicit,
+                )
+                if added:
+                    learned.append(rule_text)
+        return learned
 
     def _reconcile_and_replace_rule(
         self,
