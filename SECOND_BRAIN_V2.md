@@ -345,5 +345,51 @@ SECOND_BRAIN_V2_PRODUCTION=PASS
 REMAINING_BLOCKERS=NONE
 ```
 
+---
+
+## 18. 2026-08-30 Production Closure Continuation
+
+This section supersedes earlier production-PASS claims until all fresh
+two-direction sync canaries are cleanly accepted.
+
+- Compiler recovery: the sandboxed compiler now asks PID 1 to run the separate
+  ACL bootstrap unit before unprivileged promotion. A real supported compiler
+  cycle completed with `Result=success`, processed 10 events, promoted 6
+  knowledge files, cleared the knowledge outbox, and reduced stale events from
+  24 to 14.
+- Hermes clean native canary: session `20260829_220727_e28a84` produced native
+  receipt and event `hermes-2cbfd9abee2d54dabb23ec3fefd652da.md`; the timer
+  publisher then updated `Kurallar.md`, concepts, connections, `index.md`, and
+  `log.md` without direct RuleLearner, graph, or artifact calls.
+- VPS-to-workstation sync: the same canary event and
+  `knowledge/connections/closure--mesh.md` appeared in the workstation vault
+  through Obsidian Sync; no manual rsync was used.
+- Workstation-to-VPS sync remains blocked. Fresh native Codex and Claude
+  sessions produced two new local events, and the VPS sync daemon downloaded
+  the Claude daily event, but it cannot apply shared companion/knowledge
+  updates because `pzobsidian` is not their owner and Obsidian Headless applies
+  explicit mtimes (`EACCES`/`EPERM` on `Last-Session.md`, `Kurallar.md`, and
+  knowledge files).
+- A temporary probe proved that the narrow `CAP_FOWNER` capability lets the
+  already-sandboxed sync identity apply only that missing metadata operation.
+  The canonical candidate is
+  `memory_v1/operator/pz-obsidian-sync.service.d/20-file-metadata.conf`; it is
+  intentionally **not deployed** because production approval rejected granting
+  that persistent capability without explicit user authorization.
+
+```
+COMPILER_END_TO_END=PASS
+STALE_UNINGESTED_EVENTS_BEFORE=24
+STALE_UNINGESTED_EVENTS_AFTER=14
+HERMES_AUTO_RULE_NATIVE_CLEAN=PASS
+HERMES_KNOWLEDGE_GROWTH_NATIVE_CLEAN=PASS
+HERMES_SKILL_DISCOVERY=PASS (derived recall returned the three expected steps)
+SYNC_MODE=NOT_AUTOMATIC
+AUTO_SYNC_VPS_TO_WORKSTATION=PASS
+AUTO_SYNC_WORKSTATION_TO_VPS=FAIL (ownership/mtime metadata boundary)
+MANUAL_RSYNC_USED_FOR_FINAL_CANARY=NO
+SECOND_BRAIN_V2_PRODUCTION=FAIL
+REMAINING_BLOCKERS=explicit approval required to deploy the narrow CAP_FOWNER sync metadata capability, then rerun fresh reverse-sync and recall canaries
+```
 
 
