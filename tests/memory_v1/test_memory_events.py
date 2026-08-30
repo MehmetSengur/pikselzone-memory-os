@@ -19,7 +19,7 @@ from memory_v1.core import (
     ConfigError, DuplicateEvent, MemoryConfig, NoMemory, PolicyError,
     ProviderBlocked, SchemaError, discover_codex_binary, normalize_transcript, session_key,
 )
-from memory_v1.doctor import run_doctor
+from memory_v1.doctor import _effective_read_write_access, run_doctor
 from memory_v1.events import EventWriter, parse_event_artifact
 from memory_v1.provider import (
     StructuredResponsesProvider, check_macos_keychain_presence, resolve_credential,
@@ -508,6 +508,16 @@ class EventTests(MemoryFixture):
 
 
 class ContextDoctorTests(MemoryFixture):
+    def test_doctor_uses_macos_owner_mode_when_sandbox_denies_os_access(self):
+        path = self.vault / "daily"
+        path.mkdir()
+        path.chmod(0o700)
+        with mock.patch("memory_v1.doctor.os.access", return_value=False):
+            with mock.patch("memory_v1.doctor.platform.system", return_value="Darwin"):
+                access_ok, detail = _effective_read_write_access(path)
+        self.assertTrue(access_ok)
+        self.assertEqual("read-write-posix-identity", detail)
+
     def test_context_is_bounded_and_does_not_load_whole_vault(self):
         (self.vault / "Core.md").write_text("core\n")
         (self.vault / "Last-Session.md").write_text("x" * 3000)

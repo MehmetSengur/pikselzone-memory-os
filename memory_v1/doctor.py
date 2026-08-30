@@ -36,6 +36,27 @@ def _row(name: str, status: str, detail: str = "") -> dict[str, str]:
     return {"check": name, "status": status, "detail": detail}
 
 
+def _effective_read_write_access(path: Path) -> tuple[bool, str]:
+    """Check access without treating Codex's macOS sandbox as a host ACL denial."""
+    if os.access(path, os.R_OK | os.W_OK):
+        return True, "read-write"
+    if platform.system() != "Darwin":
+        return False, "insufficient"
+    try:
+        metadata = path.stat()
+    except OSError:
+        return False, "insufficient"
+
+    mode = stat.S_IMODE(metadata.st_mode)
+    if metadata.st_uid == os.geteuid():
+        permitted = mode & (stat.S_IRUSR | stat.S_IWUSR)
+    elif metadata.st_gid in {os.getegid(), *os.getgroups()}:
+        permitted = mode & (stat.S_IRGRP | stat.S_IWGRP)
+    else:
+        permitted = mode & (stat.S_IROTH | stat.S_IWOTH)
+    return (True, "read-write-posix-identity") if permitted else (False, "insufficient")
+
+
 def run_doctor(config: MemoryConfig) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
     vault = config.vault_path
@@ -70,10 +91,11 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
             checks.append(_row(f"{name}_path", "fail", "not-directory"))
         elif path.is_dir():
             checks.append(_row(f"{name}_path", "pass"))
+            access_ok, access_detail = _effective_read_write_access(path)
             checks.append(_row(
                 f"{name}_effective_access",
-                "pass" if os.access(path, os.R_OK | os.W_OK) else "blocked",
-                "read-write" if os.access(path, os.R_OK | os.W_OK) else "insufficient",
+                "pass" if access_ok else "blocked",
+                access_detail,
             ))
         else:
             checks.append(_row(f"{name}_path", "warn", "not-created"))
