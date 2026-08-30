@@ -506,3 +506,24 @@ REMAINING_BLOCKERS=explicit approval for the proven metadata capability or a sep
 - This diagnostic and source correction did not manually invoke a hook runner,
   write a receipt, or use rsync.  SessionEnd and the durable native canary
   remain subject to their own fresh normal-lifecycle evidence.
+
+---
+
+## 22. 2026-08-30 Native Codex SessionEnd acceptance boundary
+
+- A normal bundled Codex read-only interaction completed a real user turn
+  after the Higgsfield OAuth repair, and canonical SessionStart evidence was
+  regenerated.  A separate normal interactive termination emitted a native
+  Codex `SessionEnd` payload to the configured hook.
+- The empty termination payload correctly failed closed as
+  `checkpoint-transcript-empty`; it did not enqueue work, start a detached
+  drain, create an event, or overwrite any receipt.  A later durable-preference
+  user turn was present in its rollout, but the application reported
+  `turn_aborted` before emitting a corresponding SessionEnd hook.  It therefore
+  cannot be promoted as a native memory canary.
+- No source retry was added because the observed failures have different
+  producers (an empty rollout versus an application-aborted turn), and no
+  evidence yet shows a non-empty persisted rollout being read too early.  The
+  remaining acceptance gate is one normal, clean Codex SessionEnd whose payload
+  references a non-empty completed rollout, followed by its automatically
+  spawned worker receipt, event, and recall proof.
