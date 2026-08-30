@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd /Users/mehmeteminsengur/Documents/Pikselzone-Hermes-AI-OS/operations-repo && python3 -m memory_v1.hook_runner --config config-examples/memory-v1-workstation.json --runtime codex --event SessionStart",
+            "command": "cd /Users/mehmeteminsengur/Documents/Pikselzone-Hermes-AI-OS/pikselzone-memory-os && python3 -m memory_v1.hook_runner --config config-examples/memory-v1-workstation.json --runtime codex --event SessionStart",
             "timeout": 10
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd /Users/mehmeteminsengur/Documents/Pikselzone-Hermes-AI-OS/operations-repo && python3 -m memory_v1.hook_runner --config config-examples/memory-v1-workstation.json --runtime codex --event PreCompact",
+            "command": "cd /Users/mehmeteminsengur/Documents/Pikselzone-Hermes-AI-OS/pikselzone-memory-os && python3 -m memory_v1.hook_runner --config config-examples/memory-v1-workstation.json --runtime codex --event PreCompact",
             "timeout": 10
           }
         ]
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd /Users/mehmeteminsengur/Documents/Pikselzone-Hermes-AI-OS/operations-repo && python3 -m memory_v1.hook_runner --config config-examples/memory-v1-workstation.json --runtime codex --event SessionEnd",
+            "command": "cd /Users/mehmeteminsengur/Documents/Pikselzone-Hermes-AI-OS/pikselzone-memory-os && python3 -m memory_v1.hook_runner --config config-examples/memory-v1-workstation.json --runtime codex --event SessionEnd",
             "timeout": 10
           }
         ]

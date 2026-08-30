@@ -470,3 +470,18 @@ SECOND_BRAIN_V2_PRODUCTION=FAIL
 REMAINING_BLOCKERS=explicit approval for the proven metadata capability or a separately designed path-whitelisted helper; then fresh four-way recall acceptance and fresh native receipt lifecycle verification
 ```
 
+---
+
+## 20. 2026-08-30 Canonical workstation hook-rendering parity
+
+- The canonical V2 `hook_runner.py` differs from the historical consumer copy:
+  it records hook stdin before processing, aligns the shared brain at startup,
+  and scrubs the detached worker environment.  The active workstation Claude
+  and Codex hook files already invoke the canonical repository.
+- Both canonical install fragments now render that same canonical path rather
+  than the stale consumer copy.  `test_hook_install_parity.py` rejects a
+  fragment whose lifecycle command does not invoke the canonical V2 module.
+- The full local Memory V1 suite passed `215/215` after this correction.  This
+  source-parity fix does not close native Codex acceptance: the current normal
+  interactive CLI remains blocked before a user turn by its local startup/MCP
+  state, so it produced no fresh SessionStart or SessionEnd receipt.
