@@ -485,3 +485,24 @@ REMAINING_BLOCKERS=explicit approval for the proven metadata capability or a sep
   source-parity fix does not close native Codex acceptance: the current normal
   interactive CLI remains blocked before a user turn by its local startup/MCP
   state, so it produced no fresh SessionStart or SessionEnd receipt.
+
+---
+
+## 21. 2026-08-30 Codex OAuth and local access closure
+
+- The Higgsfield ChatGPT plugin connection was healthy, but the bundled Codex
+  CLI MCP entry was `Not logged in`.  A supported `codex mcp login higgsfield`
+  reauthentication changed that entry to `OAuth`; no hook configuration was
+  changed.  A subsequent ordinary interactive Codex session completed a real
+  user turn and produced fresh canonical Codex SessionStart evidence.
+- The actual workstation user passed scoped daily and knowledge directory
+  create, read, atomic-replace, and cleanup probes.  The prior local doctor
+  blocks were therefore Codex macOS sandbox false negatives from `os.access`,
+  not host ACL failures.  Commit `6d352be2d0fa0f96e9f18bd73e228c102f5aec1d`
+  preserves a real `os.access` success and adds a Darwin-only owner/group mode
+  fallback when the sandbox denies the probe; its targeted regression tests
+  passed.  The local doctor is now `status=ok`, with zero failures and zero
+  blocked checks.
+- This diagnostic and source correction did not manually invoke a hook runner,
+  write a receipt, or use rsync.  SessionEnd and the durable native canary
+  remain subject to their own fresh normal-lifecycle evidence.
