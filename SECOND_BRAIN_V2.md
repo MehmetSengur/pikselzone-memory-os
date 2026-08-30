@@ -611,5 +611,7 @@ REMAINING_BLOCKERS=explicit approval for the proven metadata capability or a sep
 - **Open item:** Historical vault links and suspicious orphan artefacts remain
   read-only pending a separately authorized repair; no shared-vault rewrite is
   part of V2.1.
+- **Validation:** Post-commit targeted graph/compiler/doctor validation passed
+  `71/71`; the full Memory V1 suite passed `229/229`.
 - **Status:** `SECOND_BRAIN_V2_PRODUCTION=PASS` remains unchanged;
-  `V2_1_GRAPH_HARDENING=LOCAL_IMPLEMENTATION_IN_PROGRESS`.
+  `V2_1_GRAPH_HARDENING=PASS`.
