@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .core import MemoryConfig, PolicyError, secure_read_text, session_key
 from .events import parse_event_artifact
+from .graph_engine import is_conflicted_copy_path
 
 
 CONTINUITY_FILES = (
@@ -97,6 +98,8 @@ def _knowledge_inventory(config: MemoryConfig) -> dict[str, int | str]:
                 raise PolicyError("context-knowledge-unsafe-directory")
         for name in file_names:
             path = current_path / name
+            if is_conflicted_copy_path(path):
+                continue
             info = path.lstat()
             if (
                 stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)

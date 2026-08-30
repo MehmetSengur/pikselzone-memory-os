@@ -34,11 +34,11 @@ class MockLlmSuccess:
         self.writes = writes or [
             {
                 "path": "knowledge/concepts/memory-hardening.md",
-                "content": "---\ntitle: Memory Hardening\naliases: [hardening]\ntags: [memory, architecture]\nsources: [daily/2026-08-28/event-1.md]\ncreated: 2026-08-28\nupdated: 2026-08-28\nauthority: derived-memory-not-canonical\n---\n\n## Özet\nHardening summary.\n\n## Önemli Noktalar\n- Safe isolation\n\n## Detaylar\nDetails.\n\n## İlişkili Kavramlar\n- [[Hermes]]\n\n## Kaynaklar\n- event-1\n",
+                "content": "---\ntitle: Memory Hardening\naliases: [hardening]\ntags: [memory, architecture]\nsources: [daily/2026-08-28/event-1.md]\ncreated: 2026-08-28\nupdated: 2026-08-28\nauthority: derived-memory-not-canonical\n---\n\n## Özet\nHardening summary.\n\n## Önemli Noktalar\n- Safe isolation\n\n## Detaylar\nDetails.\n\n## Kaynaklar\n- event-1\n",
             },
             {
                 "path": "knowledge/index.md",
-                "content": "# Knowledge Index\n\n| Article | Summary | Source | Updated |\n|---|---|---|---|\n| [[Memory Hardening]] | Hardening summary | event-1 | 2026-08-28 |\n",
+                "content": "# Knowledge Index\n\n| Article | Summary | Source | Updated |\n|---|---|---|---|\n| [[concepts/memory-hardening|Memory Hardening]] | Hardening summary | event-1 | 2026-08-28 |\n",
             },
         ]
         self.model = "gpt-5.4-mini"
@@ -151,6 +151,29 @@ authority: "derived-session-memory-not-operational-truth"
         # Ingestion ledger must advance
         state = load_compiler_state(self.state / "compiler" / "state.json")
         self.assertIn("daily/2026-08-28/hermes-e1.md", state["ingested"])
+
+    def test_promoter_rejects_candidate_that_would_create_broken_graph_link(self):
+        self._create_event()
+        select_and_stage_batch(self.config, outbox_root=self.outbox_root, max_events=10)
+        bad_writes = [{
+            "path": "knowledge/concepts/bad.md",
+            "content": "---\ntitle: Bad\naliases: []\n---\n# Bad\n[[concepts/missing]]\n",
+        }]
+        result = load_knowledge_generator().generate_knowledge(
+            base_dir=str(self.outbox_root), llm_client=MockLlmSuccess(writes=bad_writes)
+        )
+        self.assertEqual("ok", result["status"])
+        with self.assertRaisesRegex(PolicyError, "candidate-broken-or-noncanonical-wikilink"):
+            promote_knowledge_outbox(self.config, outbox_root=self.outbox_root)
+        self.assertFalse((self.vault / "knowledge/concepts/bad.md").exists())
+
+    def test_compiler_snapshot_excludes_observed_conflicted_copy(self):
+        self._create_event()
+        conflict = self.knowledge / "index (Conflicted copy pz-hermes 202608301608).md"
+        conflict.write_text("conflict-only-marker", encoding="utf-8")
+        batch = select_and_stage_batch(self.config, outbox_root=self.outbox_root, max_events=10)
+        self.assertIsNotNone(batch)
+        self.assertNotIn("conflict-only-marker", batch["untrusted_existing_knowledge"])
 
     def test_run2_unchanged_input_causes_zero_model_calls_and_exact_noop(self):
         # Setup: run 1 already completed

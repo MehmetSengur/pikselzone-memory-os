@@ -592,3 +592,24 @@ REMAINING_BLOCKERS=explicit approval for the proven metadata capability or a sep
   `feat/self-evolving-second-brain-v2` at
   `0a73175fc69026057e18fbc74ef6580286fcf32f`.  No push or merge was performed.
 - Final status: `SECOND_BRAIN_V2_PRODUCTION=PASS`.
+
+---
+
+## 25. 2026-08-31 V2.1 graph hygiene and integrity hardening
+
+- **Decision:** Preserve the V2 architecture and add only canonical concept
+  resolution, connection endpoint integrity, conflict-copy exclusion, and a
+  read-only graph-health doctor row.
+- **Evidence:** The resolver accepts canonical slug/path, title, inline alias,
+  block-style alias, and safe normalized forms; ambiguity fails deterministically.
+  New connections require two distinct existing concepts and write canonical
+  `[[concepts/<slug>|<title>]]` endpoints. Candidate promotion rejects broken or
+  non-canonical wikilinks before any vault write.
+- **Learning:** The observed `index/log (Conflicted copy pz-hermes <timestamp>)`
+  files are excluded from graph metrics, compiler knowledge snapshots, and
+  context inventory without moving or deleting user files.
+- **Open item:** Historical vault links and suspicious orphan artefacts remain
+  read-only pending a separately authorized repair; no shared-vault rewrite is
+  part of V2.1.
+- **Status:** `SECOND_BRAIN_V2_PRODUCTION=PASS` remains unchanged;
+  `V2_1_GRAPH_HARDENING=LOCAL_IMPLEMENTATION_IN_PROGRESS`.

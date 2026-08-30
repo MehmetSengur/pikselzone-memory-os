@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import csv
 import logging
 import re
 import unicodedata
@@ -30,12 +31,95 @@ from .core import (
 logger = logging.getLogger("memory_v1.graph_engine")
 
 
+# This is deliberately limited to the conflict-copy filename format observed in
+# the shared vault.  Do not turn this into a broad "conflict" match: ordinary
+# user notes are valid graph material until there is evidence otherwise.
+CONFLICTED_COPY_RE = re.compile(
+    r"\s+\(Conflicted copy pz-hermes \d{12}\)\.md$", re.IGNORECASE
+)
+
+
+def is_conflicted_copy_path(path: Path) -> bool:
+    """Return whether a file is an observed Obsidian sync conflict copy."""
+    return bool(CONFLICTED_COPY_RE.search(path.name))
+
+
 def slugify(text: str) -> str:
     """Generate safe lowercase ASCII/alphanumeric slug."""
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"[^\w\s-]", "", text.lower())
     slug = re.sub(r"[-\s]+", "-", text).strip("-_")
     return slug or "untitled-concept"
+
+
+def _strip_optional_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1].strip()
+    return value
+
+
+def _frontmatter_lines(content: str) -> list[str]:
+    """Return bounded YAML-like frontmatter lines without requiring PyYAML."""
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return []
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            return lines[1:index]
+    return []
+
+
+def parse_frontmatter_aliases(content: str) -> list[str]:
+    """Parse supported inline and block-style ``aliases`` frontmatter safely.
+
+    This intentionally understands only the small subset written by the graph
+    engine.  Invalid input is ignored so a malformed note cannot interrupt the
+    compiler's degraded-first lifecycle.
+    """
+    lines = _frontmatter_lines(content)
+    values: list[str] = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^aliases\s*:\s*(.*)$", line)
+        if not match:
+            continue
+        remainder = match.group(1).strip()
+        if remainder.startswith("["):
+            if not remainder.endswith("]"):
+                return []
+            try:
+                parsed = next(csv.reader([remainder[1:-1]], skipinitialspace=True))
+            except (csv.Error, StopIteration):
+                return []
+            values.extend(_strip_optional_quotes(item) for item in parsed)
+        elif not remainder:
+            for following in lines[index + 1:]:
+                if re.match(r"^\S", following):
+                    break
+                item = re.match(r"^\s+-\s+(.+?)\s*$", following)
+                if item:
+                    values.append(_strip_optional_quotes(item.group(1)))
+        else:
+            return []
+        break
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = slugify(value)
+        if value and normalized not in seen:
+            seen.add(normalized)
+            unique.append(value)
+    return unique
+
+
+def _frontmatter_title(content: str) -> Optional[str]:
+    for line in _frontmatter_lines(content):
+        match = re.match(r"^title\s*:\s*(.+?)\s*$", line)
+        if match:
+            return _strip_optional_quotes(match.group(1))
+    title_match = re.search(r"^#\s+(.+?)\s*$", content, re.MULTILINE)
+    return title_match.group(1).strip() if title_match else None
 
 
 @dataclasses.dataclass
@@ -83,32 +167,88 @@ class KnowledgeGraphEngine:
             atomic_write(self.log_file, initial_log, mode=0o660)
 
     def find_concept(self, title_or_alias: str) -> Optional[Path]:
-        """Find an existing concept file matching title or aliases."""
-        target_slug = slugify(title_or_alias)
-        direct_file = self.concepts_dir / f"{target_slug}.md"
-        if direct_file.is_file():
-            return direct_file
+        """Resolve a concept in deterministic, safe precedence order.
 
-        # Check existing concept files for alias matches
-        for f in self.concepts_dir.glob("*.md"):
-            try:
-                content = f.read_text(encoding="utf-8")
-                # Look for aliases in frontmatter or title
-                if f"aliases: [" in content:
-                    aliases_match = re.search(r"aliases:\s*\[(.*?)\]", content)
-                    if aliases_match:
-                        raw_aliases = [a.strip(" '\"\t") for a in aliases_match.group(1).split(",")]
-                        for a in raw_aliases:
-                            if slugify(a) == target_slug:
-                                return f
-                # Title match
-                title_match = re.search(r"^#\s+(.+)$", content, re.MULTILINE)
-                if title_match and slugify(title_match.group(1)) == target_slug:
-                    return f
-            except Exception:
+        A match is never selected arbitrarily.  Ambiguous title, alias, or
+        normalized-slug input raises ``PolicyError`` so callers can degrade or
+        fail explicitly rather than linking an unrelated concept.
+        """
+        raw = title_or_alias.strip().removeprefix("[[").removesuffix("]]")
+        raw = raw.split("|", 1)[0].strip().removeprefix("concepts/")
+        raw = raw.removesuffix(".md")
+        target_slug = slugify(raw)
+
+        # 1. Exact canonical slug/path.
+        normalized_file = self.concepts_dir / f"{target_slug}.md"
+        if normalized_file.is_file() and not is_conflicted_copy_path(normalized_file):
+            return normalized_file
+
+        records: list[tuple[Path, str | None, list[str]]] = []
+        for path in sorted(self.concepts_dir.glob("*.md")):
+            if is_conflicted_copy_path(path):
                 continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            records.append((path, _frontmatter_title(content), parse_frontmatter_aliases(content)))
 
-        return None
+        def unique_match(paths: list[Path], match_kind: str) -> Optional[Path]:
+            unique = sorted(set(paths))
+            if len(unique) > 1:
+                raise PolicyError(f"ambiguous-concept-{match_kind}:{target_slug}")
+            return unique[0] if unique else None
+
+        # 2. Title (frontmatter title preferred, then H1 fallback).
+        title_match = unique_match(
+            [path for path, title, _ in records if title and title == title_or_alias.strip()],
+            "title",
+        )
+        if title_match:
+            return title_match
+
+        # 3. Alias.
+        alias_match = unique_match(
+            [path for path, _, aliases in records if title_or_alias.strip() in aliases],
+            "alias",
+        )
+        if alias_match:
+            return alias_match
+
+        # 4. Safe normalized fallback for spacing/case/hyphen variants.
+        normalized_match = unique_match(
+            [
+                path for path, title, aliases in records
+                if (title and slugify(title) == target_slug)
+                or any(slugify(alias) == target_slug for alias in aliases)
+                or path.stem == target_slug
+            ],
+            "normalized-slug",
+        )
+        return normalized_match
+
+    def _canonical_concept_display(self, path: Path) -> str:
+        """Use the concept's declared title when rendering a canonical link."""
+        try:
+            title = _frontmatter_title(path.read_text(encoding="utf-8"))
+        except OSError:
+            title = None
+        return title or path.stem.replace("-", " ").title()
+
+    def _resolve_related_concept_links(self, values: list[str]) -> list[tuple[Path, str]]:
+        """Return existing targets only; unresolved related concepts are skipped."""
+        resolved: list[tuple[Path, str]] = []
+        seen: set[Path] = set()
+        for value in values:
+            try:
+                path = self.find_concept(value)
+            except PolicyError as exc:
+                logger.warning("Skipping ambiguous related concept %r: %s", value, exc)
+                continue
+            if path and path not in seen:
+                seen.add(path)
+                resolved.append((path, self._canonical_concept_display(path)))
+        return resolved
 
     def add_or_update_concept(self, data: ConceptData) -> Path:
         """Create a new concept or expand an existing one in-place, updating wikilinks and index."""
@@ -144,9 +284,8 @@ class KnowledgeGraphEngine:
 
             # Check new related concepts for wikilinks
             new_wikilinks = []
-            for rc in data.related_concepts:
-                rc_slug = slugify(rc)
-                wlink = f"[[concepts/{rc_slug}|{rc}]]"
+            for rc_path, rc_display in self._resolve_related_concept_links(data.related_concepts):
+                wlink = f"[[concepts/{rc_path.stem}|{rc_display}]]"
                 if wlink not in old_content:
                     new_wikilinks.append(f"- {wlink}")
             wikilinks_block = "\n" + "\n".join(new_wikilinks) if new_wikilinks else ""
@@ -192,7 +331,8 @@ class KnowledgeGraphEngine:
             sources_fmt = ", ".join(f'"{s}"' for s in data.sources)
 
             wikilinks_lines = "\n".join(
-                f"- [[concepts/{slugify(rc)}|{rc}]]" for rc in data.related_concepts
+                f"- [[concepts/{path.stem}|{display}]]"
+                for path, display in self._resolve_related_concept_links(data.related_concepts)
             )
             details_lines = "\n".join(f"- {d}" for d in data.details)
 
@@ -251,8 +391,19 @@ class KnowledgeGraphEngine:
     ) -> Path:
         """Create or update a bidirectional relationship between two concepts."""
         self.ensure_graph_dirs()
-        slug_a = slugify(concept_a)
-        slug_b = slugify(concept_b)
+        try:
+            path_a = self.find_concept(concept_a)
+            path_b = self.find_concept(concept_b)
+        except PolicyError:
+            raise
+        if not path_a or not path_b:
+            missing = "concept-a" if not path_a else "concept-b"
+            raise PolicyError(f"connection-endpoint-not-found:{missing}")
+
+        slug_a = path_a.stem
+        slug_b = path_b.stem
+        canonical_a = self._canonical_concept_display(path_a)
+        canonical_b = self._canonical_concept_display(path_b)
 
         if slug_a == slug_b:
             raise PolicyError("cannot-connect-concept-to-itself")
@@ -260,7 +411,7 @@ class KnowledgeGraphEngine:
         # Canonical sort prevents opposing files like a--b.md and b--a.md
         if slug_a > slug_b:
             slug_a, slug_b = slug_b, slug_a
-            concept_a, concept_b = concept_b, concept_a
+            canonical_a, canonical_b = canonical_b, canonical_a
 
         conn_filename = f"{slug_a}--{slug_b}.md"
         target_path = self.connections_dir / conn_filename
@@ -281,12 +432,12 @@ class KnowledgeGraphEngine:
             ev_lines = "\n".join(f"- {e}" for e in clean_ev) if clean_ev else "- Doğrudan oturum bağlamı."
             content = (
                 f"---\n"
-                f'concept_a: "{concept_a}"\n'
-                f'concept_b: "{concept_b}"\n'
+                f'concept_a: "{canonical_a}"\n'
+                f'concept_b: "{canonical_b}"\n'
                 f'created: "{today_str}"\n'
                 f'source: "{source}"\n'
                 f"---\n\n"
-                f"# İlişki: [[concepts/{slug_a}|{concept_a}]] ↔ [[concepts/{slug_b}|{concept_b}]]\n\n"
+                f"# İlişki: [[concepts/{slug_a}|{canonical_a}]] ↔ [[concepts/{slug_b}|{canonical_b}]]\n\n"
                 f"## İlişki Niteliği\n{clean_rel}\n\n"
                 f"## Kanıtlar & Bağlam\n{ev_lines}\n"
             )
@@ -299,7 +450,7 @@ class KnowledgeGraphEngine:
 
         # Update index.md
         self._update_index(
-            article=f"[[connections/{target_path.stem}|{concept_a} ↔ {concept_b}]]",
+            article=f"[[connections/{target_path.stem}|{canonical_a} ↔ {canonical_b}]]",
             summary=clean_rel[:120].replace("|", "-"),
             source=source,
             updated=today_str,

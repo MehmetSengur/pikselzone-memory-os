@@ -508,6 +508,55 @@ class EventTests(MemoryFixture):
 
 
 class ContextDoctorTests(MemoryFixture):
+    def test_doctor_graph_health_is_read_only_and_warns_for_integrity_gaps(self):
+        knowledge = self.vault / "knowledge"
+        concepts = knowledge / "concepts"
+        connections = knowledge / "connections"
+        concepts.mkdir(parents=True)
+        connections.mkdir()
+        (concepts / "alpha.md").write_text(
+            "---\ntitle: \"Alpha\"\naliases: [A]\n---\n# Alpha\n[[Missing Title]]\n",
+            encoding="utf-8",
+        )
+        (concepts / "beta.md").write_text("# Beta\n", encoding="utf-8")
+        (connections / "alpha--beta.md").write_text(
+            "# [[concepts/alpha|Alpha]] ↔ [[concepts/beta|Beta]]\n", encoding="utf-8"
+        )
+        (connections / "orphan.md").write_text("# no endpoints\n", encoding="utf-8")
+        (knowledge / "index (Conflicted copy pz-hermes 202608301608).md").write_text(
+            "[[concepts/does-not-exist]]\n", encoding="utf-8"
+        )
+        before = {
+            path.relative_to(self.vault): path.read_bytes()
+            for path in self.vault.rglob("*.md")
+        }
+
+        result = run_doctor(self.config())
+        row = next(item for item in result["checks"] if item["check"] == "graph_health")
+
+        self.assertEqual("warn", row["status"])
+        self.assertIn("GRAPH_MD_NODES=4", row["detail"])
+        self.assertIn("GRAPH_EXPLICIT_EDGES=3", row["detail"])
+        self.assertIn("GRAPH_BROKEN_LINKS=1", row["detail"])
+        self.assertIn("GRAPH_KNOWLEDGE_CONCEPTS=2", row["detail"])
+        self.assertIn("GRAPH_CONNECTION_ORPHANS=1", row["detail"])
+        self.assertIn("GRAPH_CONFLICTED_COPIES=1", row["detail"])
+        after = {
+            path.relative_to(self.vault): path.read_bytes()
+            for path in self.vault.rglob("*.md")
+        }
+        self.assertEqual(before, after)
+
+    def test_context_inventory_excludes_observed_conflicted_copy(self):
+        knowledge = self.vault / "knowledge"
+        knowledge.mkdir()
+        (knowledge / "index.md").write_text("# canonical\n", encoding="utf-8")
+        (knowledge / "index (Conflicted copy pz-hermes 202608301608).md").write_text(
+            "# conflict\n", encoding="utf-8"
+        )
+        projection = json.loads(build_context(self.config(), budget=1000))
+        self.assertEqual(1, projection["knowledge_inventory"]["other"])
+
     def test_doctor_uses_macos_owner_mode_when_sandbox_denies_os_access(self):
         path = self.vault / "daily"
         path.mkdir()

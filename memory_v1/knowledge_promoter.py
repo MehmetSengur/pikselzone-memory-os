@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 from pathlib import Path
@@ -19,8 +20,10 @@ from .core import (
     secure_read_file, secure_read_text, sha256_file, write_health,
 )
 from .events import parse_event_artifact
+from .graph_engine import is_conflicted_copy_path
 
 logger = logging.getLogger("pz-memory-promoter")
+CANONICAL_WIKILINK_RE = re.compile(r"(?<!!)\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
 
 
 def load_compiler_state(path: Path) -> dict[str, Any]:
@@ -102,6 +105,8 @@ def select_and_stage_batch(
     used_k_chars = 0
     if knowledge_root.exists() and knowledge_root.is_dir():
         for path in sorted(knowledge_root.rglob("*.md")):
+            if is_conflicted_copy_path(path):
+                continue
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 continue
@@ -191,6 +196,51 @@ def _ensure_concept_derived_frontmatter(content: str, rel_path: str) -> str:
         fm_lines.append("authority: derived-memory-not-canonical")
     body_text = "\n".join(lines[body_idx:])
     return "---\n" + "\n".join(fm_lines) + "\n---\n\n" + body_text.lstrip()
+
+
+def _validate_graph_candidate_integrity(
+    config: MemoryConfig, validated_payloads: list[tuple[str, Path, bytes]],
+) -> None:
+    """Reject staged graph writes that could create unresolved or orphan links."""
+    knowledge = config.vault_path / "knowledge"
+    candidate_concepts = {
+        rel.removeprefix("knowledge/concepts/").removesuffix(".md")
+        for rel, _, _ in validated_payloads if rel.startswith("knowledge/concepts/")
+    }
+    candidate_connections = {
+        rel.removeprefix("knowledge/connections/").removesuffix(".md")
+        for rel, _, _ in validated_payloads if rel.startswith("knowledge/connections/")
+    }
+    live_concepts = {
+        path.stem for path in (knowledge / "concepts").glob("*.md")
+        if path.is_file() and not path.is_symlink()
+    }
+    live_connections = {
+        path.stem for path in (knowledge / "connections").glob("*.md")
+        if path.is_file() and not path.is_symlink()
+    }
+    valid_concepts = live_concepts | candidate_concepts
+    valid_connections = live_connections | candidate_connections
+
+    for rel, _, content_bytes in validated_payloads:
+        content = content_bytes.decode("utf-8", errors="replace")
+        targets = [match.group(1).strip().removesuffix(".md") for match in CANONICAL_WIKILINK_RE.finditer(content)]
+        for target in targets:
+            if target.startswith("concepts/") and target.removeprefix("concepts/") in valid_concepts:
+                continue
+            if target.startswith("connections/") and target.removeprefix("connections/") in valid_connections:
+                continue
+            raise PolicyError(f"candidate-broken-or-noncanonical-wikilink:{rel}:{target}")
+
+        if rel.startswith("knowledge/connections/"):
+            endpoints = {
+                target.removeprefix("concepts/") for target in targets
+                if target.startswith("concepts/") and target.removeprefix("concepts/") in valid_concepts
+            }
+            expected_name = "--".join(sorted(endpoints)) if len(endpoints) == 2 else ""
+            actual_name = rel.removeprefix("knowledge/connections/").removesuffix(".md")
+            if not expected_name or actual_name != expected_name:
+                raise PolicyError(f"candidate-connection-endpoint-integrity:{rel}")
 
 
 def _promote_direct_outbox_files(config: MemoryConfig, root: Path) -> list[Path]:
@@ -387,6 +437,12 @@ def promote_knowledge_outbox(
                 raise PolicyError(f"target-path-escape:{rel_path}")
 
             validated_payloads.append((rel_path, target_path, content_bytes))
+
+        try:
+            _validate_graph_candidate_integrity(config, validated_payloads)
+        except PolicyError as exc:
+            write_health(config.state_path, "compiler", "blocked", str(exc))
+            raise
 
         # Stage 2: Atomically promote validated files with bounded rollback
         backups: list[tuple[Path, bytes, int]] = []

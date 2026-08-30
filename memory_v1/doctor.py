@@ -19,6 +19,7 @@ from .core import (
     session_key, sha256_bytes, sha256_file,
 )
 from .events import parse_event_artifact
+from .graph_engine import KnowledgeGraphEngine, is_conflicted_copy_path, parse_frontmatter_aliases
 from .provider import check_macos_keychain_presence
 
 
@@ -152,6 +153,7 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
             ),
         ))
     checks.extend(_health_rows(config))
+    checks.append(_graph_health_row(config))
     checks.extend(_event_tree_rows(config))
     checks.append(_memory_secret_row(config))
     pending = config.state_path / "queue" / "pending"
@@ -183,6 +185,138 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
         "summary": {"fail": failures, "blocked": blocked, "warning": warnings},
         "checks": checks,
     }
+
+
+WIKILINK_RE = re.compile(r"(?<!!)\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
+
+
+def _graph_health_metrics(config: MemoryConfig) -> dict[str, int]:
+    """Read canonical graph files and calculate bounded, deterministic metrics."""
+    root = config.vault_path / "knowledge"
+    empty = {
+        "GRAPH_MD_NODES": 0,
+        "GRAPH_EXPLICIT_EDGES": 0,
+        "GRAPH_BROKEN_LINKS": 0,
+        "GRAPH_KNOWLEDGE_CONCEPTS": 0,
+        "GRAPH_KNOWLEDGE_CONCEPT_ORPHANS": 0,
+        "GRAPH_CONNECTION_ORPHANS": 0,
+        "GRAPH_CONFLICTED_COPIES": 0,
+    }
+    if not root.is_dir() or root.is_symlink():
+        return empty
+
+    canonical_files: list[Path] = []
+    conflicted_copies = 0
+    for path in root.rglob("*.md"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if is_conflicted_copy_path(path):
+            conflicted_copies += 1
+            continue
+        canonical_files.append(path)
+    canonical_files.sort()
+
+    concepts_dir = root / "concepts"
+    connections_dir = root / "connections"
+    concept_paths = {
+        path.stem: path for path in canonical_files
+        if path.parent == concepts_dir
+    }
+    connection_paths = {
+        path.stem: path for path in canonical_files
+        if path.parent == connections_dir
+    }
+    aliases: set[str] = set()
+    for path in concept_paths.values():
+        try:
+            aliases.update(alias.casefold() for alias in parse_frontmatter_aliases(path.read_text(encoding="utf-8")))
+        except OSError:
+            continue
+
+    engine = KnowledgeGraphEngine(config.vault_path)
+    degrees = {stem: 0 for stem in concept_paths}
+    explicit_edges = 0
+    broken_links = 0
+    connection_orphans = 0
+
+    def canonical_link_target(raw_target: str) -> Path | None:
+        target = raw_target.strip().removesuffix(".md")
+        if target.startswith("concepts/"):
+            return concept_paths.get(target.removeprefix("concepts/"))
+        if target.startswith("connections/"):
+            return connection_paths.get(target.removeprefix("connections/"))
+        if target.casefold() in {stem.casefold() for stem in concept_paths}:
+            return next(path for stem, path in concept_paths.items() if stem.casefold() == target.casefold())
+        if target.casefold() in aliases:
+            return Path("<obsidian-alias>")
+        return None
+
+    def concept_target(raw_target: str) -> Path | None:
+        target = raw_target.strip()
+        if target.startswith("concepts/"):
+            return concept_paths.get(target.removeprefix("concepts/").removesuffix(".md"))
+        try:
+            return engine.find_concept(target)
+        except Exception:
+            return None
+
+    for path in canonical_files:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        links = [match.group(1).strip() for match in WIKILINK_RE.finditer(content)]
+        explicit_edges += len(links)
+        for target in links:
+            if canonical_link_target(target) is None:
+                broken_links += 1
+
+        resolved_concepts = [item for item in (concept_target(target) for target in links) if item]
+        if path.parent == concepts_dir:
+            for target in resolved_concepts:
+                if target.stem in degrees and target.stem != path.stem:
+                    degrees[path.stem] += 1
+                    degrees[target.stem] += 1
+        elif path.parent == connections_dir:
+            explicit_endpoints = [
+                target for target in links
+                if target.startswith("concepts/")
+                and target.removeprefix("concepts/").removesuffix(".md") in concept_paths
+            ]
+            unique_endpoints = {
+                target.removeprefix("concepts/").removesuffix(".md")
+                for target in explicit_endpoints
+            }
+            if len(unique_endpoints) != 2:
+                connection_orphans += 1
+            else:
+                first, second = sorted(unique_endpoints)
+                degrees[first] += 1
+                degrees[second] += 1
+
+    return {
+        "GRAPH_MD_NODES": len(canonical_files),
+        "GRAPH_EXPLICIT_EDGES": explicit_edges,
+        "GRAPH_BROKEN_LINKS": broken_links,
+        "GRAPH_KNOWLEDGE_CONCEPTS": len(concept_paths),
+        "GRAPH_KNOWLEDGE_CONCEPT_ORPHANS": sum(value == 0 for value in degrees.values()),
+        "GRAPH_CONNECTION_ORPHANS": connection_orphans,
+        "GRAPH_CONFLICTED_COPIES": conflicted_copies,
+    }
+
+
+def _graph_health_row(config: MemoryConfig) -> dict[str, str]:
+    metrics = _graph_health_metrics(config)
+    concepts = metrics["GRAPH_KNOWLEDGE_CONCEPTS"]
+    orphan_percent = (metrics["GRAPH_KNOWLEDGE_CONCEPT_ORPHANS"] / concepts * 100) if concepts else 0.0
+    detail = ";".join([
+        *(f"{name}={value}" for name, value in metrics.items()),
+        f"GRAPH_KNOWLEDGE_CONCEPT_ORPHAN_PERCENT={orphan_percent:.2f}",
+    ])
+    warning = any(metrics[name] > 0 for name in (
+        "GRAPH_BROKEN_LINKS", "GRAPH_CONNECTION_ORPHANS", "GRAPH_CONFLICTED_COPIES",
+    ))
+    return _row("graph_health", "warn" if warning else "pass", detail)
 
 
 def _health_rows(config: MemoryConfig) -> list[dict[str, str]]:
@@ -890,6 +1024,8 @@ def run_self_healing(config: MemoryConfig) -> dict[str, Any]:
         concepts_dir = k_dir / "concepts"
         concepts_dir.mkdir(parents=True, exist_ok=True)
         for cf in list(k_dir.glob("**/*.md")):
+            if is_conflicted_copy_path(cf):
+                continue
             try:
                 content = cf.read_text(encoding="utf-8")
                 found_targets = re.findall(r"\[\[concepts/([a-zA-Z0-9_-]+)(?:\|[^\]]+)?\]\]", content)

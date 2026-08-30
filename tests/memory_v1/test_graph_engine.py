@@ -5,7 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from memory_v1.graph_engine import ConceptData, KnowledgeGraphEngine, slugify
+from memory_v1.core import PolicyError
+from memory_v1.graph_engine import (
+    ConceptData, KnowledgeGraphEngine, is_conflicted_copy_path,
+    parse_frontmatter_aliases, slugify,
+)
 
 
 class TestKnowledgeGraphEngine(unittest.TestCase):
@@ -18,8 +22,18 @@ class TestKnowledgeGraphEngine(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def write_concept(self, slug: str, title: str, aliases: str = "[]") -> Path:
+        path = self.engine.concepts_dir / f"{slug}.md"
+        path.write_text(
+            f"---\ntitle: \"{title}\"\naliases: {aliases}\n---\n\n# {title}\n",
+            encoding="utf-8",
+        )
+        return path
+
     # 1. Concept creation with frontmatter and wikilinks
     def test_create_concept(self):
+        self.engine.add_or_update_concept(ConceptData(title="Redis", summary="Cache"))
+        self.engine.add_or_update_concept(ConceptData(title="Meta Ads", summary="Ads"))
         data = ConceptData(
             title="TwoBerries CAPI",
             summary="Meta Conversion API entegrasyon servisi.",
@@ -142,6 +156,78 @@ class TestKnowledgeGraphEngine(unittest.TestCase):
         # Verify concepts exist
         concepts = list(self.engine.concepts_dir.glob("*.md"))
         self.assertGreaterEqual(len(concepts), 1)
+
+    def test_find_concept_resolves_canonical_slug_title_and_alias(self):
+        path = self.write_concept(
+            "runtime-native-subscription-memory",
+            "Runtime-Native Subscription Memory",
+            '["Native Subscription Architecture", "Subscription-Backed Memory V1"]',
+        )
+        self.assertEqual(path, self.engine.find_concept("runtime-native-subscription-memory"))
+        self.assertEqual(path, self.engine.find_concept("Runtime-Native Subscription Memory"))
+        self.assertEqual(path, self.engine.find_concept("Native Subscription Architecture"))
+        self.assertEqual(path, self.engine.find_concept("subscription backed memory v1"))
+
+    def test_alias_parser_supports_inline_block_quotes_and_duplicates(self):
+        inline = "---\naliases: [Runtime Native Memory, 'Subscription Memory']\n---\n"
+        block = "---\naliases:\n  - Runtime Native Memory\n  - \"Subscription Memory\"\n  - Runtime Native Memory\n---\n"
+        self.assertEqual(
+            ["Runtime Native Memory", "Subscription Memory"],
+            parse_frontmatter_aliases(inline),
+        )
+        self.assertEqual(parse_frontmatter_aliases(inline), parse_frontmatter_aliases(block))
+
+    def test_alias_parser_ignores_malformed_block(self):
+        malformed = "---\naliases:\n  -\nnext: value\n---\n"
+        self.assertEqual([], parse_frontmatter_aliases(malformed))
+
+    def test_ambiguous_alias_fails_without_selecting_a_target(self):
+        self.write_concept("first", "First", '["Shared Alias"]')
+        self.write_concept("second", "Second", '["Shared Alias"]')
+        with self.assertRaisesRegex(PolicyError, "ambiguous-concept-alias"):
+            self.engine.find_concept("Shared Alias")
+
+    def test_alias_input_reuses_existing_concept(self):
+        existing = self.write_concept("runtime-native", "Runtime Native", '["Subscription Memory"]')
+        result = self.engine.add_or_update_concept(
+            ConceptData(title="Subscription Memory", summary="Updated summary", details=["New detail"])
+        )
+        self.assertEqual(existing, result)
+        self.assertEqual(1, len(list(self.engine.concepts_dir.glob("*.md"))))
+        self.assertIn("New detail", existing.read_text(encoding="utf-8"))
+
+    def test_connection_resolves_title_and_alias_to_explicit_canonical_endpoints(self):
+        first = self.write_concept("runtime-native", "Runtime Native", '["Subscription Memory"]')
+        second = self.write_concept("automatic-drain-closure", "Automatic Drain Closure")
+        connection = self.engine.add_or_update_connection(
+            "Subscription Memory", "Automatic Drain Closure", "Depends on", ["fixture"],
+        )
+        self.assertEqual("automatic-drain-closure--runtime-native.md", connection.name)
+        content = connection.read_text(encoding="utf-8")
+        self.assertIn(f"[[concepts/{first.stem}|Runtime Native]]", content)
+        self.assertIn(f"[[concepts/{second.stem}|Automatic Drain Closure]]", content)
+
+    def test_connection_rejects_missing_self_and_reverse_duplicate(self):
+        self.engine.add_or_update_concept(ConceptData(title="Alpha", summary="A"))
+        self.engine.add_or_update_concept(ConceptData(title="Beta", summary="B"))
+        with self.assertRaisesRegex(PolicyError, "connection-endpoint-not-found"):
+            self.engine.add_or_update_connection("Alpha", "Missing", "Broken")
+        with self.assertRaisesRegex(PolicyError, "cannot-connect-concept-to-itself"):
+            self.engine.add_or_update_connection("Alpha", "Alpha", "Self")
+        first = self.engine.add_or_update_connection("Alpha", "Beta", "Related")
+        second = self.engine.add_or_update_connection("Beta", "Alpha", "Related")
+        self.assertEqual(first, second)
+        self.assertEqual(1, len(list(self.engine.connections_dir.glob("*.md"))))
+
+    def test_related_concept_links_skip_missing_targets(self):
+        created = self.engine.add_or_update_concept(
+            ConceptData(title="Alpha", summary="A", related_concepts=["Missing"])
+        )
+        self.assertNotIn("[[concepts/missing", created.read_text(encoding="utf-8"))
+
+    def test_conflicted_copy_pattern_is_narrow(self):
+        self.assertTrue(is_conflicted_copy_path(Path("index (Conflicted copy pz-hermes 202608301608).md")))
+        self.assertFalse(is_conflicted_copy_path(Path("important conflicted copy.md")))
 
 
 if __name__ == "__main__":
