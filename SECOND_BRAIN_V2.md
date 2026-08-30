@@ -551,3 +551,44 @@ REMAINING_BLOCKERS=explicit approval for the proven metadata capability or a sep
   The wider final acceptance remains open: the new rule invalidates stale
   startup-recall evidence by source SHA, and fresh completed Hermes/Claude
   recall directions remain required.
+
+---
+
+## 24. 2026-08-31 Final acceptance closure
+
+- Claude authentication was verified in the user's normal Terminal as
+  `loggedIn=true`, `authMethod=claude.ai`, `apiProvider=firstParty`, and
+  `subscriptionType=pro`.  The final Claude native startup receipt refreshed
+  with session `61bd5b6b-8ca3-47c3-9993-dffe1c5eea14`; the final Codex native
+  startup receipt refreshed with session
+  `01a05463-1cd3-7560-b79f-e2eeda158702`.  Final Hermes native receipt
+  `20260830_203635_5b133f.json` records `native_invoke=true` and
+  `hook_name=on_session_finalize`.  These final no-memory refresh sessions
+  produced no durable preference.
+- All four fresh direction canaries passed with marker-only recall prompts:
+  Hermes -> Claude `PZ-HC-20260830-3a172134f1`, Hermes -> Codex using the
+  same marker, Claude -> Hermes `PZ-CH-20260830-b6fb36724a`, and Codex ->
+  Hermes `PZ-CW-20260830-bf48807417`.  The Claude Auto Memory files under
+  `~/.claude/projects/.../memory/` were explicitly excluded from evidence;
+  the Claude -> Hermes proof is the native Claude SessionEnd -> Memory OS
+  rule/event -> automatic sync -> fresh Hermes recall chain.
+- Automatic Mac <-> VPS sync converged with identical SHA-256 for the fresh
+  Hermes, Claude, and Codex daily events, `companion/Kurallar.md`, and the
+  compiler-produced knowledge files.  No manual hook runner, rsync, or
+  receipt write was used.  The scheduled compiler naturally ingested the
+  final three events (`ingested=73`), after which stale un-ingested events
+  reached `0`.
+- Final local doctor is `status=ok`, `fail=0`, `blocked=0` (three expected
+  workstation non-applicable/unknown warnings).  Final production doctor is
+  `status=ok`, `fail=0`, `blocked=0`, `warning=0`, with stale events `0` and
+  sync, backup, drain, flush, compiler, and cross-runtime checks verified.
+- Production health is PASS: container `running/healthy`, active sessions `0`,
+  policy violation marker absent, maintenance lock absent, policy timer active
+  with `last_run=success 0`; sync, publisher, compiler, and policy timers are
+  active and enabled.  The sync service is running with `NoNewPrivileges=yes`
+  and the bounded `CAP_FOWNER` capability set only.
+- The full regression passed: `Ran 216 tests ... OK`.  This closes SECOND
+  BRAIN V2 final acceptance on branch
+  `feat/self-evolving-second-brain-v2` at
+  `0a73175fc69026057e18fbc74ef6580286fcf32f`.  No push or merge was performed.
+- Final status: `SECOND_BRAIN_V2_PRODUCTION=PASS`.
