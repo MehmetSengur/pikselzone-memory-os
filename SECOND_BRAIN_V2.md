@@ -615,3 +615,35 @@ REMAINING_BLOCKERS=explicit approval for the proven metadata capability or a sep
   `71/71`; the full Memory V1 suite passed `229/229`.
 - **Status:** `SECOND_BRAIN_V2_PRODUCTION=PASS` remains unchanged;
   `V2_1_GRAPH_HARDENING=PASS`.
+- **Historical repair:** A bounded snapshot of the 14 mutation candidates was
+  stored at `/private/tmp/pz-v21-historical-graph-repair-20260831T0142+0300`
+  with a per-file `SHA256-before.txt` manifest.  The migration replaced 11
+  historical title-style links with canonical paths, converted the invalid
+  `Lifecycle` wikilink to plain text, and mechanically canonicalized the two
+  directly related `Kurallar.md` references.
+- **Connection repair:** The three historical connection notes now carry two
+  explicit canonical concept links and canonical sorted `--` names:
+  `hermes-outbox-pattern--staged-memory-events`,
+  `pzmemory-publisher-host--staged-memory-events`, and
+  `automatic-drain-closure--runtime-native-subscription-memory`.
+- **Topology:** Before: `TOTAL_MD_NODES=215`, `TOTAL_EXPLICIT_EDGES=649`,
+  `BROKEN_LINKS=16`, `KNOWLEDGE_CONCEPT_ORPHANS=2`,
+  `KNOWLEDGE_CONNECTION_ORPHANS=3`, `SUSPICIOUS_ORPHANS=5`,
+  `CONNECTED_COMPONENTS=7`, `LARGEST_COMPONENT=87`.  After:
+  `TOTAL_MD_NODES=215`, `TOTAL_EXPLICIT_EDGES=654`, `BROKEN_LINKS=0`,
+  `KNOWLEDGE_CONCEPT_ORPHANS=2`, `KNOWLEDGE_CONNECTION_ORPHANS=0`,
+  `SUSPICIOUS_ORPHANS=2`, `CONNECTED_COMPONENTS=7`,
+  `LARGEST_COMPONENT=87`.
+- **Intentionally unresolved:** `adopt.md` remains
+  `UNRESOLVED_LOW_VALUE_ORPHAN`; its provenance is insufficient for deletion.
+  The unrelated `teknik.md` orphan and the two physical conflicted-copy files
+  are untouched.  `Lifecycle` is `STALE_OR_EXTRACTION_LINK_REMOVED`, not a
+  newly invented concept.
+- **Validation and natural sync:** Targeted tests passed `71/71`; full suite
+  passed `229/229`; local doctor remained `ok`.  Existing Obsidian Sync
+  propagated all 14 migrated files naturally to `/srv/pz-hermes/vault` with
+  byte-identical SHA-256 values, old connection names absent, and production
+  doctor `ok` with `fail=0`, `blocked=0`, `warning=0`.
+- **Historical repair status:** `V2_1_HISTORICAL_REPAIR=PASS`; no manual rsync,
+  hook runner, receipt write, production configuration, VPS service, ACL, or
+  capability change was used.
