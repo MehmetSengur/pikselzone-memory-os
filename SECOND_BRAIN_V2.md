@@ -527,3 +527,27 @@ REMAINING_BLOCKERS=explicit approval for the proven metadata capability or a sep
   remaining acceptance gate is one normal, clean Codex SessionEnd whose payload
   references a non-empty completed rollout, followed by its automatically
   spawned worker receipt, event, and recall proof.
+
+---
+
+## 23. 2026-08-30 Non-empty Codex SessionEnd closure evidence
+
+- The prior `turn_aborted` results came from a PTY wrapper leaving the
+  interactive client, not from Codex hooks or the rollout parser.  The working
+  contract is: use the bundled interactive CLI in a real terminal; wait for
+  the assistant response and the idle `Ask Codex` prompt; type `/exit`; then
+  submit it with a separate Enter.  This emits `Shutting down...` and a native
+  SessionEnd payload without a signal, manual hook call, receipt write, or
+  rsync.
+- Simple session `01a052c0-8451-7791-aad6-68c9c29169ca` recorded completed
+  user and assistant items plus `task_complete`, then naturally executed the
+  detached drain.  Durable canary session
+  `01a052c3-23d6-7633-8ca5-82a969d6670d` followed the same contract.
+- Its automatic worker receipt is `codex-84482c2dbbf55f0e10349560e3edf046`.
+  It created the matching non-empty daily event, learned the exact
+  `PZ-CODEX-CANARY-20260830-f3a9` rule in `companion/Kurallar.md`, and normal
+  sync delivered both the identical event SHA-256 and rule to the VPS.
+- This closes the Codex non-empty SessionEnd/worker/event/rule/sync segment.
+  The wider final acceptance remains open: the new rule invalidates stale
+  startup-recall evidence by source SHA, and fresh completed Hermes/Claude
+  recall directions remain required.
