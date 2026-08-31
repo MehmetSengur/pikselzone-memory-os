@@ -12,7 +12,8 @@ from unittest import mock
 
 import memory_v1.core as core_module
 from memory_v1.adapters import (
-    checkpoint_hook, drain_checkpoint, flush_hook, normalize_event_name,
+    checkpoint_hook, drain_checkpoint, find_pending_turn_checkpoint, flush_hook,
+    normalize_event_name,
 )
 from memory_v1.context import build_context
 from memory_v1.core import (
@@ -89,6 +90,17 @@ class MemoryFixture(unittest.TestCase):
         ]
         if extra:
             records.extend(extra)
+        path.write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
+        return path
+
+    def transcript_pairs(self, name, pairs):
+        path = self.root / name
+        records = []
+        for user, assistant in pairs:
+            records.extend((
+                {"message": {"role": "user", "content": user}},
+                {"message": {"role": "assistant", "content": assistant}},
+            ))
         path.write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
         return path
 
@@ -538,6 +550,118 @@ class EventTests(MemoryFixture):
             ["pre_compact", "session_end"],
             parse_event_artifact(event.read_text())["events_seen"],
         )
+
+    def test_sessionend_no_memory_settles_raw_and_terminal_without_vault_mutation(self):
+        empty = {"status": "empty", **{key: [] for key in SUMMARY if key != "status"}}
+        provider = FakeProvider(empty)
+        source = self.transcript()
+        raw = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "Stop", "session_id": "empty-terminal", "turn_id": "turn-001",
+            "transcript_path": str(source),
+        })
+        terminal = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "SessionEnd", "session_id": "empty-terminal",
+            "transcript_path": str(source),
+        })
+
+        with self.assertRaises(NoMemory):
+            drain_checkpoint(self.config(), terminal, provider=provider)
+
+        self.assertEqual(1, len(provider.calls))
+        self.assertFalse(raw.exists())
+        self.assertFalse(terminal.exists())
+        self.assertIsNone(find_pending_turn_checkpoint(
+            self.config(), runtime="codex", session_id="empty-terminal",
+        ))
+        self.assertEqual([], list(self.vault.rglob("*")))
+
+    def test_provider_failure_preserves_selected_then_no_memory_settles(self):
+        class FailingProvider:
+            def request(self, **kwargs):
+                raise ProviderBlocked("test-provider-failure")
+
+        source = self.transcript()
+        raw = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "Stop", "session_id": "empty-retry", "turn_id": "turn-001",
+            "transcript_path": str(source),
+        })
+        terminal = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "SessionEnd", "session_id": "empty-retry",
+            "transcript_path": str(source),
+        })
+        with self.assertRaises(ProviderBlocked):
+            drain_checkpoint(self.config(), terminal, provider=FailingProvider())
+        self.assertTrue(raw.exists())
+        self.assertTrue(terminal.exists())
+
+        empty = {"status": "empty", **{key: [] for key in SUMMARY if key != "status"}}
+        with self.assertRaises(NoMemory):
+            drain_checkpoint(self.config(), terminal, provider=FakeProvider(empty))
+        self.assertFalse(raw.exists())
+        self.assertFalse(terminal.exists())
+
+    def test_precompact_no_memory_settles_snapshot_but_not_later_turn(self):
+        empty = {"status": "empty", **{key: [] for key in SUMMARY if key != "status"}}
+        provider = FakeProvider(empty)
+        source = self.transcript_pairs("empty-precompact.jsonl", [("first", "one")])
+        turn_one = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "Stop", "session_id": "empty-precompact", "turn_id": "turn-001",
+            "transcript_path": str(source),
+        })
+        source = self.transcript_pairs("empty-precompact.jsonl", [("first", "one"), ("second", "two")])
+        turn_two = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "Stop", "session_id": "empty-precompact", "turn_id": "turn-002",
+            "transcript_path": str(source),
+        })
+        boundary = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "PreCompact", "session_id": "empty-precompact", "transcript_path": str(source),
+        })
+
+        with self.assertRaises(NoMemory):
+            drain_checkpoint(self.config(), boundary, provider=provider)
+        self.assertEqual(1, len(provider.calls))
+        self.assertFalse(turn_one.exists())
+        self.assertFalse(turn_two.exists())
+        self.assertFalse(boundary.exists())
+        self.assertEqual([], list(self.vault.rglob("*")))
+
+        source = self.transcript_pairs(
+            "empty-precompact.jsonl", [("first", "one"), ("second", "two"), ("third", "three")],
+        )
+        turn_three = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "Stop", "session_id": "empty-precompact", "turn_id": "turn-003",
+            "transcript_path": str(source),
+        })
+        self.assertTrue(turn_three.exists())
+        self.assertEqual(turn_three, find_pending_turn_checkpoint(
+            self.config(), runtime="codex", session_id="empty-precompact",
+        ))
+
+    def test_identical_empty_precompact_then_sessionend_skips_provider(self):
+        empty = {"status": "empty", **{key: [] for key in SUMMARY if key != "status"}}
+        provider = FakeProvider(empty)
+        source = self.transcript()
+        precompact = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "PreCompact", "session_id": "empty-boundary-dedup", "transcript_path": str(source),
+        })
+        source_digest = json.loads(precompact.read_text(encoding="utf-8"))["source_digest"]
+        with self.assertRaises(NoMemory):
+            drain_checkpoint(self.config(), precompact, provider=provider)
+        session_end = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "SessionEnd", "session_id": "empty-boundary-dedup", "transcript_path": str(source),
+        })
+        with self.assertRaises(NoMemory) as ctx:
+            drain_checkpoint(self.config(), session_end, provider=provider)
+
+        self.assertIn("already-classified-empty", str(ctx.exception))
+        self.assertEqual(1, len(provider.calls))
+        self.assertFalse(session_end.exists())
+        state_path = self.state / "sessions" / "codex" / f"{session_key('empty-boundary-dedup')}.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual("empty", state["status"])
+        self.assertEqual(source_digest, state["source_digest"])
+        self.assertEqual(["pre_compact", "session_end"], state["events_seen"])
+        self.assertEqual([], list(self.vault.rglob("*")))
 
     def test_crash_recovery_promotes_pending_turn_once(self):
         calls = 0

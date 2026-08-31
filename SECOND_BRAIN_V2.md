@@ -41,6 +41,14 @@ Memory OS-aware instructions.  Codex native memory is a separate store and is
 not read, imported, or silently synchronized.  Codex Desktop/App lifecycle
 support remains `UNKNOWN` until independently observed.
 
+A successful `NoMemory` classification is semantic settlement: the exact
+boundary snapshot is consumed without a daily artifact or Second Brain
+mutation.  The existing `status=empty` and `source_digest` session state is
+the idempotency record for later identical boundaries, which merge their event
+without another provider call.  Provider failures leave pending material
+retryable.  V2.2 is not production activated; Hermes final-turn recovery
+remains a blocker.
+
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
 - **SB2-01**: Codex old + new rollout format compatibility (both legacy `user_message`/`agent_message` and modern `item_completed` with `UserMessage`/`AgentMessage`, case-insensitive `text`/`Text` block extraction, complete filtering of `Reasoning`/`CommandExecution`/`FileChange`/internal events, and regression check against silent 0-turn failure with 10 targeted tests PASS).

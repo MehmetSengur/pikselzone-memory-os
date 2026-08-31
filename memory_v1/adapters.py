@@ -320,6 +320,13 @@ def drain_checkpoint(
         raise SchemaError("checkpoint-drain-event-invalid")
     if not selected:
         raise SchemaError("checkpoint-session-empty")
+
+    def settle_selected() -> None:
+        if sha256_file(queue_path) != checkpoint_digest:
+            raise PolicyError("checkpoint-changed-during-drain")
+        for path in selected:
+            safe_unlink(path, root=pending)
+
     if event == TURN_CHECKPOINT_EVENT:
         checkpoint_values: list[dict[str, Any]] = []
         seen_digests: set[str] = set()
@@ -363,17 +370,12 @@ def drain_checkpoint(
             or not event_path.is_file()
         ):
             raise PolicyError("duplicate-event-path-invalid") from exc
-        if sha256_file(queue_path) != checkpoint_digest:
-            raise PolicyError("checkpoint-changed-during-drain")
-        for path in selected:
-            safe_unlink(path, root=pending)
+        settle_selected()
         return event_path
     except NoMemory:
-        safe_unlink(queue_path, root=pending)
+        settle_selected()
         raise
     worker_completed_at = iso_now()
-    if sha256_file(queue_path) != checkpoint_digest:
-        raise PolicyError("checkpoint-changed-during-drain")
 
     event_digest = sha256_file(event_path)
     event_artifact = parse_event_artifact(event_path.read_text(encoding="utf-8"))
@@ -451,6 +453,5 @@ def drain_checkpoint(
         ensure_safe_directory(evidence_path.parent, create=True)
         atomic_json(evidence_path, evidence_payload)
 
-    for path in selected:
-        safe_unlink(path, root=pending)
+    settle_selected()
     return event_path

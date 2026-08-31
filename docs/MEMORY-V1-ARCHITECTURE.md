@@ -84,6 +84,13 @@ Provider failure leaves the raw checkpoint retryable and never blocks a normal
 runtime turn or startup.  PreCompact and SessionEnd remain the authoritative
 flush boundaries; recovery is a bounded degraded-mode path only.
 
+Both successful outcomes settle exactly the checkpoint paths selected when the
+boundary began: durable memory promotes once, while `NoMemory` writes no daily
+artifact and runs no companion, rule, graph, or skill mutation.  The existing
+session state record `status=empty` plus `source_digest` is the semantic
+tombstone for an identical later boundary, which only merges `events_seen`
+without re-calling the provider.  Provider failures settle nothing.
+
 Runtime semantics are deliberately not unified:
 
 | Runtime | Raw checkpoint boundary | Promotion status |

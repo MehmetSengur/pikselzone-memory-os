@@ -88,6 +88,27 @@ class EventWriter:
                 and previous.get("event_path")
             ):
                 raise DuplicateEvent(previous["event_path"])
+            # A successful empty classification is itself durable semantic
+            # state, even though it deliberately has no daily event artifact.
+            # Later identical lifecycle boundaries must not classify the same
+            # source again or replay the Second Brain pipeline.
+            if (
+                previous.get("source_digest") == source_digest
+                and previous.get("status") == "empty"
+            ):
+                events_seen = sorted(set(previous.get("events_seen", [])) | {event})
+                atomic_json(state_path, {
+                    **previous,
+                    "source_digest": source_digest,
+                    "events_seen": events_seen,
+                    "status": "empty",
+                    "updated_at": iso_now(),
+                })
+                write_health(
+                    self.config.state_path, f"flush-{runtime}", "ok",
+                    "deduplicated-no-memory",
+                )
+                raise NoMemory("already-classified-empty")
             # A terminal boundary often sees exactly the transcript already
             # flushed at PreCompact.  Record the new lifecycle fact without a
             # second provider call or a second companion/rule/graph/skill pass.
