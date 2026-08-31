@@ -531,8 +531,8 @@ def _write_discovery_cursor(cursor: dict[str, Any]) -> bool:
 def _discovery_entry(
     *, profile: str, database: Path, session_id: str, digest: Optional[str], observed_at: str,
 ) -> tuple[str, dict[str, Any]]:
+    identity = _discovery_identity(database, session_id)
     database_id = str(database.resolve())
-    identity = hashlib.sha256(f"{database_id}\0{session_id}".encode("utf-8")).hexdigest()
     return identity, {
         "session_id": session_id,
         "profile": profile,
@@ -542,12 +542,21 @@ def _discovery_entry(
     }
 
 
-def _discover_final_turn_checkpoints() -> None:
+def _discovery_identity(database: Path, session_id: str) -> str:
+    """Return the transcript-free cursor identity for one SessionDB session."""
+    database_id = str(database.resolve())
+    return hashlib.sha256(f"{database_id}\0{session_id}".encode("utf-8")).hexdigest()
+
+
+def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -> None:
     """Baseline or raw-stage bounded, tracked Hermes SessionDB final turns.
 
     This startup phase intentionally never calls PluginLlm or writes durable
-    memory. Newly observed sessions are armed as a baseline; only a later
-    final-turn digest change is eligible for canonical raw checkpoint staging.
+    memory. Only sessions observed through a real lifecycle SessionStart may be
+    armed as a baseline. The bounded recent-session scan exports existing
+    cursor entries and the current session only; unrelated historical rows stay
+    metadata-only and can never become recovery candidates merely by appearing
+    in a recent window.
     """
     cursor, cursor_ok = _load_discovery_cursor()
     if not cursor_ok:
@@ -569,6 +578,11 @@ def _discover_final_turn_checkpoints() -> None:
         return
 
     sessions = dict(cursor["sessions"])
+    real_current_session_id = (
+        current_session_id.strip()
+        if isinstance(current_session_id, str) and current_session_id.strip()
+        else None
+    )
     seen_databases: set[str] = set()
     changed = False
     for profile_name, profile_dir in targets:
@@ -591,10 +605,28 @@ def _discover_final_turn_checkpoints() -> None:
             )
             if not isinstance(rows, list):
                 raise ValueError("recent-session-result-invalid")
+            recent_ids: set[str] = set()
+            candidate_ids: list[str] = []
             for row in rows[:MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE]:
                 if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                     continue
                 session_id = row["id"]
+                recent_ids.add(session_id)
+                identity = _discovery_identity(db_path, session_id)
+                if identity in sessions or session_id == real_current_session_id:
+                    candidate_ids.append(session_id)
+
+            # The active session can legitimately fall outside the bounded
+            # recent window. Locate exactly that ID without enumerating more
+            # history; it is the only untracked session allowed to be armed.
+            if real_current_session_id and real_current_session_id not in recent_ids:
+                try:
+                    if db.get_session(real_current_session_id):
+                        candidate_ids.append(real_current_session_id)
+                except Exception as exc:
+                    logger.warning("pz-memory-v1: failed to locate current session metadata: %s", exc)
+
+            for session_id in candidate_ids:
                 try:
                     metadata = db.get_session(session_id)
                     exported = db.export_session(session_id) if metadata else None
@@ -955,10 +987,10 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
 
 
 def on_session_start(**kwargs: Any) -> None:
-    session_id = kwargs.get("session_id") or "startup"
-    logger.info("pz-memory-v1: on_session_start for session %s", session_id)
+    session_id = kwargs.get("session_id")
+    logger.info("pz-memory-v1: on_session_start for session %s", session_id or "unknown")
     try:
-        _discover_final_turn_checkpoints()
+        _discover_final_turn_checkpoints(session_id)
     except Exception as exc:
         logger.warning("pz-memory-v1: SessionDB discovery entered degraded mode: %s", exc)
     try:

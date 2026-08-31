@@ -492,7 +492,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             self.assertEqual("pikselzone-memory-turn-checkpoint-v2", payload["schema"])
             self.assertEqual("USER: keep this\nASSISTANT: acknowledged", payload["normalized_transcript"])
 
-    def test_startup_discovery_baselines_historical_sessions_without_replay(self):
+    def test_unrelated_historical_recent_sessions_remain_untracked(self):
         plugin = load_hermes_plugin()
         sessions = {
             "default": [self._fake_session("historic-1", [
@@ -504,18 +504,63 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
              mock.patch.object(plugin, "_recover_pending_turn_checkpoints") as recover, \
              mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
-            plugin.on_session_start(session_id="new-startup")
+            plugin.on_session_start(session_id="different-current")
             recover.assert_called_once()
             summarize.assert_not_called()
             self.assertEqual([(calls["search"][0][0], None, plugin.MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE, 0)], calls["search"])
             self.assertTrue(all(calls["read_only"]))
+            self.assertEqual([], calls["exports"])
             self.assertEqual([], plugin._checkpoint_paths("historic-1"))
-            cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
-            self.assertEqual(1, len(cursor["sessions"]))
-            self.assertNotIn("historic assistant", json.dumps(cursor))
+            self.assertFalse(Path(plugin._discovery_cursor_path()).exists())
             self.assertEqual([], [path for path in self.vault.rglob("*") if path.is_file()])
 
-    def test_startup_discovery_recovers_tracked_final_turn_without_pre_llm(self):
+    def test_current_untracked_session_is_baseline_only(self):
+        plugin = load_hermes_plugin()
+        session = self._fake_session("resumed-historic", [
+            {"role": "user", "content": "historic user"},
+            {"role": "assistant", "content": "historic assistant"},
+        ])
+        patches, calls = self._fake_discovery_runtime({"default": [session]})
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
+             mock.patch.object(plugin, "_recover_pending_turn_checkpoints"), \
+             mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
+            plugin.on_session_start(session_id="resumed-historic")
+            turn = "USER: historic user\nASSISTANT: historic assistant"
+            digest = hashlib.sha256(turn.encode("utf-8")).hexdigest()
+            self.assertEqual([(calls["exports"][0][0], "resumed-historic")], calls["exports"])
+            self.assertEqual([], plugin._checkpoint_paths("resumed-historic"))
+            cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
+            self.assertEqual(1, len(cursor["sessions"]))
+            self.assertEqual(digest, next(iter(cursor["sessions"].values()))["last_turn_digest"])
+            summarize.assert_not_called()
+
+    def test_only_tracked_or_current_sessions_are_exported(self):
+        plugin = load_hermes_plugin()
+        historic = [self._fake_session(f"historic-{index:02d}", [{"role": "user", "content": "u"}]) for index in range(18)]
+        tracked = self._fake_session("tracked", [{"role": "user", "content": "tracked"}])
+        current = self._fake_session("current", [{"role": "user", "content": "current"}])
+        patches, calls = self._fake_discovery_runtime({"default": [*historic, tracked, current]})
+        db_path = self.root / "fake-hermes-profiles" / "default" / "state.db"
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
+             mock.patch.object(plugin, "_recover_pending_turn_checkpoints"):
+            identity, entry = plugin._discovery_entry(
+                profile="default", database=db_path, session_id="tracked", digest=None,
+                observed_at="2026-09-01T00:00:00+03:00",
+            )
+            self.assertTrue(plugin._write_discovery_cursor({
+                "schema": plugin.DISCOVERY_CURSOR_SCHEMA, "sessions": {identity: entry},
+            }))
+            plugin.on_session_start(session_id="current")
+            self.assertEqual(1, len(calls["search"]))
+            self.assertEqual(plugin.MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE, calls["search"][0][2])
+            self.assertEqual({"tracked", "current"}, {session_id for _, session_id in calls["exports"]})
+            self.assertEqual(2, len(calls["exports"]))
+            cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
+            self.assertEqual(2, len(cursor["sessions"]))
+            self.assertFalse(any(session_id.startswith("historic-") for _, session_id in calls["exports"]))
+            self.assertFalse(any(plugin._checkpoint_paths(f"historic-{index:02d}") for index in range(18)))
+
+    def test_tracked_session_changed_digest_recovers(self):
         plugin = load_hermes_plugin()
         session = self._fake_session("tracked-crash", [{"role": "user", "content": "start"}])
         patches, calls = self._fake_discovery_runtime({"default": [session]})
@@ -524,12 +569,54 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
              mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
             plugin.on_session_start(session_id="tracked-crash")
             session["messages"].append({"role": "assistant", "content": "completed"})
-            plugin.on_session_start(session_id="next-startup")
+            plugin.on_session_start(session_id="tracked-crash")
             turn = "USER: start\nASSISTANT: completed"
             digest = hashlib.sha256(turn.encode("utf-8")).hexdigest()
             self.assertTrue(Path(plugin._checkpoint_destination("tracked-crash", digest)).is_file())
             self.assertEqual(2, len(calls["exports"]))
             summarize.assert_not_called()
+
+    def test_untracked_historical_session_can_be_resumed_without_replay(self):
+        plugin = load_hermes_plugin()
+        session = self._fake_session("historic-resumed", [
+            {"role": "user", "content": "historic user"},
+            {"role": "assistant", "content": "historic assistant"},
+        ])
+        patches, calls = self._fake_discovery_runtime({"default": [session]})
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
+             mock.patch.object(plugin, "_recover_pending_turn_checkpoints"), \
+             mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
+            plugin.on_session_start(session_id="unrelated")
+            self.assertEqual([], calls["exports"])
+            plugin.on_session_start(session_id="historic-resumed")
+            self.assertEqual([], plugin._checkpoint_paths("historic-resumed"))
+            session["messages"].extend([
+                {"role": "user", "content": "new user"},
+                {"role": "assistant", "content": "new assistant"},
+            ])
+            plugin.on_session_start(session_id="historic-resumed")
+            turn = "USER: new user\nASSISTANT: new assistant"
+            digest = hashlib.sha256(turn.encode("utf-8")).hexdigest()
+            self.assertTrue(Path(plugin._checkpoint_destination("historic-resumed", digest)).is_file())
+            summarize.assert_not_called()
+
+    def test_current_session_outside_recent_window_can_be_baselined_directly(self):
+        plugin = load_hermes_plugin()
+        historic = [self._fake_session(f"recent-{index:02d}", [{"role": "user", "content": "u"}]) for index in range(20)]
+        current = self._fake_session("outside-window", [
+            {"role": "user", "content": "current user"},
+            {"role": "assistant", "content": "current assistant"},
+        ])
+        patches, calls = self._fake_discovery_runtime({"default": [*historic, current]})
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
+             mock.patch.object(plugin, "_recover_pending_turn_checkpoints"):
+            plugin.on_session_start(session_id="outside-window")
+            self.assertEqual(1, len(calls["search"]))
+            self.assertEqual(plugin.MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE, calls["search"][0][2])
+            self.assertEqual([(calls["exports"][0][0], "outside-window")], calls["exports"])
+            cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
+            self.assertEqual(1, len(cursor["sessions"]))
+            self.assertEqual([], plugin._checkpoint_paths("outside-window"))
 
     def test_startup_and_pre_llm_share_checkpoint_identity(self):
         plugin = load_hermes_plugin()
@@ -539,7 +626,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
              mock.patch.object(plugin, "_recover_pending_turn_checkpoints"):
             plugin.on_session_start(session_id="identity-parity")
             session["messages"].append({"role": "assistant", "content": "completed"})
-            plugin.on_session_start(session_id="next-startup")
+            plugin.on_session_start(session_id="identity-parity")
             expected = plugin._checkpoint_paths("identity-parity")
             with mock.patch.object(
                 plugin, "_get_session_transcript",
@@ -555,10 +642,11 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         patches, _ = self._fake_discovery_runtime({"default": [completed, user_only]})
         with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
              mock.patch.object(plugin, "_recover_pending_turn_checkpoints"):
-            plugin.on_session_start()
+            plugin.on_session_start(session_id="already-completed")
             completed["messages"].append({"role": "assistant", "content": "done"})
             plugin._IN_MEMORY_COMPLETED.add("already-completed")
-            plugin.on_session_start()
+            plugin.on_session_start(session_id="already-completed")
+            plugin.on_session_start(session_id="user-only")
             self.assertEqual([], plugin._checkpoint_paths("already-completed"))
             self.assertEqual([], plugin._checkpoint_paths("user-only"))
 
@@ -568,13 +656,13 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         patches, _ = self._fake_discovery_runtime({"default": [session]})
         with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
              mock.patch.object(plugin, "_recover_pending_turn_checkpoints"):
-            plugin.on_session_start()
+            plugin.on_session_start(session_id="retry-discovery")
             session["messages"].append({"role": "assistant", "content": "done"})
             with mock.patch.object(plugin, "_stage_completed_turn_checkpoint", return_value=False):
-                plugin.on_session_start()
+                plugin.on_session_start(session_id="retry-discovery")
             cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
             self.assertEqual(None, next(iter(cursor["sessions"].values()))["last_turn_digest"])
-            plugin.on_session_start()
+            plugin.on_session_start(session_id="retry-discovery")
             self.assertEqual(1, len(plugin._checkpoint_paths("retry-discovery")))
 
     def test_discovery_handoff_recovers_one_memory_event_without_replay(self):
@@ -586,14 +674,14 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             "decisions": ["Recovered once"], "learnings": [], "open_items": [], "evidence": [],
         }
         with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches:
-            plugin._discover_final_turn_checkpoints()
+            plugin._discover_final_turn_checkpoints("discovery-memory")
             session["messages"].append({"role": "assistant", "content": "done"})
-            plugin._discover_final_turn_checkpoints()
+            plugin._discover_final_turn_checkpoints("discovery-memory")
             self.assertEqual(1, len(plugin._checkpoint_paths("discovery-memory")))
             with mock.patch.object(plugin, "_summarize_with_hermes", return_value=(summary, "custom", "gpt-5.4-mini")) as summarize:
                 plugin._recover_pending_turn_checkpoints()
                 self.assertEqual(1, summarize.call_count)
-                plugin._discover_final_turn_checkpoints()
+                plugin._discover_final_turn_checkpoints("discovery-memory")
                 plugin._recover_pending_turn_checkpoints()
                 self.assertEqual(1, summarize.call_count)
         self.assertFalse(plugin._checkpoint_paths("discovery-memory"))
@@ -608,13 +696,13 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         patches, _ = self._fake_discovery_runtime({"default": [session]})
         empty = {"status": "empty", "context": [], "important_conversations": [], "decisions": [], "learnings": [], "open_items": [], "evidence": []}
         with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches:
-            plugin._discover_final_turn_checkpoints()
+            plugin._discover_final_turn_checkpoints("discovery-empty")
             session["messages"].append({"role": "assistant", "content": "done"})
-            plugin._discover_final_turn_checkpoints()
+            plugin._discover_final_turn_checkpoints("discovery-empty")
             with mock.patch.object(plugin, "_summarize_with_hermes", return_value=(empty, "custom", "gpt-5.4-mini")) as summarize:
                 plugin._recover_pending_turn_checkpoints()
                 self.assertEqual(1, summarize.call_count)
-                plugin._discover_final_turn_checkpoints()
+                plugin._discover_final_turn_checkpoints("discovery-empty")
                 plugin._recover_pending_turn_checkpoints()
                 self.assertEqual(1, summarize.call_count)
         self.assertFalse(plugin._checkpoint_paths("discovery-empty"))
@@ -632,12 +720,15 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         )
         with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
              mock.patch.object(plugin, "_recover_pending_turn_checkpoints"):
+            plugin.on_session_start(session_id="bounded-0")
+            calls["search"].clear()
+            calls["exports"].clear()
             plugin.on_session_start()
             self.assertEqual(1, len(calls["search"]))
             self.assertEqual(plugin.MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE, calls["search"][0][2])
-            self.assertEqual(plugin.MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE, len(calls["exports"]))
+            self.assertEqual([(calls["exports"][0][0], "bounded-0")], calls["exports"])
             cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
-            self.assertEqual(plugin.MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE, len(cursor["sessions"]))
+            self.assertEqual(1, len(cursor["sessions"]))
 
     def test_startup_recovers_pending_sessiondb_checkpoint_once(self):
         plugin = load_hermes_plugin()

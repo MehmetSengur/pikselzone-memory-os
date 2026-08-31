@@ -93,11 +93,13 @@ without re-calling the provider.  Provider failures settle nothing.
 
 Hermes startup first uses supported read-only SessionDB/profile discovery with
 an explicit 20-session-per-profile bound.  Its 128-entry local cursor contains
-only profile/database/session identity and final-turn digest: first sightings
-are baseline-only, preventing historical replay; a changed digest on an armed
-session stages the canonical raw checkpoint and leaves semantic promotion to
-the existing recovery path.  Per-profile failures and checkpoint-write
-failures degrade safely without advancing past the affected digest.
+only profile/database/session identity and final-turn digest: only sessions
+observed through a real `on_session_start` are baseline-only armed, so
+unrelated recent historical sessions remain untracked and cannot replay.  A
+changed digest on an armed session stages the canonical raw checkpoint and
+leaves semantic promotion to the existing recovery path.  Per-profile failures
+and checkpoint-write failures degrade safely without advancing past the
+affected digest.
 
 Runtime semantics are deliberately not unified:
 

@@ -51,11 +51,12 @@ remains a blocker.
 
 Hermes startup now performs a bounded (20 recent sessions per supported
 profile) read-only SessionDB discovery before pending-checkpoint recovery.  A
-local, transcript-free cursor arms first-seen sessions as a non-replaying
-baseline; only a later final-turn digest change can create the same canonical
-raw checkpoint that `pre_llm_call` would create.  This remains raw-only and
-provider-free until existing recovery handles the checkpoint.  Native VPS
-acceptance is still required before activation.
+local, transcript-free cursor arms only sessions observed through a real
+`on_session_start` as a non-replaying baseline; unrelated recent historical
+sessions remain untracked.  Only a later final-turn digest change can create
+the same canonical raw checkpoint that `pre_llm_call` would create.  This
+remains raw-only and provider-free until existing recovery handles the
+checkpoint.  Native VPS acceptance is still required before activation.
 
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
