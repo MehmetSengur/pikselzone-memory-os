@@ -31,6 +31,16 @@ Transform Pikselzone Memory OS from a passive, overly restrictive session logger
 ## Current Status
 COMPLETED: Pikselzone Memory OS has been successfully transformed into Second Brain V2 (fully autonomous, self-evolving, learning, relationship-building, rule-extracting, skill-generating, and self-healing memory operating system).
 
+## V2.2 Checkpoint Contract
+
+V2.2 adds a bounded raw-turn checkpoint layer without replacing `PreCompact`
+or `SessionEnd`.  Completed turns are captured cheaply outside the shared
+Obsidian vault; durable promotion remains boundary-driven and idempotent.
+“Ortak hafıza” means the Pikselzone Memory OS shared brain when handled by
+Memory OS-aware instructions.  Codex native memory is a separate store and is
+not read, imported, or silently synchronized.  Codex Desktop/App lifecycle
+support remains `UNKNOWN` until independently observed.
+
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
 - **SB2-01**: Codex old + new rollout format compatibility (both legacy `user_message`/`agent_message` and modern `item_completed` with `UserMessage`/`AgentMessage`, case-insensitive `text`/`Text` block extraction, complete filtering of `Reasoning`/`CommandExecution`/`FileChange`/internal events, and regression check against silent 0-turn failure with 10 targeted tests PASS).

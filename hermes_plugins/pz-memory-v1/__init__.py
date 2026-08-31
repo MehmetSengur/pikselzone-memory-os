@@ -37,6 +37,9 @@ OUTBOX_EVIDENCE = posixpath.join(BASE_DIR, "outbox", "evidence")
 STATE_DIR = posixpath.join(BASE_DIR, "state")
 LOCKS_DIR = posixpath.join(STATE_DIR, "locks")
 RECEIPTS_DIR = posixpath.join(STATE_DIR, "receipts")
+CHECKPOINTS_DIR = posixpath.join(STATE_DIR, "checkpoints")
+MAX_TURN_CHECKPOINTS_PER_SESSION = 32
+MAX_TURN_CHECKPOINT_CHARS = 64 * 1024
 
 _IN_MEMORY_PROCESSED: set[str] = set()
 
@@ -365,6 +368,153 @@ def _get_session_transcript(session_id: str) -> tuple[Optional[str], Optional[st
     return normalized, model, task_id, total_redactions
 
 
+def _checkpoint_root() -> str:
+    return posixpath.join(
+        os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR, "state", "checkpoints"
+    )
+
+
+def _last_completed_turn(transcript: str) -> Optional[str]:
+    lines = transcript.splitlines()
+    user_indexes = [i for i, line in enumerate(lines) if line.startswith("USER: ")]
+    if not user_indexes:
+        return None
+    turn = "\n".join(lines[user_indexes[-1]:]).strip()
+    if not any(line.startswith("ASSISTANT: ") for line in turn.splitlines()):
+        return None
+    if len(turn) > MAX_TURN_CHECKPOINT_CHARS:
+        logger.warning("pz-memory-v1: completed Hermes turn exceeds checkpoint bound")
+        return None
+    return turn
+
+
+def _checkpoint_paths(session_id: str) -> list[str]:
+    root = _checkpoint_root()
+    session_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    try:
+        names = sorted(
+            name for name in os.listdir(root)
+            if name.startswith(f"hermes-{session_hash}-") and name.endswith(".json")
+        )
+    except OSError:
+        return []
+    return [posixpath.join(root, name) for name in names]
+
+
+def _stage_turn_checkpoint(session_id: str) -> bool:
+    """Persist the final completed SessionDB turn without invoking PluginLlm."""
+    transcript, model, task_id, redactions = _get_session_transcript(session_id)
+    if not transcript:
+        return False
+    turn = _last_completed_turn(transcript)
+    if not turn:
+        return False
+    digest = hashlib.sha256(turn.encode("utf-8")).hexdigest()
+    existing = _checkpoint_paths(session_id)
+    filename = f"hermes-{hashlib.sha256(session_id.encode('utf-8')).hexdigest()[:32]}-{digest[:16]}.json"
+    destination = posixpath.join(_checkpoint_root(), filename)
+    if os.path.isfile(destination):
+        return True
+    if len(existing) >= MAX_TURN_CHECKPOINTS_PER_SESSION:
+        logger.warning("pz-memory-v1: turn checkpoint retention limit reached for session %s", session_id)
+        return False
+    payload = {
+        "schema": "pikselzone-memory-turn-checkpoint-v2",
+        "runtime": "hermes",
+        "session_id": session_id,
+        "turn_digest": digest,
+        "normalized_transcript": turn,
+        "source_model": model or "unknown",
+        "root_task_id": task_id or "unknown",
+        "secret_redactions": redactions,
+        "observed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    try:
+        os.makedirs(_checkpoint_root(), mode=0o770, exist_ok=True)
+        temporary = f"{destination}.{os.getpid()}.tmp"
+        with open(temporary, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temporary, 0o660)
+        os.replace(temporary, destination)
+        return True
+    except OSError as exc:
+        logger.warning("pz-memory-v1: failed to persist turn checkpoint: %s", exc)
+        try:
+            os.unlink(temporary)
+        except (OSError, UnboundLocalError):
+            pass
+        return False
+
+
+def _clear_turn_checkpoints(session_id: str) -> None:
+    for path in _checkpoint_paths(session_id):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _recover_pending_turn_checkpoints() -> None:
+    """Best-effort startup recovery for crashed sessions; never blocks Hermes."""
+    root = _checkpoint_root()
+    try:
+        names = sorted(name for name in os.listdir(root) if name.endswith(".json"))
+    except OSError:
+        return
+    by_session: dict[str, list[dict[str, Any]]] = {}
+    for name in names:
+        path = posixpath.join(root, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                item = json.load(fh)
+            if (
+                item.get("schema") != "pikselzone-memory-turn-checkpoint-v2"
+                or item.get("runtime") != "hermes"
+                or not isinstance(item.get("session_id"), str)
+                or not isinstance(item.get("turn_digest"), str)
+                or not isinstance(item.get("normalized_transcript"), str)
+            ):
+                continue
+            by_session.setdefault(item["session_id"], []).append(item)
+        except (OSError, ValueError, TypeError):
+            logger.warning("pz-memory-v1: ignoring corrupt turn checkpoint %s", name)
+    for session_id, items in by_session.items():
+        unique: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items:
+            digest = item["turn_digest"]
+            text = item["normalized_transcript"]
+            if digest in seen or hashlib.sha256(text.encode("utf-8")).hexdigest() != digest:
+                continue
+            seen.add(digest)
+            unique.append(item)
+        if not unique or _is_session_completed(session_id):
+            continue
+        transcript = "\n".join(item["normalized_transcript"] for item in unique)
+        summary, provider, model = _summarize_with_hermes(transcript)
+        if not summary:
+            continue
+        if summary.get("status") == "empty":
+            _mark_durable_completion(session_id, status="checkpoint-recovery-empty")
+            _clear_turn_checkpoints(session_id)
+            continue
+        source_sha = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+        staged = _render_and_stage_event(
+            session_id=session_id, summary=summary,
+            source_model=model or str(unique[-1].get("source_model") or "unknown"),
+            source_provider=provider or "custom",
+            root_task_id=str(unique[-1].get("root_task_id") or "unknown"),
+            source_sha=source_sha,
+            redactions=sum(int(item.get("secret_redactions") or 0) for item in unique),
+            hook_event="checkpoint_recovery",
+        )
+        if staged:
+            _mark_durable_completion(session_id, status="checkpoint-recovery", event_path=staged)
+            _clear_turn_checkpoints(session_id)
+
+
 def _summarize_with_hermes(transcript: str) -> tuple[Optional[dict[str, Any]], str, str]:
     """Invoke Hermes PluginLlm facade with recursion guard."""
     from agent.plugin_llm import PluginLlm, PluginLlmTextInput
@@ -594,6 +744,7 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
         )
         if staged_path:
             _mark_durable_completion(session_id, status="staged-event", event_path=staged_path)
+            _clear_turn_checkpoints(session_id)
             logger.info("pz-memory-v1: durably completed session %s with staged event %s", session_id, staged_path)
         else:
             logger.warning("pz-memory-v1: staging failed for session %s (leaving uncompleted)", session_id)
@@ -605,6 +756,10 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
 def on_session_start(**kwargs: Any) -> None:
     session_id = kwargs.get("session_id") or "startup"
     logger.info("pz-memory-v1: on_session_start for session %s", session_id)
+    try:
+        _recover_pending_turn_checkpoints()
+    except Exception as exc:
+        logger.warning("pz-memory-v1: checkpoint recovery entered degraded mode: %s", exc)
 
 
 def _write_hermes_recall_evidence(
@@ -711,6 +866,11 @@ def pre_llm_call(
 ) -> dict[str, Any] | None:
     """Inject startup recall bundle on the first turn or provide targeted recall."""
     try:
+        # At the next prompt, SessionDB contains the prior assistant response.
+        # Persist it cheaply before another generation begins; promotion stays
+        # reserved for terminal lifecycle callbacks or startup recovery.
+        if session_id:
+            _stage_turn_checkpoint(session_id)
         if is_first_turn or not conversation_history:
             # Look for staged startup bundle from host inbox
             bundle_path = posixpath.join(BASE_DIR, "inbox", "hermes-startup-bundle.json")

@@ -404,6 +404,57 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
                     plugin.on_session_end(session_id=sess_id)
                     mock_stage.assert_not_called()
 
+    def test_sessiondb_turn_checkpoint_is_provider_free_and_idempotent(self):
+        plugin = load_hermes_plugin()
+        sess_id = "sess-turn-checkpoint-1"
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}):
+            with mock.patch.object(
+                plugin, "_get_session_transcript",
+                return_value=("USER: keep this\nASSISTANT: acknowledged", "gpt-5.4-mini", "task-1", 0),
+            ), mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
+                self.assertTrue(plugin._stage_turn_checkpoint(sess_id))
+                self.assertTrue(plugin._stage_turn_checkpoint(sess_id))
+                summarize.assert_not_called()
+            checkpoints = plugin._checkpoint_paths(sess_id)
+            self.assertEqual(1, len(checkpoints))
+            payload = json.loads(Path(checkpoints[0]).read_text(encoding="utf-8"))
+            self.assertEqual("pikselzone-memory-turn-checkpoint-v2", payload["schema"])
+            self.assertEqual("USER: keep this\nASSISTANT: acknowledged", payload["normalized_transcript"])
+
+    def test_startup_recovers_pending_sessiondb_checkpoint_once(self):
+        plugin = load_hermes_plugin()
+        sess_id = "sess-turn-recovery-1"
+        summary = {
+            "status": "ok", "context": ["Recovered turn"],
+            "important_conversations": [], "decisions": ["Recover safely"],
+            "learnings": [], "open_items": [], "evidence": [],
+        }
+        with mock.patch.dict(os.environ, {
+            "PZ_MEMORY_BASE_DIR": str(self.outbox_root),
+            "PZ_MEMORY_VAULT_DAILY": str(self.vault / "daily" / "2026-08-31"),
+        }):
+            plugin._IN_MEMORY_COMPLETED.clear()
+            plugin._IN_MEMORY_EXECUTING.clear()
+            with mock.patch.object(
+                plugin, "_get_session_transcript",
+                return_value=("USER: recover\nASSISTANT: pending", "gpt-5.4-mini", "task-1", 0),
+            ):
+                self.assertTrue(plugin._stage_turn_checkpoint(sess_id))
+            with mock.patch.object(plugin, "_summarize_with_hermes", return_value=(summary, "custom", "gpt-5.4-mini")) as summarize:
+                plugin._recover_pending_turn_checkpoints()
+                self.assertEqual(1, summarize.call_count)
+            self.assertFalse(plugin._checkpoint_paths(sess_id))
+            self.assertTrue(plugin._is_session_completed(sess_id, locks_dir=str(self.outbox_root / "state" / "locks")))
+            event_paths = list((self.outbox_root / "outbox" / "events").glob("*.md"))
+            self.assertEqual(1, len(event_paths))
+            self.assertEqual("checkpoint_recovery", parse_event_artifact(event_paths[0].read_text())["event"])
+
+    def test_memory_plugin_does_not_read_codex_native_memory(self):
+        plugin_source = (Path(__file__).resolve().parent.parent.parent / "hermes_plugins" / "pz-memory-v1" / "__init__.py").read_text(encoding="utf-8")
+        adapter_source = (Path(__file__).resolve().parent.parent.parent / "memory_v1" / "adapters.py").read_text(encoding="utf-8")
+        self.assertNotIn("memories_1.sqlite", plugin_source)
+        self.assertNotIn("memories_1.sqlite", adapter_source)
+
     def test_hermes_plugin_drift_detection(self):
         from memory_v1.doctor import _hermes_plugin_drift_rows
         cfg = self._make_config()

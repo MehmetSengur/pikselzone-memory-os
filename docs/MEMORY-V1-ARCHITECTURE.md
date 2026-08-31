@@ -61,6 +61,47 @@ record `events_seen`; they do not append concurrently or create duplicate daily
 files. Per-session `flock` and durable state make retries idempotent. A session
 crossing midnight retains its original single event path.
 
+## V2.2 crash-safe turn checkpoints
+
+V2.2 keeps the existing lifecycle architecture intact.  A raw turn checkpoint
+is not a durable-memory promotion and never mutates `daily/`, companion files,
+rules, graph, or skills by itself.
+
+```text
+completed assistant turn (Codex/Claude Stop; Hermes next pre_llm_call)
+  -> short redacted local checkpoint, 0600/0660, session-key scoped
+  -> no provider call on the normal path
+  -> PreCompact or SessionEnd consumes pending material and promotes once
+  -> same-session identical source adds events_seen without another pipeline pass
+  -> startup recovery or the documented 32-turn bound can promote pending raw state
+```
+
+The workstation queue stores only the final completed USER/ASSISTANT pair,
+keyed by a hash of runtime/session and runtime turn ID (or the redacted turn
+digest when no turn ID is supplied).  It is idempotent, capped at 32 retained
+turns per session and 64 KiB per turn, and remains outside the shared vault.
+Provider failure leaves the raw checkpoint retryable and never blocks a normal
+runtime turn or startup.  PreCompact and SessionEnd remain the authoritative
+flush boundaries; recovery is a bounded degraded-mode path only.
+
+Runtime semantics are deliberately not unified:
+
+| Runtime | Raw checkpoint boundary | Promotion status |
+| --- | --- | --- |
+| Codex CLI | `Stop` (completed assistant turn) | source/test covered; native lifecycle canary still required after hook installation |
+| Claude Code | `Stop` contract | source/test covered; native runtime proof remains separate |
+| Hermes | `pre_llm_call` snapshots the previous completed SessionDB turn | terminal callbacks and startup recovery use PluginLlm; VPS deployment evidence remains required |
+| Codex Desktop/App | unknown | no CLI behavior is inferred |
+
+### Shared-memory terminology and native-memory boundary
+
+In Memory OS-aware runtime instructions, **“ortak hafıza”**, **“ortak kalıcı
+hafıza”**, **“shared memory”**, **“Memory OS”**, and **“Obsidian ortak hafıza”**
+mean the Pikselzone Memory OS shared durable brain.  **Codex native memory** and
+**Claude native memory** mean their runtime-specific stores.  V2.2 never reads,
+imports, deletes, or synchronizes Codex native-memory storage (including
+`~/.codex/memories_1.sqlite`); no native-to-Memory-OS bridge is claimed.
+
 The Markdown frontmatter carries:
 
 - `schema: pikselzone-memory-event-v1`
