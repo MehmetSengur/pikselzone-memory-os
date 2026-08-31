@@ -19,7 +19,7 @@ from .core import (
     session_key, sha256_bytes, sha256_file,
 )
 from .events import parse_event_artifact
-from .graph_engine import KnowledgeGraphEngine, is_conflicted_copy_path, parse_frontmatter_aliases
+from .graph_engine import KnowledgeGraphEngine, is_conflicted_copy_path
 from .provider import check_macos_keychain_presence
 
 
@@ -196,9 +196,13 @@ def _graph_health_metrics(config: MemoryConfig) -> dict[str, int]:
     empty = {
         "GRAPH_MD_NODES": 0,
         "GRAPH_EXPLICIT_EDGES": 0,
-        "GRAPH_BROKEN_LINKS": 0,
+        "GRAPH_PHYSICAL_BROKEN_LINKS": 0,
+        "GRAPH_LOGICAL_UNRESOLVED_LINKS": 0,
         "GRAPH_KNOWLEDGE_CONCEPTS": 0,
-        "GRAPH_KNOWLEDGE_CONCEPT_ORPHANS": 0,
+        "GRAPH_PHYSICAL_CONCEPT_ORPHANS": 0,
+        "GRAPH_LOGICAL_CONCEPT_ORPHANS": 0,
+        "GRAPH_PHYSICAL_CONNECTION_ORPHANS": 0,
+        "GRAPH_LOGICAL_CONNECTION_ORPHANS": 0,
         "GRAPH_CONNECTION_ORPHANS": 0,
         "GRAPH_CONFLICTED_COPIES": 0,
     }
@@ -226,35 +230,34 @@ def _graph_health_metrics(config: MemoryConfig) -> dict[str, int]:
         path.stem: path for path in canonical_files
         if path.parent == connections_dir
     }
-    aliases: set[str] = set()
-    for path in concept_paths.values():
-        try:
-            aliases.update(alias.casefold() for alias in parse_frontmatter_aliases(path.read_text(encoding="utf-8")))
-        except OSError:
-            continue
-
     engine = KnowledgeGraphEngine(config.vault_path)
-    degrees = {stem: 0 for stem in concept_paths}
+    physical_degrees = {stem: 0 for stem in concept_paths}
+    logical_degrees = {stem: 0 for stem in concept_paths}
     explicit_edges = 0
-    broken_links = 0
-    connection_orphans = 0
+    physical_broken_links = 0
+    logical_unresolved_links = 0
+    physical_connection_orphans = 0
+    logical_connection_orphans = 0
 
     def canonical_link_target(raw_target: str) -> Path | None:
         target = raw_target.strip().removesuffix(".md")
+        if target.startswith("knowledge/concepts/"):
+            return concept_paths.get(target.removeprefix("knowledge/concepts/"))
+        if target.startswith("knowledge/connections/"):
+            return connection_paths.get(target.removeprefix("knowledge/connections/"))
         if target.startswith("concepts/"):
             return concept_paths.get(target.removeprefix("concepts/"))
         if target.startswith("connections/"):
             return connection_paths.get(target.removeprefix("connections/"))
         if target.casefold() in {stem.casefold() for stem in concept_paths}:
             return next(path for stem, path in concept_paths.items() if stem.casefold() == target.casefold())
-        if target.casefold() in aliases:
-            return Path("<obsidian-alias>")
         return None
 
-    def concept_target(raw_target: str) -> Path | None:
+    def logical_link_target(raw_target: str) -> Path | None:
         target = raw_target.strip()
-        if target.startswith("concepts/"):
-            return concept_paths.get(target.removeprefix("concepts/").removesuffix(".md"))
+        physical_target = canonical_link_target(target)
+        if physical_target is not None:
+            return physical_target
         try:
             return engine.find_concept(target)
         except Exception:
@@ -269,38 +272,56 @@ def _graph_health_metrics(config: MemoryConfig) -> dict[str, int]:
         explicit_edges += len(links)
         for target in links:
             if canonical_link_target(target) is None:
-                broken_links += 1
+                physical_broken_links += 1
+            if logical_link_target(target) is None:
+                logical_unresolved_links += 1
 
-        resolved_concepts = [item for item in (concept_target(target) for target in links) if item]
         if path.parent == concepts_dir:
-            for target in resolved_concepts:
-                if target.stem in degrees and target.stem != path.stem:
-                    degrees[path.stem] += 1
-                    degrees[target.stem] += 1
+            physical_targets = [item for item in (canonical_link_target(target) for target in links) if item]
+            logical_targets = [item for item in (logical_link_target(target) for target in links) if item]
+            for target in physical_targets:
+                if target.parent == concepts_dir and target.stem in physical_degrees and target.stem != path.stem:
+                    physical_degrees[path.stem] += 1
+                    physical_degrees[target.stem] += 1
+            for target in logical_targets:
+                if target.parent == concepts_dir and target.stem in logical_degrees and target.stem != path.stem:
+                    logical_degrees[path.stem] += 1
+                    logical_degrees[target.stem] += 1
         elif path.parent == connections_dir:
-            explicit_endpoints = [
-                target for target in links
-                if target.startswith("concepts/")
-                and target.removeprefix("concepts/").removesuffix(".md") in concept_paths
-            ]
-            unique_endpoints = {
-                target.removeprefix("concepts/").removesuffix(".md")
-                for target in explicit_endpoints
+            physical_endpoints = {
+                target.stem for raw_target in links
+                if (target := canonical_link_target(raw_target)) is not None
+                and target.parent == concepts_dir
             }
-            if len(unique_endpoints) != 2:
-                connection_orphans += 1
+            logical_endpoints = {
+                target.stem for raw_target in links
+                if (target := logical_link_target(raw_target)) is not None
+                and target.parent == concepts_dir
+            }
+            if len(physical_endpoints) != 2:
+                physical_connection_orphans += 1
             else:
-                first, second = sorted(unique_endpoints)
-                degrees[first] += 1
-                degrees[second] += 1
+                first, second = sorted(physical_endpoints)
+                physical_degrees[first] += 1
+                physical_degrees[second] += 1
+            if len(logical_endpoints) != 2:
+                logical_connection_orphans += 1
+            else:
+                first, second = sorted(logical_endpoints)
+                logical_degrees[first] += 1
+                logical_degrees[second] += 1
 
     return {
         "GRAPH_MD_NODES": len(canonical_files),
         "GRAPH_EXPLICIT_EDGES": explicit_edges,
-        "GRAPH_BROKEN_LINKS": broken_links,
+        "GRAPH_PHYSICAL_BROKEN_LINKS": physical_broken_links,
+        "GRAPH_LOGICAL_UNRESOLVED_LINKS": logical_unresolved_links,
         "GRAPH_KNOWLEDGE_CONCEPTS": len(concept_paths),
-        "GRAPH_KNOWLEDGE_CONCEPT_ORPHANS": sum(value == 0 for value in degrees.values()),
-        "GRAPH_CONNECTION_ORPHANS": connection_orphans,
+        "GRAPH_PHYSICAL_CONCEPT_ORPHANS": sum(value == 0 for value in physical_degrees.values()),
+        "GRAPH_LOGICAL_CONCEPT_ORPHANS": sum(value == 0 for value in logical_degrees.values()),
+        "GRAPH_PHYSICAL_CONNECTION_ORPHANS": physical_connection_orphans,
+        "GRAPH_LOGICAL_CONNECTION_ORPHANS": logical_connection_orphans,
+        "GRAPH_CONNECTION_ORPHANS": physical_connection_orphans,
         "GRAPH_CONFLICTED_COPIES": conflicted_copies,
     }
 
@@ -308,13 +329,17 @@ def _graph_health_metrics(config: MemoryConfig) -> dict[str, int]:
 def _graph_health_row(config: MemoryConfig) -> dict[str, str]:
     metrics = _graph_health_metrics(config)
     concepts = metrics["GRAPH_KNOWLEDGE_CONCEPTS"]
-    orphan_percent = (metrics["GRAPH_KNOWLEDGE_CONCEPT_ORPHANS"] / concepts * 100) if concepts else 0.0
+    physical_orphan_percent = (metrics["GRAPH_PHYSICAL_CONCEPT_ORPHANS"] / concepts * 100) if concepts else 0.0
+    logical_orphan_percent = (metrics["GRAPH_LOGICAL_CONCEPT_ORPHANS"] / concepts * 100) if concepts else 0.0
     detail = ";".join([
         *(f"{name}={value}" for name, value in metrics.items()),
-        f"GRAPH_KNOWLEDGE_CONCEPT_ORPHAN_PERCENT={orphan_percent:.2f}",
+        f"GRAPH_PHYSICAL_CONCEPT_ORPHAN_PERCENT={physical_orphan_percent:.2f}",
+        f"GRAPH_LOGICAL_CONCEPT_ORPHAN_PERCENT={logical_orphan_percent:.2f}",
     ])
     warning = any(metrics[name] > 0 for name in (
-        "GRAPH_BROKEN_LINKS", "GRAPH_CONNECTION_ORPHANS", "GRAPH_CONFLICTED_COPIES",
+        "GRAPH_PHYSICAL_BROKEN_LINKS", "GRAPH_LOGICAL_UNRESOLVED_LINKS",
+        "GRAPH_PHYSICAL_CONNECTION_ORPHANS", "GRAPH_LOGICAL_CONNECTION_ORPHANS",
+        "GRAPH_CONFLICTED_COPIES",
     ))
     return _row("graph_health", "warn" if warning else "pass", detail)
 

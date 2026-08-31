@@ -19,7 +19,7 @@ from memory_v1.core import (
     ConfigError, DuplicateEvent, MemoryConfig, NoMemory, PolicyError,
     ProviderBlocked, SchemaError, discover_codex_binary, normalize_transcript, session_key,
 )
-from memory_v1.doctor import _effective_read_write_access, run_doctor
+from memory_v1.doctor import _effective_read_write_access, _graph_health_metrics, run_doctor
 from memory_v1.events import EventWriter, parse_event_artifact
 from memory_v1.provider import (
     StructuredResponsesProvider, check_macos_keychain_presence, resolve_credential,
@@ -537,8 +537,13 @@ class ContextDoctorTests(MemoryFixture):
         self.assertEqual("warn", row["status"])
         self.assertIn("GRAPH_MD_NODES=4", row["detail"])
         self.assertIn("GRAPH_EXPLICIT_EDGES=3", row["detail"])
-        self.assertIn("GRAPH_BROKEN_LINKS=1", row["detail"])
+        self.assertIn("GRAPH_PHYSICAL_BROKEN_LINKS=1", row["detail"])
+        self.assertIn("GRAPH_LOGICAL_UNRESOLVED_LINKS=1", row["detail"])
         self.assertIn("GRAPH_KNOWLEDGE_CONCEPTS=2", row["detail"])
+        self.assertIn("GRAPH_PHYSICAL_CONCEPT_ORPHANS=0", row["detail"])
+        self.assertIn("GRAPH_LOGICAL_CONCEPT_ORPHANS=0", row["detail"])
+        self.assertIn("GRAPH_PHYSICAL_CONNECTION_ORPHANS=1", row["detail"])
+        self.assertIn("GRAPH_LOGICAL_CONNECTION_ORPHANS=1", row["detail"])
         self.assertIn("GRAPH_CONNECTION_ORPHANS=1", row["detail"])
         self.assertIn("GRAPH_CONFLICTED_COPIES=1", row["detail"])
         after = {
@@ -546,6 +551,27 @@ class ContextDoctorTests(MemoryFixture):
             for path in self.vault.rglob("*.md")
         }
         self.assertEqual(before, after)
+
+    def test_doctor_distinguishes_physical_and_logical_link_resolution(self):
+        knowledge = self.vault / "knowledge"
+        concepts = knowledge / "concepts"
+        concepts.mkdir(parents=True)
+        alpha = concepts / "alpha.md"
+        beta = concepts / "beta.md"
+        alpha.write_text(
+            "---\ntitle: Alpha\naliases: [Alpha Alias]\n---\n# Alpha\n",
+            encoding="utf-8",
+        )
+        beta.write_text("# Beta\n[[Alpha Alias]]\n", encoding="utf-8")
+
+        logical_only = _graph_health_metrics(self.config())
+        self.assertEqual(1, logical_only["GRAPH_PHYSICAL_BROKEN_LINKS"])
+        self.assertEqual(0, logical_only["GRAPH_LOGICAL_UNRESOLVED_LINKS"])
+
+        beta.write_text("# Beta\n[[knowledge/concepts/alpha|Alpha]]\n", encoding="utf-8")
+        canonical = _graph_health_metrics(self.config())
+        self.assertEqual(0, canonical["GRAPH_PHYSICAL_BROKEN_LINKS"])
+        self.assertEqual(0, canonical["GRAPH_LOGICAL_UNRESOLVED_LINKS"])
 
     def test_context_inventory_excludes_observed_conflicted_copy(self):
         knowledge = self.vault / "knowledge"
