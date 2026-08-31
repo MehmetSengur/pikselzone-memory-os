@@ -89,7 +89,7 @@ Runtime semantics are deliberately not unified:
 | Runtime | Raw checkpoint boundary | Promotion status |
 | --- | --- | --- |
 | Codex CLI | `Stop` (completed assistant turn) | source/test covered; native lifecycle canary still required after hook installation |
-| Claude Code | `Stop` contract | source/test covered; native runtime proof remains separate |
+| Claude Code | `Stop` operator candidate | source/test covered; native runtime proof remains unverified |
 | Hermes | `pre_llm_call` snapshots the previous completed SessionDB turn | terminal callbacks and startup recovery use PluginLlm; VPS deployment evidence remains required |
 | Codex Desktop/App | unknown | no CLI behavior is inferred |
 
