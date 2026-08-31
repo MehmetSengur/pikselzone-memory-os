@@ -91,6 +91,14 @@ session state record `status=empty` plus `source_digest` is the semantic
 tombstone for an identical later boundary, which only merges `events_seen`
 without re-calling the provider.  Provider failures settle nothing.
 
+Hermes startup first uses supported read-only SessionDB/profile discovery with
+an explicit 20-session-per-profile bound.  Its 128-entry local cursor contains
+only profile/database/session identity and final-turn digest: first sightings
+are baseline-only, preventing historical replay; a changed digest on an armed
+session stages the canonical raw checkpoint and leaves semantic promotion to
+the existing recovery path.  Per-profile failures and checkpoint-write
+failures degrade safely without advancing past the affected digest.
+
 Runtime semantics are deliberately not unified:
 
 | Runtime | Raw checkpoint boundary | Promotion status |

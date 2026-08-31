@@ -49,6 +49,14 @@ without another provider call.  Provider failures leave pending material
 retryable.  V2.2 is not production activated; Hermes final-turn recovery
 remains a blocker.
 
+Hermes startup now performs a bounded (20 recent sessions per supported
+profile) read-only SessionDB discovery before pending-checkpoint recovery.  A
+local, transcript-free cursor arms first-seen sessions as a non-replaying
+baseline; only a later final-turn digest change can create the same canonical
+raw checkpoint that `pre_llm_call` would create.  This remains raw-only and
+provider-free until existing recovery handles the checkpoint.  Native VPS
+acceptance is still required before activation.
+
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
 - **SB2-01**: Codex old + new rollout format compatibility (both legacy `user_message`/`agent_message` and modern `item_completed` with `UserMessage`/`AgentMessage`, case-insensitive `text`/`Text` block extraction, complete filtering of `Reasoning`/`CommandExecution`/`FileChange`/internal events, and regression check against silent 0-turn failure with 10 targeted tests PASS).

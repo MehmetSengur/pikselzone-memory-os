@@ -23,6 +23,7 @@ import logging
 import os
 import posixpath
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("hermes.plugin.pz-memory-v1")
@@ -40,6 +41,9 @@ RECEIPTS_DIR = posixpath.join(STATE_DIR, "receipts")
 CHECKPOINTS_DIR = posixpath.join(STATE_DIR, "checkpoints")
 MAX_TURN_CHECKPOINTS_PER_SESSION = 32
 MAX_TURN_CHECKPOINT_CHARS = 64 * 1024
+MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE = 20
+MAX_STARTUP_DISCOVERY_CURSOR_ENTRIES = 128
+DISCOVERY_CURSOR_SCHEMA = "pikselzone-memory-hermes-discovery-cursor-v1"
 
 _IN_MEMORY_PROCESSED: set[str] = set()
 
@@ -298,11 +302,44 @@ def _claim_session(session_id: str, locks_dir: Optional[str] = None) -> bool:
     return _acquire_execution_lock(session_id, locks_dir)
 
 
+def _normalize_session_export(
+    session_data: dict[str, Any],
+) -> tuple[Optional[str], Optional[str], Optional[str], int]:
+    """Normalize one supported SessionDB export without retaining raw state."""
+    messages = session_data.get("messages", [])
+    if not isinstance(messages, list) or not messages:
+        return None, None, None, 0
+
+    model = session_data.get("model")
+    task_id = session_data.get("kanban_task_id") or session_data.get("handoff_state")
+    lines: list[str] = []
+    total_redactions = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = msg.get("content")
+        if not content or not isinstance(content, str):
+            continue
+        content_clean = content.strip()
+        if not content_clean:
+            continue
+        redacted_text, rcount = redact_sensitive_text(content_clean)
+        total_redactions += rcount
+        prefix = "USER: " if role == "user" else "ASSISTANT: "
+        lines.append(f"{prefix}{redacted_text}")
+
+    if not lines:
+        return None, model, task_id, total_redactions
+    return "\n".join(lines), model, task_id, total_redactions
+
+
 def _get_session_transcript(session_id: str) -> tuple[Optional[str], Optional[str], Optional[str], int]:
     """Retrieve session messages from Hermes SessionDB, return (normalized_text, model, task_id, redactions)."""
     session_data = None
     try:
-        from pathlib import Path
         import hermes_state
         from hermes_constants import get_hermes_home
 
@@ -337,35 +374,7 @@ def _get_session_transcript(session_id: str) -> tuple[Optional[str], Optional[st
     if not session_data:
         return None, None, None, 0
 
-    messages = session_data.get("messages", [])
-    if not messages:
-        return None, None, None, 0
-
-    model = session_data.get("model")
-    task_id = session_data.get("kanban_task_id") or session_data.get("handoff_state")
-
-    lines: list[str] = []
-    total_redactions = 0
-    for msg in messages:
-        role = str(msg.get("role") or "").lower()
-        if role not in {"user", "assistant"}:
-            continue
-        content = msg.get("content")
-        if not content or not isinstance(content, str):
-            continue
-        content_clean = content.strip()
-        if not content_clean:
-            continue
-        redacted_text, rcount = redact_sensitive_text(content_clean)
-        total_redactions += rcount
-        prefix = "USER: " if role == "user" else "ASSISTANT: "
-        lines.append(f"{prefix}{redacted_text}")
-
-    if not lines:
-        return None, model, task_id, total_redactions
-
-    normalized = "\n".join(lines)
-    return normalized, model, task_id, total_redactions
+    return _normalize_session_export(session_data)
 
 
 def _checkpoint_root() -> str:
@@ -401,18 +410,20 @@ def _checkpoint_paths(session_id: str) -> list[str]:
     return [posixpath.join(root, name) for name in names]
 
 
-def _stage_turn_checkpoint(session_id: str) -> bool:
-    """Persist the final completed SessionDB turn without invoking PluginLlm."""
-    transcript, model, task_id, redactions = _get_session_transcript(session_id)
-    if not transcript:
-        return False
-    turn = _last_completed_turn(transcript)
-    if not turn:
-        return False
+def _checkpoint_destination(session_id: str, digest: str) -> str:
+    return posixpath.join(
+        _checkpoint_root(),
+        f"hermes-{hashlib.sha256(session_id.encode('utf-8')).hexdigest()[:32]}-{digest[:16]}.json",
+    )
+
+
+def _stage_completed_turn_checkpoint(
+    session_id: str, turn: str, model: Optional[str], task_id: Optional[str], redactions: int,
+) -> bool:
+    """Persist one canonical redacted final turn without invoking PluginLlm."""
     digest = hashlib.sha256(turn.encode("utf-8")).hexdigest()
     existing = _checkpoint_paths(session_id)
-    filename = f"hermes-{hashlib.sha256(session_id.encode('utf-8')).hexdigest()[:32]}-{digest[:16]}.json"
-    destination = posixpath.join(_checkpoint_root(), filename)
+    destination = _checkpoint_destination(session_id, digest)
     if os.path.isfile(destination):
         return True
     if len(existing) >= MAX_TURN_CHECKPOINTS_PER_SESSION:
@@ -446,6 +457,196 @@ def _stage_turn_checkpoint(session_id: str) -> bool:
         except (OSError, UnboundLocalError):
             pass
         return False
+
+
+def _stage_turn_checkpoint(session_id: str) -> bool:
+    """Persist the final completed SessionDB turn without invoking PluginLlm."""
+    transcript, model, task_id, redactions = _get_session_transcript(session_id)
+    if not transcript:
+        return False
+    turn = _last_completed_turn(transcript)
+    if not turn:
+        return False
+    return _stage_completed_turn_checkpoint(session_id, turn, model, task_id, redactions)
+
+
+def _discovery_cursor_path() -> str:
+    base = os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR
+    return posixpath.join(base, "state", "hermes-session-discovery-v1.json")
+
+
+def _load_discovery_cursor() -> tuple[dict[str, Any], bool]:
+    """Return a validated local-only cursor, or fail closed for discovery."""
+    path = _discovery_cursor_path()
+    if not os.path.exists(path):
+        return {"schema": DISCOVERY_CURSOR_SCHEMA, "sessions": {}}, True
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            value = json.load(fh)
+        sessions = value.get("sessions") if isinstance(value, dict) else None
+        if value.get("schema") != DISCOVERY_CURSOR_SCHEMA or not isinstance(sessions, dict):
+            raise ValueError("cursor-schema-invalid")
+        return {"schema": DISCOVERY_CURSOR_SCHEMA, "sessions": sessions}, True
+    except Exception as exc:
+        logger.warning("pz-memory-v1: discovery cursor unavailable; skipping discovery: %s", exc)
+        return {}, False
+
+
+def _write_discovery_cursor(cursor: dict[str, Any]) -> bool:
+    """Atomically persist the bounded, transcript-free discovery cursor."""
+    path = _discovery_cursor_path()
+    temporary = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(posixpath.dirname(path), mode=0o770, exist_ok=True)
+        sessions = cursor.get("sessions", {})
+        ordered = sorted(
+            (
+                (key, value) for key, value in sessions.items()
+                if isinstance(key, str) and isinstance(value, dict)
+            ),
+            key=lambda item: (str(item[1].get("observed_at") or ""), item[0]),
+            reverse=True,
+        )[:MAX_STARTUP_DISCOVERY_CURSOR_ENTRIES]
+        payload = {
+            "schema": DISCOVERY_CURSOR_SCHEMA,
+            "updated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "sessions": dict(ordered),
+        }
+        with open(temporary, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temporary, 0o660)
+        os.replace(temporary, path)
+        return True
+    except Exception as exc:
+        logger.warning("pz-memory-v1: failed to persist discovery cursor: %s", exc)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        return False
+
+
+def _discovery_entry(
+    *, profile: str, database: Path, session_id: str, digest: Optional[str], observed_at: str,
+) -> tuple[str, dict[str, Any]]:
+    database_id = str(database.resolve())
+    identity = hashlib.sha256(f"{database_id}\0{session_id}".encode("utf-8")).hexdigest()
+    return identity, {
+        "session_id": session_id,
+        "profile": profile,
+        "database": database_id,
+        "last_turn_digest": digest,
+        "observed_at": observed_at,
+    }
+
+
+def _discover_final_turn_checkpoints() -> None:
+    """Baseline or raw-stage bounded, tracked Hermes SessionDB final turns.
+
+    This startup phase intentionally never calls PluginLlm or writes durable
+    memory. Newly observed sessions are armed as a baseline; only a later
+    final-turn digest change is eligible for canonical raw checkpoint staging.
+    """
+    cursor, cursor_ok = _load_discovery_cursor()
+    if not cursor_ok:
+        return
+    try:
+        import hermes_state
+        from hermes_cli import profiles as profiles_mod
+    except Exception as exc:
+        logger.warning("pz-memory-v1: Hermes SessionDB discovery unavailable: %s", exc)
+        return
+
+    try:
+        infos = profiles_mod.list_profiles()
+        targets = [(str(info.name), Path(info.path)) for info in infos]
+        if not targets:
+            targets = [("default", Path(profiles_mod.get_profile_dir("default")))]
+    except Exception as exc:
+        logger.warning("pz-memory-v1: profile discovery unavailable: %s", exc)
+        return
+
+    sessions = dict(cursor["sessions"])
+    seen_databases: set[str] = set()
+    changed = False
+    for profile_name, profile_dir in targets:
+        db_path = profile_dir / "state.db"
+        try:
+            database_id = str(db_path.resolve())
+        except OSError:
+            logger.warning("pz-memory-v1: invalid profile database path for %s", profile_name)
+            continue
+        if database_id in seen_databases or not db_path.is_file():
+            continue
+        seen_databases.add(database_id)
+        db = None
+        try:
+            db = hermes_state.SessionDB(db_path=db_path, read_only=True)
+            rows = db.search_sessions(
+                source=None,
+                limit=MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE,
+                offset=0,
+            )
+            if not isinstance(rows, list):
+                raise ValueError("recent-session-result-invalid")
+            for row in rows[:MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE]:
+                if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                    continue
+                session_id = row["id"]
+                try:
+                    metadata = db.get_session(session_id)
+                    exported = db.export_session(session_id) if metadata else None
+                except Exception as exc:
+                    logger.warning("pz-memory-v1: failed to inspect session metadata: %s", exc)
+                    continue
+                if not isinstance(exported, dict):
+                    continue
+                transcript, model, task_id, redactions = _normalize_session_export(exported)
+                turn = _last_completed_turn(transcript) if transcript else None
+                digest = hashlib.sha256(turn.encode("utf-8")).hexdigest() if turn else None
+                observed_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+                identity, entry = _discovery_entry(
+                    profile=profile_name,
+                    database=db_path,
+                    session_id=session_id,
+                    digest=digest,
+                    observed_at=observed_at,
+                )
+                previous = sessions.get(identity)
+                if not isinstance(previous, dict):
+                    # First sighting is an activation baseline, never a replay.
+                    sessions[identity] = entry
+                    changed = True
+                    continue
+                if previous.get("last_turn_digest") == digest or not digest:
+                    sessions[identity] = entry
+                    changed = True
+                    continue
+                if _is_session_completed(session_id):
+                    sessions[identity] = entry
+                    changed = True
+                    continue
+                destination = _checkpoint_destination(session_id, digest)
+                if os.path.isfile(destination) or _stage_completed_turn_checkpoint(
+                    session_id, turn, model, task_id, redactions,
+                ):
+                    sessions[identity] = entry
+                    changed = True
+                else:
+                    # Do not advance past a turn whose checkpoint did not persist.
+                    logger.warning("pz-memory-v1: leaving final turn discoverable after checkpoint failure")
+        except Exception as exc:
+            logger.warning("pz-memory-v1: profile discovery degraded for %s: %s", profile_name, exc)
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+    if changed:
+        _write_discovery_cursor({"schema": DISCOVERY_CURSOR_SCHEMA, "sessions": sessions})
 
 
 def _clear_turn_checkpoints(session_id: str) -> None:
@@ -756,6 +957,10 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
 def on_session_start(**kwargs: Any) -> None:
     session_id = kwargs.get("session_id") or "startup"
     logger.info("pz-memory-v1: on_session_start for session %s", session_id)
+    try:
+        _discover_final_turn_checkpoints()
+    except Exception as exc:
+        logger.warning("pz-memory-v1: SessionDB discovery entered degraded mode: %s", exc)
     try:
         _recover_pending_turn_checkpoints()
     except Exception as exc:
