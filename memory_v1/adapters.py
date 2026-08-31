@@ -1,6 +1,7 @@
 """Runtime-neutral hook input adapters for Codex, Claude Code, and Hermes."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,7 +31,14 @@ EVENT_ALIASES = {
     "onsessionfinalize": "session_finalize",
     "onsessionreset": "session_reset",
     "onsessioncompress": "pre_compact",
+    "stop": "turn_complete",
 }
+
+TERMINAL_FLUSH_EVENTS = {"pre_compact", "session_end", "session_finalize", "session_reset"}
+TURN_CHECKPOINT_EVENT = "turn_complete"
+RECOVERY_EVENT = "checkpoint_recovery"
+MAX_TURN_CHECKPOINTS_PER_SESSION = 32
+MAX_TURN_CHECKPOINT_CHARS = 64 * 1024
 
 
 def normalize_event_name(value: str) -> str:
@@ -125,6 +133,61 @@ def hermes_hook(config: MemoryConfig, payload: dict[str, Any], **kwargs: Any) ->
     return flush_hook(config, runtime="hermes", payload=payload, **kwargs)
 
 
+def _turn_id(payload: dict[str, Any], normalized: str, source_digest: str) -> str:
+    supplied = _first_text(payload, ("turn_id", "turnId", "turn_uuid", "turnUuid"))
+    # Never put a runtime identifier in a filename.  The full snapshot digest
+    # is a stable fallback when the runtime does not expose a turn id.
+    return supplied or source_digest
+
+
+def _last_completed_turn(normalized: str) -> str:
+    """Return the final USER..ASSISTANT pair without retaining full history."""
+    lines = normalized.splitlines()
+    user_indexes = [index for index, line in enumerate(lines) if line.startswith("USER: ")]
+    if not user_indexes or not any(line.startswith("ASSISTANT: ") for line in lines):
+        raise SchemaError("checkpoint-turn-incomplete")
+    start = user_indexes[-1]
+    result = lines[start:]
+    if not any(line.startswith("ASSISTANT: ") for line in result):
+        raise SchemaError("checkpoint-turn-incomplete")
+    text = "\n".join(result).strip()
+    if len(text) > MAX_TURN_CHECKPOINT_CHARS:
+        raise PolicyError("checkpoint-turn-too-large")
+    return text
+
+
+def _checkpoint_paths_for_session(
+    config: MemoryConfig, *, runtime: str, state_key: str
+) -> list[Path]:
+    pending = config.state_path / "queue" / "pending"
+    if not pending.is_dir():
+        return []
+    prefix = f"{runtime}-{state_key}-"
+    paths = [path for path in pending.glob(f"{prefix}*.json") if path.is_file()]
+    return sorted(paths, key=lambda path: (path.stat().st_mtime_ns, path.name))
+
+
+def pending_turn_checkpoint_count(
+    config: MemoryConfig, *, runtime: str, session_id: str
+) -> int:
+    key = session_key(session_id)
+    return sum(
+        "-turn_complete-" in path.name
+        for path in _checkpoint_paths_for_session(config, runtime=runtime, state_key=key)
+    )
+
+
+def find_pending_turn_checkpoint(
+    config: MemoryConfig, *, runtime: str, session_id: str
+) -> Path | None:
+    key = session_key(session_id)
+    paths = [
+        path for path in _checkpoint_paths_for_session(config, runtime=runtime, state_key=key)
+        if "-turn_complete-" in path.name
+    ]
+    return paths[0] if paths else None
+
+
 def checkpoint_hook(
     config: MemoryConfig, *, runtime: str, payload: dict[str, Any],
     event_override: str | None = None,
@@ -151,9 +214,22 @@ def checkpoint_hook(
     if turn_count == 0:
         raise SchemaError("checkpoint-transcript-empty")
     key = session_key(session_id)
+    checkpoint_kind = "terminal"
+    turn_id = ""
+    if event == TURN_CHECKPOINT_EVENT:
+        checkpoint_kind = "turn"
+        normalized = _last_completed_turn(normalized)
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        turn_id = _turn_id(payload, normalized, digest)
+        existing = pending_turn_checkpoint_count(config, runtime=runtime, session_id=session_id)
+        if existing >= MAX_TURN_CHECKPOINTS_PER_SESSION:
+            raise PolicyError("checkpoint-turn-retention-limit")
+    checkpoint_token = digest[:16]
+    if turn_id:
+        checkpoint_token = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()[:16]
     queue_path = (
         config.state_path / "queue" / "pending"
-        / f"{runtime}-{key}-{event}-{digest[:16]}.json"
+        / f"{runtime}-{key}-{event}-{checkpoint_token}.json"
     )
     hook_observed_at = iso_now()
     hook_cfg_path = (
@@ -167,6 +243,7 @@ def checkpoint_hook(
     )
     atomic_json(queue_path, {
         "schema": "pikselzone-memory-checkpoint-v1",
+        "checkpoint_kind": checkpoint_kind,
         "runtime": runtime,
         "agent_id": _first_text(payload, ("agent_id", "agentId", "agent_name"))
         or f"{runtime}-main",
@@ -181,6 +258,7 @@ def checkpoint_hook(
         ] if isinstance(payload.get("kanban_ids", []), list) else [],
         "source_digest": digest,
         "normalized_transcript": normalized,
+        "turn_id": turn_id or None,
         "hook_observed_at": hook_observed_at,
         "hook_config_sha256": hook_cfg_sha,
     })
@@ -217,16 +295,65 @@ def drain_checkpoint(
     hook_cfg_sha = str(value.get("hook_config_sha256") or "")
     runtime = value["runtime"]
     s_key = session_key(value["session_id"])
+    if runtime not in config.runtimes or runtime not in {"codex", "claude", "hermes"}:
+        raise SchemaError("checkpoint-runtime-invalid")
+    event = value["event"]
+    checkpoint_paths = _checkpoint_paths_for_session(config, runtime=runtime, state_key=s_key)
+    if queue_path not in checkpoint_paths:
+        raise PolicyError("checkpoint-not-session-member")
+    if event == TURN_CHECKPOINT_EVENT:
+        # A Stop hook is a completed-turn boundary, not a durable-promotion
+        # boundary.  This code path is used only by bounded threshold/startup
+        # recovery workers, and groups all currently pending raw turns.
+        selected = [path for path in checkpoint_paths if "-turn_complete-" in path.name]
+        effective_event = RECOVERY_EVENT
+    elif event in TERMINAL_FLUSH_EVENTS:
+        # The terminal transcript is authoritative and already includes every
+        # preceding turn.  Older raw turn checkpoints are acknowledged only
+        # after this one successful durable flush.
+        selected = [
+            path for path in checkpoint_paths
+            if path == queue_path or "-turn_complete-" in path.name
+        ]
+        effective_event = event
+    else:
+        raise SchemaError("checkpoint-drain-event-invalid")
+    if not selected:
+        raise SchemaError("checkpoint-session-empty")
+    if event == TURN_CHECKPOINT_EVENT:
+        checkpoint_values: list[dict[str, Any]] = []
+        seen_digests: set[str] = set()
+        for path in selected:
+            try:
+                item = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SchemaError("checkpoint-corrupt") from exc
+            digest = item.get("source_digest")
+            text = item.get("normalized_transcript")
+            if not isinstance(digest, str) or not isinstance(text, str) or digest in seen_digests:
+                continue
+            NormalizedTranscript.from_checkpoint(text, digest)
+            seen_digests.add(digest)
+            checkpoint_values.append(item)
+        if not checkpoint_values:
+            raise SchemaError("checkpoint-recovery-empty")
+        combined = "\n".join(item["normalized_transcript"] for item in checkpoint_values)
+        combined_digest = hashlib.sha256(combined.encode("utf-8")).hexdigest()
+        normalized_transcript = NormalizedTranscript.from_checkpoint(combined, combined_digest)
+        flush_value = {**value, "source_digest": combined_digest, "normalized_transcript": combined}
+    else:
+        normalized_transcript = NormalizedTranscript.from_checkpoint(
+            value["normalized_transcript"], value["source_digest"]
+        )
+        flush_value = value
     active_provider = provider or create_provider(config)
     try:
         event_path = EventWriter(config, active_provider).flush(
-            runtime=value["runtime"], agent_id=value["agent_id"],
-            session_id=value["session_id"], event=value["event"],
-            transcript=NormalizedTranscript.from_checkpoint(
-                value["normalized_transcript"], value["source_digest"]
-            ),
-            source_model=value["source_model"], root_task_id=value["root_task_id"],
-            kanban_ids=value["kanban_ids"],
+            runtime=flush_value["runtime"], agent_id=flush_value["agent_id"],
+            session_id=flush_value["session_id"], event=effective_event,
+            transcript=normalized_transcript,
+            source_model=flush_value["source_model"], root_task_id=flush_value["root_task_id"],
+            kanban_ids=flush_value["kanban_ids"],
         )
     except DuplicateEvent as exc:
         event_path = Path(str(exc))
@@ -238,7 +365,8 @@ def drain_checkpoint(
             raise PolicyError("duplicate-event-path-invalid") from exc
         if sha256_file(queue_path) != checkpoint_digest:
             raise PolicyError("checkpoint-changed-during-drain")
-        safe_unlink(queue_path, root=pending)
+        for path in selected:
+            safe_unlink(path, root=pending)
         return event_path
     except NoMemory:
         safe_unlink(queue_path, root=pending)
@@ -323,5 +451,6 @@ def drain_checkpoint(
         ensure_safe_directory(evidence_path.parent, create=True)
         atomic_json(evidence_path, evidence_payload)
 
-    safe_unlink(queue_path, root=pending)
+    for path in selected:
+        safe_unlink(path, root=pending)
     return event_path

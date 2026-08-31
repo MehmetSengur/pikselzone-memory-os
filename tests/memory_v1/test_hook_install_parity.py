@@ -10,7 +10,7 @@ class TestHookInstallParity(unittest.TestCase):
     def test_fragments_execute_the_canonical_v2_implementation(self) -> None:
         root = Path(__file__).resolve().parents[2]
         expected_prefix = f"cd {root} && python3 -m memory_v1.hook_runner"
-        expected_events = {"SessionStart", "PreCompact", "SessionEnd"}
+        expected_events = {"SessionStart", "PreCompact", "Stop", "SessionEnd"}
 
         for runtime in ("claude", "codex"):
             fragment = root / "memory_v1" / "operator" / f"{runtime}-hooks.fragment.json"

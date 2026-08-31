@@ -22,6 +22,17 @@
         ]
       }
     ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /Users/mehmeteminsengur/Documents/Pikselzone-Hermes-AI-OS/pikselzone-memory-os && python3 -m memory_v1.hook_runner --config config-examples/memory-v1-workstation.json --runtime codex --event Stop",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

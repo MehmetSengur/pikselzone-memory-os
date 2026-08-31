@@ -23,6 +23,9 @@ RUNTIMES = {"codex", "claude", "hermes"}
 EVENTS = {
     "session_start", "session_end", "pre_compact", "post_compact",
     "session_finalize", "session_reset", "subagent_start", "subagent_stop",
+    # A turn checkpoint is raw, local state.  It becomes an event only when a
+    # bounded recovery drain has to promote it after a crash.
+    "turn_complete", "checkpoint_recovery",
 }
 SUMMARY_FIELDS = (
     "context", "important_conversations", "decisions", "learnings",

@@ -9,7 +9,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .adapters import checkpoint_hook, load_hook_input
+from .adapters import (
+    MAX_TURN_CHECKPOINTS_PER_SESSION,
+    checkpoint_hook,
+    find_pending_turn_checkpoint,
+    load_hook_input,
+    pending_turn_checkpoint_count,
+)
 from .core import MemoryConfig, MemoryError, ensure_safe_directory, write_health
 from .provider import scrubbed_subprocess_env
 
@@ -25,6 +31,19 @@ def build_drain_command(
         "--config", str(config_path.resolve()),
         "drain", "--queue", str(queue_path.resolve()),
     ]
+
+
+def _spawn_drain(config_path: Path, queue_path: Path, log_path: Path) -> None:
+    """Start a best-effort worker; lifecycle hooks themselves stay nonblocking."""
+    repo_root = Path(__file__).resolve().parents[1]
+    env = scrubbed_subprocess_env({"PYTHONPATH": str(repo_root)})
+    env.pop("PZ_MEMORY_INVOKED_BY", None)
+    with log_path.open("ab") as log:
+        subprocess.Popen(
+            build_drain_command(config_path, queue_path),
+            cwd=str(repo_root), env=env, stdin=subprocess.DEVNULL,
+            stdout=log, stderr=log, start_new_session=True, close_fds=True,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -63,16 +82,16 @@ def main(argv: list[str] | None = None) -> int:
                 or payload.get("rollout_path")
                 or payload.get("transcriptPath")
             )
-            session_key = None
+            startup_session_id = None
             if transcript_p and isinstance(transcript_p, str):
                 m = re.search(
                     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
                     transcript_p,
                 )
                 if m:
-                    session_key = m.group(1)
-            if not session_key:
-                session_key = (
+                    startup_session_id = m.group(1)
+            if not startup_session_id:
+                startup_session_id = (
                     payload.get("thread_id")
                     or payload.get("threadId")
                     or payload.get("conversation_id")
@@ -81,9 +100,9 @@ def main(argv: list[str] | None = None) -> int:
                     or "startup"
                 )
             bundle = build_startup_recall_bundle(
-                config, runtime=args.runtime, session_key=session_key
+                config, runtime=args.runtime, session_key=startup_session_id
             )
-            art_path, art_sha = find_runtime_session_artifact(config, args.runtime, session_key)
+            art_path, art_sha = find_runtime_session_artifact(config, args.runtime, startup_session_id)
             write_recall_evidence(
                 config,
                 bundle,
@@ -96,6 +115,18 @@ def main(argv: list[str] | None = None) -> int:
                 write_health(config.state_path, f"recall-{args.runtime}", "ok")
             except OSError:
                 pass
+            # A resumed runtime session may be the first reliable lifecycle
+            # boundary after a crash.  Recover only its own pending raw turns;
+            # the detached worker is intentionally best-effort so provider
+            # failure never prevents normal runtime startup.
+            if isinstance(startup_session_id, str) and startup_session_id != "startup":
+                pending_turn = find_pending_turn_checkpoint(
+                    config, runtime=args.runtime, session_id=startup_session_id
+                )
+                if pending_turn:
+                    log_dir = config.state_path / "logs"
+                    ensure_safe_directory(log_dir, create=True)
+                    _spawn_drain(args.config, pending_turn, log_dir / f"drain-{args.runtime}.log")
             wire = {
                 "continue": True,
                 "hookSpecificOutput": {
@@ -111,18 +142,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         log_dir = config.state_path / "logs"
         ensure_safe_directory(log_dir, create=True)
-        repo_root = Path(__file__).resolve().parents[1]
-        env = scrubbed_subprocess_env({"PYTHONPATH": str(repo_root)})
-        env.pop("PZ_MEMORY_INVOKED_BY", None)
-        cmd = build_drain_command(args.config, queue_path)
-        with (log_dir / f"drain-{args.runtime}.log").open("ab") as log:
-            subprocess.Popen(
-                cmd,
-                cwd=str(repo_root),
-                env=env,
-                stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                start_new_session=True, close_fds=True,
-            )
+        if args.event == "Stop":
+            session_id = payload.get("session_id") or payload.get("sessionId") or payload.get("thread_id") or payload.get("threadId")
+            if isinstance(session_id, str) and pending_turn_checkpoint_count(
+                config, runtime=args.runtime, session_id=session_id
+            ) >= MAX_TURN_CHECKPOINTS_PER_SESSION:
+                # The documented bounded batch policy is the only ordinary
+                # turn path that may promote.  It is still detached and leaves
+                # raw checkpoints intact if the provider is unavailable.
+                _spawn_drain(args.config, queue_path, log_dir / f"drain-{args.runtime}.log")
+        else:
+            _spawn_drain(args.config, queue_path, log_dir / f"drain-{args.runtime}.log")
         return 0
     except (MemoryError, OSError) as exc:
         try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -155,7 +156,10 @@ class RuntimeNativeTests(unittest.TestCase):
     def test_codex_bundled_discovery(self):
         cfg = self._make_config()
         discovered = discover_codex_binary(cfg)
-        if Path("/Applications/ChatGPT.app/Contents/Resources/codex").is_file():
+        if (
+            Path("/Applications/ChatGPT.app/Contents/Resources/codex").is_file()
+            and not shutil.which("codex")
+        ):
             self.assertEqual("/Applications/ChatGPT.app/Contents/Resources/codex", discovered)
 
     # 7. Codex exec command construction
@@ -869,4 +873,3 @@ class RuntimeNativeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -88,6 +88,37 @@ class EventWriter:
                 and previous.get("event_path")
             ):
                 raise DuplicateEvent(previous["event_path"])
+            # A terminal boundary often sees exactly the transcript already
+            # flushed at PreCompact.  Record the new lifecycle fact without a
+            # second provider call or a second companion/rule/graph/skill pass.
+            if (
+                previous.get("source_digest") == source_digest
+                and previous.get("event_path")
+                and Path(str(previous["event_path"])).is_file()
+            ):
+                event_path = Path(str(previous["event_path"]))
+                existing = parse_event_artifact(event_path.read_text(encoding="utf-8"))
+                events_seen = sorted(set(previous.get("events_seen", [])) | {event})
+                summary = {
+                    field: [item for item in existing["sections"][field] if item != "unknown"]
+                    for field in SUMMARY_FIELDS
+                }
+                rendered = self._render(
+                    runtime=runtime, agent_id=existing["agent_id"], session_id=session_id,
+                    event=event, events_seen=events_seen, created_at=existing["created_at"],
+                    source_model=existing["source_model"],
+                    source_provider=existing.get("source_provider"),
+                    root_task_id=existing["root_task_id"], kanban_ids=existing["kanban_ids"],
+                    source_digest=source_digest, summary=summary,
+                    redaction_count=existing["secret_redactions"],
+                )
+                atomic_write(event_path, rendered.encode("utf-8"), mode=0o640)
+                atomic_json(state_path, {
+                    **previous, "events_seen": events_seen, "event_path": str(event_path),
+                    "updated_at": iso_now(),
+                })
+                write_health(self.config.state_path, f"flush-{runtime}", "ok", "deduplicated-boundary")
+                return event_path
             try:
                 try:
                     raw_summary = self.provider.request(
