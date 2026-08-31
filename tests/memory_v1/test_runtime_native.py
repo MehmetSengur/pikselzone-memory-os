@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -625,6 +626,30 @@ class RuntimeNativeTests(unittest.TestCase):
         self.assertIn("drain", cmd)
         self.assertIn("--queue", cmd)
         self.assertEqual(str(q_path.resolve()), cmd[cmd.index("--queue") + 1])
+
+    def test_codex_stop_hook_checkpoints_without_spawning_provider_worker(self):
+        cfg = self._make_config()
+        transcript_file = self.root / "stop-hook.jsonl"
+        transcript_file.write_text(
+            json.dumps({"role": "user", "content": "Keep this."}) + "\n"
+            + json.dumps({"role": "assistant", "content": "Checkpointed."}) + "\n",
+            encoding="utf-8",
+        )
+        payload = json.dumps({
+            "session_id": "sess-stop-hook-1", "turn_id": "turn-001",
+            "transcript_path": str(transcript_file),
+        })
+        with mock.patch.object(hook_runner.MemoryConfig, "load", return_value=cfg), \
+             mock.patch.object(hook_runner, "_spawn_drain") as spawn, \
+             mock.patch("sys.stdin", io.StringIO(payload)):
+            rc = hook_runner.main([
+                "--config", str(self.root / "config.json"),
+                "--runtime", "codex", "--event", "Stop",
+            ])
+        self.assertEqual(0, rc)
+        spawn.assert_not_called()
+        pending = list((self.state / "queue" / "pending").glob("*.json"))
+        self.assertEqual(1, len(pending))
 
     # 33. Automatic worker receipt and evidence generation
     def test_automatic_worker_receipt_and_evidence_generation(self):
