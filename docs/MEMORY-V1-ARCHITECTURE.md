@@ -94,9 +94,11 @@ without re-calling the provider.  Provider failures settle nothing.
 Hermes startup first uses supported read-only SessionDB/profile discovery with
 an explicit 20-session-per-profile bound.  Its 128-entry local cursor contains
 only profile/database/session identity and final-turn digest: only sessions
-observed through a real `on_session_start` are baseline-only armed, so
+observed through a real `on_session_start` are baseline-only armed.  The active
+session is armed from `get_hermes_home()/state.db` even before Hermes persists
+its SessionDB row; an existing first-sighting digest is baseline-only.  Thus
 unrelated recent historical sessions remain untracked and cannot replay.  A
-changed digest on an armed session stages the canonical raw checkpoint and
+changed digest on a previously armed session stages the canonical raw checkpoint and
 leaves semantic promotion to the existing recovery path.  Per-profile failures
 and checkpoint-write failures degrade safely without advancing past the
 affected digest.

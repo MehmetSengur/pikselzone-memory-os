@@ -58,6 +58,13 @@ the same canonical raw checkpoint that `pre_llm_call` would create.  This
 remains raw-only and provider-free until existing recovery handles the
 checkpoint.  Native VPS acceptance is still required before activation.
 
+A real Hermes `SessionStart` arms its active session from the public active
+Hermes home even before Hermes persists a SessionDB row: the initial cursor
+digest is `null`.  If that row already exists at first sighting, its current
+final-turn digest is baseline-only and is never replayed.  The failed native
+canary `20260901_134450_bf9e17` exposed the SessionStart-before-SessionDB
+ordering; it is implementation evidence only, not native-acceptance PASS.
+
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
 - **SB2-01**: Codex old + new rollout format compatibility (both legacy `user_message`/`agent_message` and modern `item_completed` with `UserMessage`/`AgentMessage`, case-insensitive `text`/`Text` block extraction, complete filtering of `Reasoning`/`CommandExecution`/`FileChange`/internal events, and regression check against silent 0-turn failure with 10 targeted tests PASS).

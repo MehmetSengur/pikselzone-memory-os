@@ -548,6 +548,31 @@ def _discovery_identity(database: Path, session_id: str) -> str:
     return hashlib.sha256(f"{database_id}\0{session_id}".encode("utf-8")).hexdigest()
 
 
+def _active_session_db_path() -> Optional[Path]:
+    """Return the active profile's canonical SessionDB path, if Hermes exposes it.
+
+    Hermes establishes the active profile home before invoking ``on_session_start``.
+    That public home is the authority for newly arming the current session; the
+    SessionDB itself may intentionally have no row until the first user turn.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        active_home = get_hermes_home()
+        if not active_home:
+            raise ValueError("active-hermes-home-empty")
+        return Path(active_home) / "state.db"
+    except Exception as exc:
+        logger.warning("pz-memory-v1: active Hermes home unavailable: %s", exc)
+        return None
+
+
+def _active_profile_label(active_db_path: Path) -> str:
+    """Keep cursor metadata useful without discovering profiles by history."""
+    home = active_db_path.parent
+    return "default" if home.name == "data" else home.name
+
+
 def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -> None:
     """Baseline or raw-stage bounded, tracked Hermes SessionDB final turns.
 
@@ -561,28 +586,84 @@ def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -
     cursor, cursor_ok = _load_discovery_cursor()
     if not cursor_ok:
         return
-    try:
-        import hermes_state
-        from hermes_cli import profiles as profiles_mod
-    except Exception as exc:
-        logger.warning("pz-memory-v1: Hermes SessionDB discovery unavailable: %s", exc)
-        return
-
-    try:
-        infos = profiles_mod.list_profiles()
-        targets = [(str(info.name), Path(info.path)) for info in infos]
-        if not targets:
-            targets = [("default", Path(profiles_mod.get_profile_dir("default")))]
-    except Exception as exc:
-        logger.warning("pz-memory-v1: profile discovery unavailable: %s", exc)
-        return
-
     sessions = dict(cursor["sessions"])
     real_current_session_id = (
         current_session_id.strip()
         if isinstance(current_session_id, str) and current_session_id.strip()
         else None
     )
+    newly_armed: set[str] = set()
+    active_db_path = _active_session_db_path() if real_current_session_id else None
+    active_database_id = str(active_db_path.resolve()) if active_db_path else None
+
+    try:
+        import hermes_state
+    except Exception as exc:
+        logger.warning("pz-memory-v1: Hermes SessionDB discovery unavailable: %s", exc)
+        hermes_state = None
+
+    # A real SessionStart is sufficient authority to arm its current session.
+    # Do this before profile enumeration: Hermes can invoke SessionStart before
+    # it persists the session row, and unrelated profile discovery must not
+    # discard a durable pending-null baseline.
+    if real_current_session_id and active_db_path:
+        identity, entry = _discovery_entry(
+            profile=_active_profile_label(active_db_path),
+            database=active_db_path,
+            session_id=real_current_session_id,
+            digest=None,
+            observed_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        )
+        if not isinstance(sessions.get(identity), dict):
+            db = None
+            try:
+                if hermes_state is not None and active_db_path.is_file():
+                    db = hermes_state.SessionDB(db_path=active_db_path, read_only=True)
+                    metadata = db.get_session(real_current_session_id)
+                    exported = db.export_session(real_current_session_id) if metadata else None
+                    if isinstance(exported, dict):
+                        transcript, _, _, _ = _normalize_session_export(exported)
+                        turn = _last_completed_turn(transcript) if transcript else None
+                        entry["last_turn_digest"] = (
+                            hashlib.sha256(turn.encode("utf-8")).hexdigest() if turn else None
+                        )
+            except Exception as exc:
+                # The active database identity remains enough to arm a
+                # pre-persisted session. A later native start can inspect it.
+                logger.warning("pz-memory-v1: active SessionDB lookup degraded: %s", exc)
+            finally:
+                if db is not None:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
+            sessions[identity] = entry
+            if _write_discovery_cursor({"schema": DISCOVERY_CURSOR_SCHEMA, "sessions": sessions}):
+                newly_armed.add(identity)
+            else:
+                # A failed cursor write is not an arm. Keep any prior cursor
+                # state intact for the bounded scan below.
+                sessions = dict(cursor["sessions"])
+
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        infos = profiles_mod.list_profiles()
+        targets = [(str(info.name), Path(info.path)) for info in infos]
+        if not targets:
+            targets = [("default", Path(profiles_mod.get_profile_dir("default")))]
+        if active_db_path and all(
+            str((profile_dir / "state.db").resolve()) != active_database_id
+            for _, profile_dir in targets
+        ):
+            targets.insert(0, (_active_profile_label(active_db_path), active_db_path.parent))
+    except Exception as exc:
+        logger.warning("pz-memory-v1: profile discovery unavailable: %s", exc)
+        return
+
+    if hermes_state is None:
+        return
+
     seen_databases: set[str] = set()
     changed = False
     for profile_name, profile_dir in targets:
@@ -613,13 +694,18 @@ def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -
                 session_id = row["id"]
                 recent_ids.add(session_id)
                 identity = _discovery_identity(db_path, session_id)
-                if identity in sessions or session_id == real_current_session_id:
+                if identity in sessions and identity not in newly_armed:
                     candidate_ids.append(session_id)
 
             # The active session can legitimately fall outside the bounded
-            # recent window. Locate exactly that ID without enumerating more
-            # history; it is the only untracked session allowed to be armed.
-            if real_current_session_id and real_current_session_id not in recent_ids:
+            # recent window. Locate it exactly in its active database only;
+            # SessionStart has already established its tracking authority.
+            if (
+                real_current_session_id
+                and database_id == active_database_id
+                and real_current_session_id not in recent_ids
+                and _discovery_identity(db_path, real_current_session_id) not in newly_armed
+            ):
                 try:
                     if db.get_session(real_current_session_id):
                         candidate_ids.append(real_current_session_id)
@@ -649,6 +735,13 @@ def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -
                 previous = sessions.get(identity)
                 if not isinstance(previous, dict):
                     # First sighting is an activation baseline, never a replay.
+                    sessions[identity] = entry
+                    changed = True
+                    continue
+                if identity in newly_armed:
+                    # This SessionStart armed the session. Even if the row
+                    # appeared between the exact lookup and bounded scan, its
+                    # first visible digest is baseline-only in this invocation.
                     sessions[identity] = entry
                     changed = True
                     continue

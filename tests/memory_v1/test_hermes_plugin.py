@@ -65,11 +65,15 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         }
         return MemoryConfig.from_dict(raw)
 
-    def _fake_discovery_runtime(self, sessions_by_profile, *, failing_profiles=()):
+    def _fake_discovery_runtime(
+        self, sessions_by_profile, *, failing_profiles=(), active_profile="default",
+        list_profiles_error=False,
+    ):
         """Install only the supported Hermes SessionDB/profile interfaces."""
         profile_infos = []
         databases = {}
-        calls = {"search": [], "exports": [], "read_only": []}
+        homes = {}
+        calls = {"search": [], "gets": [], "exports": [], "read_only": []}
         for profile_name, sessions in sessions_by_profile.items():
             home = self.root / "fake-hermes-profiles" / profile_name
             home.mkdir(parents=True, exist_ok=True)
@@ -77,6 +81,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             db_path.touch()
             key = str(db_path.resolve())
             profile_infos.append(types.SimpleNamespace(name=profile_name, path=home))
+            homes[profile_name] = home
             databases[key] = RuntimeError("profile-db-failure") if profile_name in failing_profiles else sessions
 
         class FakeSessionDB:
@@ -94,6 +99,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
                 return [{"id": item["id"]} for item in inner_self.sessions[offset:offset + limit]]
 
             def get_session(inner_self, session_id):
+                calls["gets"].append((inner_self.key, session_id))
                 for item in inner_self.sessions:
                     if item["id"] == session_id:
                         return {key: value for key, value in item.items() if key != "messages"}
@@ -110,7 +116,12 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
                 return None
 
         profiles_module = types.ModuleType("hermes_cli.profiles")
-        profiles_module.list_profiles = lambda: profile_infos
+        def list_profiles():
+            if list_profiles_error:
+                raise RuntimeError("profile-list-failure")
+            return profile_infos
+
+        profiles_module.list_profiles = list_profiles
         profiles_module.get_profile_dir = lambda name: next(
             info.path for info in profile_infos if info.name == name
         )
@@ -118,10 +129,13 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         hermes_cli_module.profiles = profiles_module
         hermes_state_module = types.ModuleType("hermes_state")
         hermes_state_module.SessionDB = FakeSessionDB
+        hermes_constants_module = types.ModuleType("hermes_constants")
+        hermes_constants_module.get_hermes_home = lambda: homes[active_profile]
         patches = mock.patch.dict(sys.modules, {
             "hermes_state": hermes_state_module,
             "hermes_cli": hermes_cli_module,
             "hermes_cli.profiles": profiles_module,
+            "hermes_constants": hermes_constants_module,
         })
         return patches, calls
 
@@ -511,8 +525,120 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             self.assertTrue(all(calls["read_only"]))
             self.assertEqual([], calls["exports"])
             self.assertEqual([], plugin._checkpoint_paths("historic-1"))
-            self.assertFalse(Path(plugin._discovery_cursor_path()).exists())
+            cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
+            self.assertEqual(1, len(cursor["sessions"]))
+            self.assertEqual("different-current", next(iter(cursor["sessions"].values()))["session_id"])
+            self.assertIsNone(next(iter(cursor["sessions"].values()))["last_turn_digest"])
             self.assertEqual([], [path for path in self.vault.rglob("*") if path.is_file()])
+
+    def test_real_session_start_arms_before_sessiondb_row_exists(self):
+        plugin = load_hermes_plugin()
+        current = "pre-persist-current"
+        sessions = {
+            "default": [],
+            "other": [self._fake_session("unrelated", [
+                {"role": "user", "content": "historic user"},
+                {"role": "assistant", "content": "historic assistant"},
+            ])],
+        }
+        patches, calls = self._fake_discovery_runtime(sessions)
+        active_db = self.root / "fake-hermes-profiles" / "default" / "state.db"
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
+             mock.patch.object(plugin, "_recover_pending_turn_checkpoints"), \
+             mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
+            plugin.on_session_start(session_id=current)
+            cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
+            self.assertEqual(1, len(cursor["sessions"]))
+            entry = next(iter(cursor["sessions"].values()))
+            self.assertEqual(current, entry["session_id"])
+            self.assertEqual(str(active_db.resolve()), entry["database"])
+            self.assertIsNone(entry["last_turn_digest"])
+            self.assertEqual([], calls["exports"])
+            self.assertEqual([], plugin._checkpoint_paths(current))
+            self.assertEqual([], list(self.events_outbox.glob("*.md")))
+            summarize.assert_not_called()
+
+    def test_pre_persist_armed_session_recovers_completed_turn_on_next_start(self):
+        plugin = load_hermes_plugin()
+        current = "pre-persist-then-complete"
+        sessions = {"default": []}
+        patches, calls = self._fake_discovery_runtime(sessions)
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
+             mock.patch.object(plugin, "_recover_pending_turn_checkpoints"), \
+             mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
+            plugin.on_session_start(session_id=current)
+            sessions["default"].append(self._fake_session(current, [
+                {"role": "user", "content": "one user"},
+                {"role": "assistant", "content": "one assistant"},
+            ]))
+            plugin.on_session_start(session_id=current)
+            turn = "USER: one user\nASSISTANT: one assistant"
+            digest = hashlib.sha256(turn.encode("utf-8")).hexdigest()
+            self.assertTrue(Path(plugin._checkpoint_destination(current, digest)).is_file())
+            cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
+            self.assertEqual(digest, next(iter(cursor["sessions"].values()))["last_turn_digest"])
+            self.assertEqual([(calls["exports"][0][0], current)], calls["exports"])
+            summarize.assert_not_called()
+
+    def test_existing_historical_session_first_real_start_is_baseline_not_replay(self):
+        plugin = load_hermes_plugin()
+        current = "historic-first-real-start"
+        session = self._fake_session(current, [
+            {"role": "user", "content": "historic user"},
+            {"role": "assistant", "content": "historic assistant"},
+        ])
+        patches, _ = self._fake_discovery_runtime({"default": [session]})
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
+             mock.patch.object(plugin, "_recover_pending_turn_checkpoints"):
+            plugin.on_session_start(session_id=current)
+            historical = "USER: historic user\nASSISTANT: historic assistant"
+            historical_digest = hashlib.sha256(historical.encode("utf-8")).hexdigest()
+            cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
+            self.assertEqual(historical_digest, next(iter(cursor["sessions"].values()))["last_turn_digest"])
+            self.assertEqual([], plugin._checkpoint_paths(current))
+            session["messages"].extend([
+                {"role": "user", "content": "new user"},
+                {"role": "assistant", "content": "new assistant"},
+            ])
+            plugin.on_session_start(session_id=current)
+            current_turn = "USER: new user\nASSISTANT: new assistant"
+            current_digest = hashlib.sha256(current_turn.encode("utf-8")).hexdigest()
+            self.assertTrue(Path(plugin._checkpoint_destination(current, current_digest)).is_file())
+            self.assertFalse(Path(plugin._checkpoint_destination(current, historical_digest)).exists())
+
+    def test_current_arm_survives_profile_discovery_failure(self):
+        plugin = load_hermes_plugin()
+        current = "arm-survives-profile-failure"
+        patches, calls = self._fake_discovery_runtime(
+            {"default": []}, list_profiles_error=True,
+        )
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
+             mock.patch.object(plugin, "_recover_pending_turn_checkpoints"), \
+             mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
+            plugin.on_session_start(session_id=current)
+            cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
+            self.assertEqual(1, len(cursor["sessions"]))
+            self.assertEqual(current, next(iter(cursor["sessions"].values()))["session_id"])
+            self.assertEqual([], calls["search"])
+            self.assertEqual([], calls["exports"])
+            summarize.assert_not_called()
+
+    def test_current_arm_survives_active_sessiondb_lookup_failure(self):
+        plugin = load_hermes_plugin()
+        current = "arm-survives-active-db-failure"
+        patches, calls = self._fake_discovery_runtime(
+            {"default": []}, failing_profiles={"default"},
+        )
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
+             mock.patch.object(plugin, "_recover_pending_turn_checkpoints"), \
+             mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
+            plugin.on_session_start(session_id=current)
+            cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
+            self.assertEqual(1, len(cursor["sessions"]))
+            self.assertEqual(current, next(iter(cursor["sessions"].values()))["session_id"])
+            self.assertEqual([], calls["exports"])
+            self.assertEqual([], plugin._checkpoint_paths(current))
+            summarize.assert_not_called()
 
     def test_current_untracked_session_is_baseline_only(self):
         plugin = load_hermes_plugin()
@@ -716,7 +842,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         valid = [self._fake_session(f"bounded-{index}", [{"role": "user", "content": "u"}]) for index in range(25)]
         failing = [self._fake_session("bad-profile", [{"role": "user", "content": "u"}])]
         patches, calls = self._fake_discovery_runtime(
-            {"broken": failing, "valid": valid}, failing_profiles={"broken"},
+            {"broken": failing, "valid": valid}, failing_profiles={"broken"}, active_profile="valid",
         )
         with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
              mock.patch.object(plugin, "_recover_pending_turn_checkpoints"):
