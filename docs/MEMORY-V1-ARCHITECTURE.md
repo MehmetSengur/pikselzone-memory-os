@@ -119,6 +119,14 @@ model exists. Canary `20260901_134450_bf9e17` documented pre-persist arming,
 and `20260902_172739_4b7b32` documented that initial input readiness is not a
 SessionStart callback; neither is acceptance PASS.
 
+For bounded canaries and tests, `PZ_MEMORY_BASE_DIR` redirects all mutable
+Hermes Memory OS runtime state: inbox, receipts, trace, locks, checkpoints,
+cursor, event outbox, and evidence outbox. It does not redirect Hermes
+SessionDB; raw discovery still exact-reads the active profile's
+`get_hermes_home()/state.db`. Source `35332b4` canary preflight detected a
+fixed recall-evidence outbox path and stopped before a CLI child or user turn;
+this is implementation evidence, not native-acceptance PASS.
+
 Runtime semantics are deliberately not unified:
 
 | Runtime | Raw checkpoint boundary | Promotion status |

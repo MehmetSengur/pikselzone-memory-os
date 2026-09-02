@@ -77,6 +77,13 @@ SessionStart-before-SessionDB persistence ordering. The failed native canary
 not itself invoke SessionStart. Both are contract-discovery evidence only, not
 native-acceptance PASS.
 
+`PZ_MEMORY_BASE_DIR` redirects every mutable Hermes Memory OS runtime artifact
+for bounded tests and canaries: inbox, cursor, receipts, locks, checkpoints,
+events, and evidence outboxes. It does not redirect Hermes SessionDB, which
+remains the active Hermes profile's `get_hermes_home()/state.db`. Canary
+preflight at source `35332b4` found a fixed recall-evidence path that would
+have contaminated production; execution stopped before the first CLI turn.
+
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
 - **SB2-01**: Codex old + new rollout format compatibility (both legacy `user_message`/`agent_message` and modern `item_completed` with `UserMessage`/`AgentMessage`, case-insensitive `text`/`Text` block extraction, complete filtering of `Reasoning`/`CommandExecution`/`FileChange`/internal events, and regression check against silent 0-turn failure with 10 targeted tests PASS).

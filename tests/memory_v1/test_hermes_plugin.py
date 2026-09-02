@@ -512,6 +512,110 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             self.assertEqual("pikselzone-memory-turn-checkpoint-v2", payload["schema"])
             self.assertEqual("USER: keep this\nASSISTANT: acknowledged", payload["normalized_transcript"])
 
+    def test_recall_evidence_respects_memory_base_override(self):
+        plugin = load_hermes_plugin()
+        live_base = self.root / "live-memory-base"
+        isolated_base = self.root / "isolated-memory-base"
+        with mock.patch.object(plugin, "BASE_DIR", str(live_base)), \
+             mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(isolated_base)}), \
+             mock.patch.object(plugin, "_active_session_db_path", return_value=None):
+            plugin._write_hermes_recall_evidence("isolated-recall", "isolated bundle", [])
+
+        self.assertTrue((isolated_base / "outbox" / "evidence" / "recall-hermes.json").is_file())
+        self.assertFalse((live_base / "outbox" / "evidence" / "recall-hermes.json").exists())
+
+    def test_recall_receipt_lookup_respects_memory_base_override(self):
+        plugin = load_hermes_plugin()
+        session_id = "receipt-isolation"
+        live_base = self.root / "live-memory-base"
+        isolated_base = self.root / "isolated-memory-base"
+        live_receipt = live_base / "state" / "receipts" / f"{session_id}.json"
+        isolated_receipt = isolated_base / "state" / "receipts" / f"{session_id}.json"
+        live_receipt.parent.mkdir(parents=True)
+        isolated_receipt.parent.mkdir(parents=True)
+        live_receipt.write_text("live-receipt", encoding="utf-8")
+        isolated_receipt.write_text("isolated-receipt", encoding="utf-8")
+
+        with mock.patch.object(plugin, "BASE_DIR", str(live_base)), \
+             mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(isolated_base)}), \
+             mock.patch.object(plugin, "_active_session_db_path", return_value=None):
+            plugin._write_hermes_recall_evidence(session_id, "bundle", [])
+            evidence_path = isolated_base / "outbox" / "evidence" / "recall-hermes.json"
+            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+            self.assertEqual(str(isolated_receipt), payload["session_artifact_path"])
+            self.assertEqual(hashlib.sha256(b"isolated-receipt").hexdigest(), payload["session_artifact_sha256"])
+
+            isolated_receipt.unlink()
+            plugin._write_hermes_recall_evidence(session_id, "bundle-without-receipt", [])
+            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+            self.assertIsNone(payload["session_artifact_path"])
+            self.assertEqual("", payload["session_artifact_sha256"])
+
+    def test_pre_llm_startup_bundle_respects_memory_base_override(self):
+        plugin = load_hermes_plugin()
+        live_base = self.root / "live-memory-base"
+        isolated_base = self.root / "isolated-memory-base"
+        live_bundle = live_base / "inbox" / "hermes-startup-bundle.json"
+        isolated_bundle = isolated_base / "inbox" / "hermes-startup-bundle.json"
+        live_bundle.parent.mkdir(parents=True)
+        isolated_bundle.parent.mkdir(parents=True)
+        live_bundle.write_text(json.dumps({"text": "LIVE-BUNDLE-MUST-NOT-BE-READ"}), encoding="utf-8")
+        isolated_bundle.write_text(json.dumps({"text": "ISOLATED-BUNDLE"}), encoding="utf-8")
+
+        with mock.patch.object(plugin, "BASE_DIR", str(live_base)), \
+             mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(isolated_base)}), \
+             mock.patch.object(plugin, "_stage_turn_checkpoint", return_value=False), \
+             mock.patch.object(plugin, "_write_hermes_recall_evidence"):
+            result = plugin.pre_llm_call(session_id="isolated-bundle", is_first_turn=True)
+            self.assertIn("ISOLATED-BUNDLE", result["context"])
+            self.assertNotIn("LIVE-BUNDLE-MUST-NOT-BE-READ", result["context"])
+
+            isolated_bundle.unlink()
+            result = plugin.pre_llm_call(session_id="isolated-bundle-empty", is_first_turn=True)
+            self.assertNotIn("LIVE-BUNDLE-MUST-NOT-BE-READ", result["context"])
+            self.assertIn("PIKSELZONE MEMORY V1", result["context"])
+
+    def test_default_memory_base_behavior_unchanged_without_override(self):
+        plugin = load_hermes_plugin()
+        default_base = self.root / "default-memory-base"
+        with mock.patch.object(plugin, "BASE_DIR", str(default_base)), \
+             mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": ""}), \
+             mock.patch.object(plugin, "_active_session_db_path", return_value=None):
+            plugin._write_hermes_recall_evidence("default-base", "default bundle", [])
+
+        self.assertTrue((default_base / "outbox" / "evidence" / "recall-hermes.json").is_file())
+
+    def test_isolated_terminal_event_and_completion_stay_under_override(self):
+        plugin = load_hermes_plugin()
+        session_id = "isolated-terminal"
+        live_base = self.root / "live-memory-base"
+        isolated_base = self.root / "isolated-memory-base"
+        summary = {
+            "status": "ok", "context": ["isolated"], "important_conversations": [],
+            "decisions": [], "learnings": [], "open_items": [], "evidence": [],
+        }
+        plugin._IN_MEMORY_COMPLETED.clear()
+        plugin._IN_MEMORY_EXECUTING.clear()
+        with mock.patch.object(plugin, "BASE_DIR", str(live_base)), \
+             mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(isolated_base)}):
+            receipt = plugin._record_lifecycle_receipt(session_id, "on_session_end")
+            event_path = plugin._render_and_stage_event(
+                session_id=session_id, summary=summary, source_model="model", source_provider="provider",
+                root_task_id="task", source_sha="a" * 64, redactions=0,
+                hook_event="on_session_end", receipt=receipt,
+            )
+            plugin._mark_durable_completion(session_id, status="staged-event", event_path=event_path)
+            self.assertTrue(plugin._stage_completed_turn_checkpoint(
+                session_id, "USER: isolated\nASSISTANT: complete", "model", "task", 0,
+            ))
+            self.assertTrue(plugin._checkpoint_paths(session_id))
+
+        self.assertTrue(event_path and Path(event_path).is_file())
+        self.assertTrue((isolated_base / "state" / "locks" / f"{session_id}.completed").is_file())
+        self.assertFalse(live_base.exists())
+        plugin._IN_MEMORY_COMPLETED.clear()
+        plugin._IN_MEMORY_EXECUTING.clear()
+
     def test_unrelated_historical_recent_sessions_remain_untracked(self):
         plugin = load_hermes_plugin()
         sessions = {

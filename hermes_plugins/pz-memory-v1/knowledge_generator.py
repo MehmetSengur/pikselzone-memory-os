@@ -73,7 +73,7 @@ def generate_knowledge(
     base_dir: str | None = None,
     llm_client: Any | None = None,
 ) -> dict[str, Any]:
-    base = base_dir or os.environ.get("PZ_MEMORY_BASE_DIR") or "/opt/data/memory-v1"
+    base = base_dir or os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR
     inbox_file = posixpath.join(base, "inbox", "knowledge-batch.json")
     outbox_dir = posixpath.join(base, "outbox", "knowledge")
     candidates_dir = posixpath.join(outbox_dir, "candidates")

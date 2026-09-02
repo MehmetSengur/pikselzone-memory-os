@@ -11,7 +11,8 @@ Enforces:
 - Authenticated lifecycle receipt verification: records stack frame caller to guarantee true native invoke.
 - Re-entrancy guard via PZ_MEMORY_INTERNAL_CALL.
 - Zero direct credential access or OpenAI endpoints.
-- Outbox-only containment: Writes only to /opt/data/memory-v1/outbox/.
+- Outbox-only containment: Writes under the default /opt/data/memory-v1/outbox/
+  or an explicit PZ_MEMORY_BASE_DIR override.
 """
 from __future__ import annotations
 
@@ -33,12 +34,6 @@ PLUGIN_VERSION = "1.0.0"
 
 # Filesystem layout inside Hermes container
 BASE_DIR = "/opt/data/memory-v1"
-OUTBOX_EVENTS = posixpath.join(BASE_DIR, "outbox", "events")
-OUTBOX_EVIDENCE = posixpath.join(BASE_DIR, "outbox", "evidence")
-STATE_DIR = posixpath.join(BASE_DIR, "state")
-LOCKS_DIR = posixpath.join(STATE_DIR, "locks")
-RECEIPTS_DIR = posixpath.join(STATE_DIR, "receipts")
-CHECKPOINTS_DIR = posixpath.join(STATE_DIR, "checkpoints")
 MAX_TURN_CHECKPOINTS_PER_SESSION = 32
 MAX_TURN_CHECKPOINT_CHARS = 64 * 1024
 MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE = 20
@@ -75,6 +70,22 @@ SECRET_TOKEN = re.compile(
     r"Bearer\s+[A-Za-z0-9._-]{20,}|"
     r"eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})"
 )
+
+
+def _memory_base_dir() -> str:
+    """Return the active mutable Memory OS runtime base for this operation.
+
+    Hermes SessionDB is intentionally separate and remains profile-scoped via
+    ``get_hermes_home()/state.db``.  Do not cache this value: tests and bounded
+    canaries set ``PZ_MEMORY_BASE_DIR`` dynamically.
+    """
+    override = os.environ.get("PZ_MEMORY_BASE_DIR", "").strip()
+    return override or BASE_DIR
+
+
+def _memory_path(*parts: str) -> str:
+    """Build a mutable Memory OS runtime path under the active base."""
+    return posixpath.join(_memory_base_dir(), *parts)
 PRIVATE_KEY_BLOCK = re.compile(
     r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?"
     r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
@@ -152,7 +163,7 @@ def _record_lifecycle_receipt(
         "receipt_hash": receipt_hash,
     }
 
-    receipts_root = target_dir or posixpath.join(os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR, "state", "receipts")
+    receipts_root = target_dir or _memory_path("state", "receipts")
     try:
         os.makedirs(receipts_root, mode=0o770, exist_ok=True)
         r_file = posixpath.join(receipts_root, f"{session_id}.json")
@@ -168,7 +179,7 @@ def _record_lifecycle_receipt(
 
     # Append to hook-trace receipt log
     try:
-        trace_file = posixpath.join(os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR, "state", "hook-trace.jsonl")
+        trace_file = _memory_path("state", "hook-trace.jsonl")
         os.makedirs(posixpath.dirname(trace_file), mode=0o770, exist_ok=True)
         with open(trace_file, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(receipt) + "\n")
@@ -186,7 +197,7 @@ def _is_session_completed(session_id: str, locks_dir: Optional[str] = None) -> b
     """Check if session has already been durably completed."""
     if not session_id or session_id in _IN_MEMORY_COMPLETED:
         return True
-    target_dir = locks_dir or posixpath.join(os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR, "state", "locks")
+    target_dir = locks_dir or _memory_path("state", "locks")
     comp_file = posixpath.join(target_dir, f"{session_id}.completed")
     if os.path.isfile(comp_file):
         _IN_MEMORY_COMPLETED.add(session_id)
@@ -210,7 +221,7 @@ def _acquire_execution_lock(session_id: str, locks_dir: Optional[str] = None) ->
     if not session_id or _is_session_completed(session_id, locks_dir) or session_id in _IN_MEMORY_EXECUTING:
         return False
 
-    target_dir = locks_dir or posixpath.join(os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR, "state", "locks")
+    target_dir = locks_dir or _memory_path("state", "locks")
     try:
         os.makedirs(target_dir, mode=0o770, exist_ok=True)
         exec_file = posixpath.join(target_dir, f"{session_id}.executing")
@@ -246,7 +257,7 @@ def _acquire_execution_lock(session_id: str, locks_dir: Optional[str] = None) ->
 def _release_execution_lock(session_id: str, locks_dir: Optional[str] = None) -> None:
     """Release transient execution lock."""
     _IN_MEMORY_EXECUTING.discard(session_id)
-    target_dir = locks_dir or posixpath.join(os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR, "state", "locks")
+    target_dir = locks_dir or _memory_path("state", "locks")
     exec_file = posixpath.join(target_dir, f"{session_id}.executing")
     try:
         os.unlink(exec_file)
@@ -262,7 +273,7 @@ def _mark_durable_completion(
 ) -> None:
     """Mark session as durably completed only after successful event generation or explicit empty result."""
     _IN_MEMORY_COMPLETED.add(session_id)
-    target_dir = locks_dir or posixpath.join(os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR, "state", "locks")
+    target_dir = locks_dir or _memory_path("state", "locks")
     try:
         os.makedirs(target_dir, mode=0o770, exist_ok=True)
         now_iso = dt.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -378,9 +389,7 @@ def _get_session_transcript(session_id: str) -> tuple[Optional[str], Optional[st
 
 
 def _checkpoint_root() -> str:
-    return posixpath.join(
-        os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR, "state", "checkpoints"
-    )
+    return _memory_path("state", "checkpoints")
 
 
 def _last_completed_turn(transcript: str) -> Optional[str]:
@@ -471,8 +480,7 @@ def _stage_turn_checkpoint(session_id: str) -> bool:
 
 
 def _discovery_cursor_path() -> str:
-    base = os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR
-    return posixpath.join(base, "state", "hermes-session-discovery-v1.json")
+    return _memory_path("state", "hermes-session-discovery-v1.json")
 
 
 def _load_discovery_cursor() -> tuple[dict[str, Any], bool]:
@@ -934,9 +942,8 @@ def _render_and_stage_event(
     event_text = "\n".join(frontmatter + body).rstrip() + "\n"
     event_sha = hashlib.sha256(event_text.encode("utf-8")).hexdigest()
 
-    base = os.environ.get("PZ_MEMORY_BASE_DIR") or BASE_DIR
-    outbox_events_dir = posixpath.join(base, "outbox", "events")
-    outbox_evidence_dir = posixpath.join(base, "outbox", "evidence")
+    outbox_events_dir = _memory_path("outbox", "events")
+    outbox_evidence_dir = _memory_path("outbox", "evidence")
 
     os.makedirs(outbox_events_dir, mode=0o770, exist_ok=True)
     os.makedirs(outbox_evidence_dir, mode=0o770, exist_ok=True)
@@ -1106,8 +1113,9 @@ def _write_hermes_recall_evidence(
     selected_item_ids: list[str] | None = None,
 ) -> None:
     try:
-        os.makedirs(OUTBOX_EVIDENCE, exist_ok=True)
-        evidence_file = posixpath.join(OUTBOX_EVIDENCE, "recall-hermes.json")
+        evidence_root = _memory_path("outbox", "evidence")
+        os.makedirs(evidence_root, exist_ok=True)
+        evidence_file = posixpath.join(evidence_root, "recall-hermes.json")
         observed_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
         bundle_sha = hashlib.sha256(bundle_text.encode("utf-8")).hexdigest()
         items_ids = selected_item_ids or ["hermes-startup-context"]
@@ -1115,7 +1123,7 @@ def _write_hermes_recall_evidence(
 
         art_path = None
         art_sha = ""
-        rcpt_path = posixpath.join(BASE_DIR, "state", "receipts", f"{session_id}.json")
+        rcpt_path = _memory_path("state", "receipts", f"{session_id}.json")
         if os.path.exists(rcpt_path):
             art_path = rcpt_path
             try:
@@ -1124,12 +1132,11 @@ def _write_hermes_recall_evidence(
             except Exception:
                 pass
         if not art_path:
-            data_root = os.environ.get("HERMES_DATA_DIR") or posixpath.dirname(BASE_DIR)
-            sdb = posixpath.join(data_root, "profiles", "pz-orchestrator", "state.db")
-            if os.path.exists(sdb):
-                art_path = sdb
+            session_db = _active_session_db_path()
+            if session_db and session_db.exists():
+                art_path = str(session_db)
                 try:
-                    with open(sdb, "rb") as f:
+                    with open(session_db, "rb") as f:
                         art_sha = hashlib.sha256(f.read()).hexdigest()
                 except Exception:
                     pass
@@ -1209,7 +1216,7 @@ def pre_llm_call(
             _stage_turn_checkpoint(session_id)
         if is_first_turn or not conversation_history:
             # Look for staged startup bundle from host inbox
-            bundle_path = posixpath.join(BASE_DIR, "inbox", "hermes-startup-bundle.json")
+            bundle_path = _memory_path("inbox", "hermes-startup-bundle.json")
             bundle_text = ""
             source_files = []
             if os.path.exists(bundle_path):
