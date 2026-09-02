@@ -484,7 +484,11 @@ def _load_discovery_cursor() -> tuple[dict[str, Any], bool]:
         with open(path, "r", encoding="utf-8") as fh:
             value = json.load(fh)
         sessions = value.get("sessions") if isinstance(value, dict) else None
-        if value.get("schema") != DISCOVERY_CURSOR_SCHEMA or not isinstance(sessions, dict):
+        if (
+            value.get("schema") != DISCOVERY_CURSOR_SCHEMA
+            or not isinstance(sessions, dict)
+            or len(sessions) > MAX_STARTUP_DISCOVERY_CURSOR_ENTRIES
+        ):
             raise ValueError("cursor-schema-invalid")
         return {"schema": DISCOVERY_CURSOR_SCHEMA, "sessions": sessions}, True
     except Exception as exc:
@@ -573,15 +577,39 @@ def _active_profile_label(active_db_path: Path) -> str:
     return "default" if home.name == "data" else home.name
 
 
+def _tracked_session_ids_for_database(sessions: dict[str, Any], database: Path) -> list[str]:
+    """Return cursor-authorized session IDs for one exact SessionDB identity.
+
+    The cursor is the authority for startup recovery.  Validate every entry
+    before using it so a malformed local cursor cannot widen discovery beyond
+    previously lifecycle-tracked sessions.
+    """
+    database_id = str(database.resolve())
+    tracked: list[str] = []
+    for identity, entry in sessions.items():
+        if not isinstance(identity, str) or not isinstance(entry, dict):
+            continue
+        session_id = entry.get("session_id")
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or entry.get("database") != database_id
+            or identity != _discovery_identity(database, session_id)
+        ):
+            logger.warning("pz-memory-v1: ignoring invalid discovery cursor entry")
+            continue
+        tracked.append(session_id)
+    return tracked
+
+
 def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -> None:
     """Baseline or raw-stage bounded, tracked Hermes SessionDB final turns.
 
     This startup phase intentionally never calls PluginLlm or writes durable
     memory. Only sessions observed through a real lifecycle SessionStart may be
-    armed as a baseline. The bounded recent-session scan exports existing
-    cursor entries and the current session only; unrelated historical rows stay
-    metadata-only and can never become recovery candidates merely by appearing
-    in a recent window.
+    armed as a baseline. Startup discovery exact-reads only cursor-authorized
+    identities, so unrelated historical rows cannot become recovery candidates
+    merely because they are recent (or because a tracked row became old).
     """
     cursor, cursor_ok = _load_discovery_cursor()
     if not cursor_ok:
@@ -642,7 +670,7 @@ def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -
                 newly_armed.add(identity)
             else:
                 # A failed cursor write is not an arm. Keep any prior cursor
-                # state intact for the bounded scan below.
+                # state intact for the subsequent exact lookup.
                 sessions = dict(cursor["sessions"])
 
     try:
@@ -676,42 +704,16 @@ def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -
         if database_id in seen_databases or not db_path.is_file():
             continue
         seen_databases.add(database_id)
+        candidate_ids = [
+            session_id
+            for session_id in _tracked_session_ids_for_database(sessions, db_path)
+            if _discovery_identity(db_path, session_id) not in newly_armed
+        ]
+        if not candidate_ids:
+            continue
         db = None
         try:
             db = hermes_state.SessionDB(db_path=db_path, read_only=True)
-            rows = db.search_sessions(
-                source=None,
-                limit=MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE,
-                offset=0,
-            )
-            if not isinstance(rows, list):
-                raise ValueError("recent-session-result-invalid")
-            recent_ids: set[str] = set()
-            candidate_ids: list[str] = []
-            for row in rows[:MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE]:
-                if not isinstance(row, dict) or not isinstance(row.get("id"), str):
-                    continue
-                session_id = row["id"]
-                recent_ids.add(session_id)
-                identity = _discovery_identity(db_path, session_id)
-                if identity in sessions and identity not in newly_armed:
-                    candidate_ids.append(session_id)
-
-            # The active session can legitimately fall outside the bounded
-            # recent window. Locate it exactly in its active database only;
-            # SessionStart has already established its tracking authority.
-            if (
-                real_current_session_id
-                and database_id == active_database_id
-                and real_current_session_id not in recent_ids
-                and _discovery_identity(db_path, real_current_session_id) not in newly_armed
-            ):
-                try:
-                    if db.get_session(real_current_session_id):
-                        candidate_ids.append(real_current_session_id)
-                except Exception as exc:
-                    logger.warning("pz-memory-v1: failed to locate current session metadata: %s", exc)
-
             for session_id in candidate_ids:
                 try:
                     metadata = db.get_session(session_id)
@@ -740,7 +742,7 @@ def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -
                     continue
                 if identity in newly_armed:
                     # This SessionStart armed the session. Even if the row
-                    # appeared between the exact lookup and bounded scan, its
+                    # appeared between the exact lookup phases, its
                     # first visible digest is baseline-only in this invocation.
                     sessions[identity] = entry
                     changed = True
@@ -1080,16 +1082,20 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
 
 
 def on_session_start(**kwargs: Any) -> None:
+    """Arm a new native session and raw-discover already tracked sessions.
+
+    Hermes invokes this only during the first new user turn, not when an
+    interactive CLI merely displays its initial prompt or resumes history.
+    Semantic checkpoint recovery is deliberately excluded here: its durable
+    completion marker is session-scoped and must not suppress later turns in a
+    session that the user can continue.
+    """
     session_id = kwargs.get("session_id")
     logger.info("pz-memory-v1: on_session_start for session %s", session_id or "unknown")
     try:
         _discover_final_turn_checkpoints(session_id)
     except Exception as exc:
         logger.warning("pz-memory-v1: SessionDB discovery entered degraded mode: %s", exc)
-    try:
-        _recover_pending_turn_checkpoints()
-    except Exception as exc:
-        logger.warning("pz-memory-v1: checkpoint recovery entered degraded mode: %s", exc)
 
 
 def _write_hermes_recall_evidence(
@@ -1285,4 +1291,12 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("on_session_end", on_session_end)
     ctx.register_hook("on_session_finalize", on_session_finalize)
-    logger.info("pz-memory-v1 plugin registered lifecycle hooks (on_session_start, pre_llm_call, on_session_end, on_session_finalize)")
+    # Plugin registration is Hermes's native per-process startup point.  It is
+    # intentionally raw-only: cursor-authorized SessionDB discovery can make a
+    # crashed completed turn durable without re-entering PluginLlm while the
+    # plugin manager is loading, or writing a session-scoped semantic marker.
+    try:
+        _discover_final_turn_checkpoints()
+    except Exception as exc:
+        logger.warning("pz-memory-v1: native plugin-startup discovery degraded: %s", exc)
+    logger.info("pz-memory-v1 plugin registered lifecycle hooks and raw startup discovery")

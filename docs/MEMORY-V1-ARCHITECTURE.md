@@ -73,7 +73,8 @@ completed assistant turn (Codex/Claude Stop; Hermes next pre_llm_call)
   -> no provider call on the normal path
   -> PreCompact or SessionEnd consumes pending material and promotes once
   -> same-session identical source adds events_seen without another pipeline pass
-  -> startup recovery or the documented 32-turn bound can promote pending raw state
+  -> native terminal boundary can promote pending raw state
+  -> native plugin startup can only raw-stage a tracked crashed turn
 ```
 
 The workstation queue stores only the final completed USER/ASSISTANT pair,
@@ -91,17 +92,32 @@ session state record `status=empty` plus `source_digest` is the semantic
 tombstone for an identical later boundary, which only merges `events_seen`
 without re-calling the provider.  Provider failures settle nothing.
 
-Hermes startup first uses supported read-only SessionDB/profile discovery with
-an explicit 20-session-per-profile bound.  Its 128-entry local cursor contains
-only profile/database/session identity and final-turn digest: only sessions
-observed through a real `on_session_start` are baseline-only armed.  The active
-session is armed from `get_hermes_home()/state.db` even before Hermes persists
-its SessionDB row; an existing first-sighting digest is baseline-only.  Thus
-unrelated recent historical sessions remain untracked and cannot replay.  A
-changed digest on a previously armed session stages the canonical raw checkpoint and
-leaves semantic promotion to the existing recovery path.  Per-profile failures
-and checkpoint-write failures degrade safely without advancing past the
-affected digest.
+In deployed Hermes 0.19.0, plugin registration is a native per-CLI-process
+startup point after the active `HERMES_HOME` is selected. It does not imply a
+SessionStart callback: `on_session_start` runs only in the first new user turn
+after system-prompt construction, while a CLI at its initial prompt and an
+exact-session resume with zero input invoke neither SessionStart nor
+`pre_llm_call`. `pre_llm_call` runs in every actual user-turn prologue.
+
+Registration therefore uses supported read-only SessionDB/profile access only
+to exact-read already tracked cursor identities. The 128-entry cursor contains
+only profile/database/session identity and final-turn digest; it is the
+authority for bounded startup discovery, so unrelated history is neither armed
+nor exported and a tracked crash remains recoverable outside a recent-20
+window. A real `on_session_start` alone baseline-arms a new active session
+from `get_hermes_home()/state.db` even before Hermes persists its SessionDB
+row. An existing first-sighting digest is baseline-only. A changed digest on a
+previously armed session stages the canonical raw checkpoint; failures never
+advance the cursor beyond an unwritten checkpoint.
+
+Neither registration nor SessionStart performs semantic checkpoint recovery:
+the current durable completion marker is session-scoped, so startup promotion
+could otherwise suppress later turns in a session the user continues. Raw
+durability is immediate at native plugin startup; semantic promotion remains a
+native terminal-boundary action until a separately safe per-turn completion
+model exists. Canary `20260901_134450_bf9e17` documented pre-persist arming,
+and `20260902_172739_4b7b32` documented that initial input readiness is not a
+SessionStart callback; neither is acceptance PASS.
 
 Runtime semantics are deliberately not unified:
 
@@ -109,7 +125,7 @@ Runtime semantics are deliberately not unified:
 | --- | --- | --- |
 | Codex CLI | `Stop` (completed assistant turn) | source/test covered; native lifecycle canary still required after hook installation |
 | Claude Code | `Stop` operator candidate | source/test covered; native runtime proof remains unverified |
-| Hermes | `pre_llm_call` snapshots the previous completed SessionDB turn | terminal callbacks and startup recovery use PluginLlm; VPS deployment evidence remains required |
+| Hermes | `pre_llm_call` snapshots the previous completed SessionDB turn | terminal callbacks use PluginLlm; plugin startup is raw-only; VPS deployment evidence remains required |
 | Codex Desktop/App | unknown | no CLI behavior is inferred |
 
 ### Shared-memory terminology and native-memory boundary

@@ -150,15 +150,21 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
 
     def test_plugin_registration(self):
         plugin = load_hermes_plugin()
-        registered = {}
+        registered = []
 
         class MockCtx:
             def register_hook(self, name, cb):
-                registered[name] = cb
+                registered.append((name, cb))
 
-        plugin.register(MockCtx())
-        self.assertIn("on_session_end", registered)
-        self.assertIn("on_session_finalize", registered)
+        with mock.patch.object(plugin, "_discover_final_turn_checkpoints") as discover:
+            plugin.register(MockCtx())
+        self.assertEqual([
+            ("on_session_start", plugin.on_session_start),
+            ("pre_llm_call", plugin.pre_llm_call),
+            ("on_session_end", plugin.on_session_end),
+            ("on_session_finalize", plugin.on_session_finalize),
+        ], registered)
+        discover.assert_called_once_with()
 
     def test_plugin_never_chmods_shared_hermes_data_root(self):
         plugin_source = (Path(__file__).resolve().parent.parent.parent / "hermes_plugins" / "pz-memory-v1" / "__init__.py").read_text(encoding="utf-8")
@@ -519,9 +525,9 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
              mock.patch.object(plugin, "_recover_pending_turn_checkpoints") as recover, \
              mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
             plugin.on_session_start(session_id="different-current")
-            recover.assert_called_once()
+            recover.assert_not_called()
             summarize.assert_not_called()
-            self.assertEqual([(calls["search"][0][0], None, plugin.MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE, 0)], calls["search"])
+            self.assertEqual([], calls["search"])
             self.assertTrue(all(calls["read_only"]))
             self.assertEqual([], calls["exports"])
             self.assertEqual([], plugin._checkpoint_paths("historic-1"))
@@ -677,8 +683,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
                 "schema": plugin.DISCOVERY_CURSOR_SCHEMA, "sessions": {identity: entry},
             }))
             plugin.on_session_start(session_id="current")
-            self.assertEqual(1, len(calls["search"]))
-            self.assertEqual(plugin.MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE, calls["search"][0][2])
+            self.assertEqual([], calls["search"])
             self.assertEqual({"tracked", "current"}, {session_id for _, session_id in calls["exports"]})
             self.assertEqual(2, len(calls["exports"]))
             cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
@@ -737,12 +742,64 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
              mock.patch.object(plugin, "_recover_pending_turn_checkpoints"):
             plugin.on_session_start(session_id="outside-window")
-            self.assertEqual(1, len(calls["search"]))
-            self.assertEqual(plugin.MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE, calls["search"][0][2])
+            self.assertEqual([], calls["search"])
             self.assertEqual([(calls["exports"][0][0], "outside-window")], calls["exports"])
             cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
             self.assertEqual(1, len(cursor["sessions"]))
             self.assertEqual([], plugin._checkpoint_paths("outside-window"))
+
+    def test_native_plugin_startup_recovers_tracked_session_outside_recent_window(self):
+        plugin = load_hermes_plugin()
+        recent = [
+            self._fake_session(f"recent-{index:02d}", [{"role": "user", "content": "u"}])
+            for index in range(plugin.MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE)
+        ]
+        tracked = self._fake_session("tracked-outside-window", [
+            {"role": "user", "content": "crashed user"},
+            {"role": "assistant", "content": "durable assistant"},
+        ])
+        patches, calls = self._fake_discovery_runtime({"default": [*recent, tracked]})
+        db_path = self.root / "fake-hermes-profiles" / "default" / "state.db"
+
+        class MockCtx:
+            def register_hook(self, name, callback):
+                return None
+
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), patches, \
+             mock.patch.object(plugin, "_recover_pending_turn_checkpoints") as recover, \
+             mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
+            identity, entry = plugin._discovery_entry(
+                profile="default", database=db_path, session_id="tracked-outside-window",
+                digest=None, observed_at="2026-09-01T00:00:00+03:00",
+            )
+            self.assertTrue(plugin._write_discovery_cursor({
+                "schema": plugin.DISCOVERY_CURSOR_SCHEMA, "sessions": {identity: entry},
+            }))
+            plugin.register(MockCtx())
+            digest = hashlib.sha256(
+                "USER: crashed user\nASSISTANT: durable assistant".encode("utf-8")
+            ).hexdigest()
+            self.assertTrue(Path(plugin._checkpoint_destination("tracked-outside-window", digest)).is_file())
+            self.assertEqual([], calls["search"])
+            self.assertEqual([(calls["exports"][0][0], "tracked-outside-window")], calls["exports"])
+            self.assertFalse(any(session_id.startswith("recent-") for _, session_id in calls["exports"]))
+            recover.assert_not_called()
+            summarize.assert_not_called()
+
+    def test_oversized_discovery_cursor_fails_closed(self):
+        plugin = load_hermes_plugin()
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}):
+            cursor_path = Path(plugin._discovery_cursor_path())
+            cursor_path.parent.mkdir(parents=True, exist_ok=True)
+            cursor_path.write_text(json.dumps({
+                "schema": plugin.DISCOVERY_CURSOR_SCHEMA,
+                "sessions": {str(index): {} for index in range(
+                    plugin.MAX_STARTUP_DISCOVERY_CURSOR_ENTRIES + 1
+                )},
+            }), encoding="utf-8")
+            cursor, cursor_ok = plugin._load_discovery_cursor()
+            self.assertFalse(cursor_ok)
+            self.assertEqual({}, cursor)
 
     def test_startup_and_pre_llm_share_checkpoint_identity(self):
         plugin = load_hermes_plugin()
@@ -850,8 +907,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             calls["search"].clear()
             calls["exports"].clear()
             plugin.on_session_start()
-            self.assertEqual(1, len(calls["search"]))
-            self.assertEqual(plugin.MAX_STARTUP_DISCOVERY_SESSIONS_PER_PROFILE, calls["search"][0][2])
+            self.assertEqual([], calls["search"])
             self.assertEqual([(calls["exports"][0][0], "bounded-0")], calls["exports"])
             cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
             self.assertEqual(1, len(cursor["sessions"]))

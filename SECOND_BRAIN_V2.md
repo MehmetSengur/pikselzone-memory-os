@@ -49,21 +49,33 @@ without another provider call.  Provider failures leave pending material
 retryable.  V2.2 is not production activated; Hermes final-turn recovery
 remains a blocker.
 
-Hermes startup now performs a bounded (20 recent sessions per supported
-profile) read-only SessionDB discovery before pending-checkpoint recovery.  A
-local, transcript-free cursor arms only sessions observed through a real
-`on_session_start` as a non-replaying baseline; unrelated recent historical
-sessions remain untracked.  Only a later final-turn digest change can create
-the same canonical raw checkpoint that `pre_llm_call` would create.  This
-remains raw-only and provider-free until existing recovery handles the
-checkpoint.  Native VPS acceptance is still required before activation.
+Deployed Hermes 0.19.0 invokes plugin registration once per CLI process after
+the active `HERMES_HOME` has been selected, but does not invoke
+`on_session_start` when a CLI merely reaches its initial input prompt. That
+hook runs during the first new user turn after system-prompt construction; it
+does not run on exact-session continuation. `pre_llm_call` runs in each actual
+user-turn prologue. Therefore plugin registration performs only bounded,
+provider-free raw discovery for identities already present in the 128-entry
+local cursor. It exact-reads those stored database/session identities, rather
+than scanning recent history, so a tracked crash can remain recoverable after
+it falls outside a recent-session window. Unrelated historical sessions are
+never armed or exported by registration.
 
-A real Hermes `SessionStart` arms its active session from the public active
-Hermes home even before Hermes persists a SessionDB row: the initial cursor
-digest is `null`.  If that row already exists at first sighting, its current
-final-turn digest is baseline-only and is never replayed.  The failed native
-canary `20260901_134450_bf9e17` exposed the SessionStart-before-SessionDB
-ordering; it is implementation evidence only, not native-acceptance PASS.
+A real Hermes `on_session_start` remains the sole authority to arm a new
+session from the public active Hermes home even before Hermes persists a
+SessionDB row: the initial cursor digest is `null`. If that row already exists
+at first sighting, its current final-turn digest is baseline-only and is never
+replayed. Registration and SessionStart discovery stage only the canonical raw
+checkpoint; neither invokes `PluginLlm` nor writes semantic completion because
+completion is currently session-scoped and must not suppress later turns in a
+continued session. Semantic promotion remains at a native terminal boundary
+pending a separately safe per-turn completion model.
+
+The failed native canary `20260901_134450_bf9e17` exposed the
+SessionStart-before-SessionDB persistence ordering. The failed native canary
+`20260902_172739_4b7b32` exposed that initial CLI input-prompt readiness does
+not itself invoke SessionStart. Both are contract-discovery evidence only, not
+native-acceptance PASS.
 
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
