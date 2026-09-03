@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import (
-    MemoryConfig, MemoryError, PolicyError, ProviderBlocked, SchemaError,
+    BARE_CONCEPT_DENYLIST, MemoryConfig, MemoryError, PolicyError, ProviderBlocked, SchemaError,
     atomic_json, atomic_write, compiler_json_schema, ensure_safe_directory,
     directive_shaped, exclusive_lock, iso_now, knowledge_relative_path, path_within,
     redact_sensitive_text, reject_symlink_chain, secure_read_file,
@@ -38,8 +38,12 @@ aliases, tags, sources, created, and updated metadata plus core summary,
 important points, details, related-concept wikilinks, and sources sections.
 Connections should name both concepts and preserve evidence provenance. Keep
 index as Article | Summary | Source | Updated and append compiler history to
-log. If nothing durable should change, return status=no_changes and an empty
-writes list."""
+log. A single status or artefact word (PASS, FAIL, app, api, test, error, done,
+status, ...) is never a durable concept; skip it. When an event records a
+problem and an attempt, keep problem / what-was-tried / outcome / why-it-failed
+together in the concept so a future project can avoid the same mistake. If
+nothing durable should change, return status=no_changes and an empty writes
+list."""
 
 
 class TerraCompiler:
@@ -226,6 +230,10 @@ class TerraCompiler:
             if not isinstance(item, dict) or set(item) != {"path", "content"}:
                 raise SchemaError("compiler-write-invalid")
             path = str(knowledge_relative_path(str(item["path"])))
+            if path.startswith("knowledge/concepts/"):
+                slug = path[len("knowledge/concepts/"):].removesuffix(".md")
+                if slug in BARE_CONCEPT_DENYLIST:
+                    raise PolicyError(f"compiler-generic-bare-concept:{slug}")
             content = item["content"]
             if not isinstance(content, str) or not content.strip():
                 raise SchemaError("compiler-content-invalid")
