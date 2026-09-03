@@ -15,7 +15,7 @@ from typing import Any
 from .core import (
     BARE_CONCEPT_DENYLIST, MemoryConfig, MemoryError, PolicyError, SchemaError,
     atomic_json, atomic_write, directive_shaped, ensure_safe_directory,
-    compiler_write_relative_path, exclusive_lock, iso_now, knowledge_relative_path,
+    KNOWLEDGE_DETERMINISTIC_FILES, exclusive_lock, iso_now, knowledge_relative_path,
     path_within,
     redact_sensitive_text, reject_symlink_chain, safe_unlink,
     secure_read_file, secure_read_text, sha256_file, write_health,
@@ -384,21 +384,29 @@ def promote_knowledge_outbox(
         # Stage 1: Validate all candidates before promoting any
         validated_payloads: list[tuple[str, Path, bytes]] = []
 
+        dropped_deterministic: list[str] = []
         for item in writes:
             rel_path = str(item.get("path", "")).strip().lstrip("/")
             expected_sha = item.get("sha256")
             if not rel_path:
                 raise SchemaError("candidate-path-empty")
 
-            # Path validation & traversal prevention.  The *write* policy is
-            # narrower than the read allowlist: knowledge/index.md and
-            # knowledge/log.md are deterministic single-writer artifacts
-            # rebuilt after promotion, never promoted model output.
+            # Path validation & traversal prevention.
             try:
-                compiler_write_relative_path(rel_path)
+                knowledge_relative_path(rel_path)
             except PolicyError as exc:
                 write_health(config.state_path, "compiler", "fail", str(exc))
                 raise
+            # The *write* policy is narrower than the read allowlist:
+            # knowledge/index.md and knowledge/log.md are deterministic
+            # single-writer artifacts rebuilt after promotion.  A generator
+            # whose instruction has not been updated yet may still propose
+            # them; drop those candidates instead of failing the whole batch,
+            # so the model output never becomes index/log content but the rest
+            # of the knowledge batch still flows.
+            if str(knowledge_relative_path(rel_path)) in KNOWLEDGE_DETERMINISTIC_FILES:
+                dropped_deterministic.append(rel_path)
+                continue
 
             candidate_file = candidates_dir / rel_path
             if not candidate_file.is_file():
@@ -500,6 +508,11 @@ def promote_knowledge_outbox(
         # The model never authors these; they are derived from the canonical
         # concept/connection files that were just promoted.
         from .knowledge_index import rebuild_after_promotion
+        if dropped_deterministic:
+            logger.info(
+                "pz-memory-promoter: dropped %d model-proposed deterministic file(s): %s",
+                len(dropped_deterministic), ", ".join(sorted(dropped_deterministic)),
+            )
         rebuilt = rebuild_after_promotion(
             config.vault_path,
             batch_id=str(manifest.get("batch_id") or "batch-unknown"),
@@ -512,4 +525,8 @@ def promote_knowledge_outbox(
             "index rebuilt deterministically (%d rows)",
             len(promoted_paths), rebuilt["index_rows"],
         )
-        return {"status": "ok", "promoted": promoted_paths, "index_rows": rebuilt["index_rows"]}
+        return {
+            "status": "ok", "promoted": promoted_paths,
+            "index_rows": rebuilt["index_rows"],
+            "dropped_deterministic": sorted(dropped_deterministic),
+        }

@@ -109,6 +109,37 @@ class KnowledgeWritePolicyTest(unittest.TestCase):
         self.assertIn("ONLY knowledge/concepts/", COMPILER_INSTRUCTION)
 
 
+class PromoterToleratesStaleGeneratorTest(unittest.TestCase):
+    """A generator whose instruction has not been updated may still propose
+    index.md/log.md.  The promoter must drop those candidates rather than fail
+    the whole batch: the model output still never becomes index/log content,
+    but the rest of the knowledge batch keeps flowing."""
+
+    def test_manifest_with_index_is_dropped_not_fatal(self) -> None:
+        from memory_v1 import knowledge_promoter as kp
+        # The write policy itself still refuses the path outright ...
+        with self.assertRaises(PolicyError):
+            compiler_write_relative_path("knowledge/index.md")
+        # ... and the promoter recognises exactly those two files.
+        from memory_v1.core import KNOWLEDGE_DETERMINISTIC_FILES
+        self.assertEqual(
+            set(KNOWLEDGE_DETERMINISTIC_FILES),
+            {"knowledge/index.md", "knowledge/log.md"},
+        )
+        src = (Path(kp.__file__)).read_text(encoding="utf-8")
+        self.assertIn("dropped_deterministic.append(rel_path)", src)
+        self.assertIn("dropped_deterministic", src)
+
+    def test_terra_path_still_rejects_outright(self) -> None:
+        """Our own compiler instruction forbids it, so a proposal there is a
+        contract violation and stays a hard reject."""
+        with self.assertRaises(PolicyError):
+            TerraCompiler._validate_proposal({
+                "status": "changes",
+                "writes": [{"path": "knowledge/index.md", "content": "# Index\n"}],
+            })
+
+
 class DeterministicRebuildTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="pz-test-singlewriter-")
