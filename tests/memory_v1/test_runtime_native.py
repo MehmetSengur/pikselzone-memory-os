@@ -629,6 +629,10 @@ class RuntimeNativeTests(unittest.TestCase):
 
     def test_codex_stop_hook_checkpoints_without_spawning_provider_worker(self):
         cfg = self._make_config()
+        repo = self.root / "repo"
+        repo.mkdir()
+        from memory_v1 import project_registry
+        project_registry.register(cfg.state_path, repo, "demo")
         transcript_file = self.root / "stop-hook.jsonl"
         transcript_file.write_text(
             json.dumps({"role": "user", "content": "Keep this."}) + "\n"
@@ -637,7 +641,7 @@ class RuntimeNativeTests(unittest.TestCase):
         )
         payload = json.dumps({
             "session_id": "sess-stop-hook-1", "turn_id": "turn-001",
-            "transcript_path": str(transcript_file),
+            "transcript_path": str(transcript_file), "cwd": str(repo),
         })
         with mock.patch.object(hook_runner.MemoryConfig, "load", return_value=cfg), \
              mock.patch.object(hook_runner, "_spawn_drain") as spawn, \
@@ -645,11 +649,38 @@ class RuntimeNativeTests(unittest.TestCase):
             rc = hook_runner.main([
                 "--config", str(self.root / "config.json"),
                 "--runtime", "codex", "--event", "Stop",
+                "--project", "demo", "--project-root", str(repo),
             ])
         self.assertEqual(0, rc)
         spawn.assert_not_called()
         pending = list((self.state / "queue" / "pending").glob("*.json"))
         self.assertEqual(1, len(pending))
+        checkpoint = json.loads(pending[0].read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint["project"], "demo")
+        self.assertEqual(checkpoint["continuity_scope"], "demo")
+
+    def test_stop_hook_capture_off_without_registration(self):
+        cfg = self._make_config()
+        transcript_file = self.root / "unreg.jsonl"
+        transcript_file.write_text(
+            json.dumps({"role": "user", "content": "x"}) + "\n"
+            + json.dumps({"role": "assistant", "content": "y"}) + "\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(hook_runner.MemoryConfig, "load", return_value=cfg), \
+             mock.patch.object(hook_runner, "_spawn_drain") as spawn, \
+             mock.patch("sys.stdin", io.StringIO(json.dumps({
+                 "session_id": "s", "transcript_path": str(transcript_file),
+             }))):
+            rc = hook_runner.main([
+                "--config", str(self.root / "config.json"),
+                "--runtime", "codex", "--event", "Stop",
+            ])
+        self.assertEqual(0, rc)
+        spawn.assert_not_called()
+        self.assertFalse((self.state / "queue" / "pending").exists())
+        health = json.loads((self.state / "health" / "capture-codex.json").read_text(encoding="utf-8"))
+        self.assertEqual(health["status"], "off")
 
     # 33. Automatic worker receipt and evidence generation
     def test_automatic_worker_receipt_and_evidence_generation(self):

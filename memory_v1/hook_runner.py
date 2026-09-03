@@ -46,6 +46,43 @@ def _spawn_drain(config_path: Path, queue_path: Path, log_path: Path) -> None:
         )
 
 
+def _clean_continue() -> int:
+    print(json.dumps({"continue": True}))
+    return 0
+
+
+def _resolve_scope(config: MemoryConfig, args, payload: dict) -> tuple[bool, str, str | None, str | None]:
+    """Apply the single authority rule (plan §1c).
+
+    Returns ``(capture_on, project, continuity_scope, off_reason)``.  Hermes
+    never goes through the registry gate: it always captures, its continuity
+    scope is "hermes" and its event provenance is "unscoped".
+    """
+    if args.runtime == "hermes":
+        return True, "unscoped", "hermes", None
+    from .project_registry import resolve_capture
+    cwd = (
+        os.environ.get("CLAUDE_PROJECT_DIR")
+        or (payload.get("cwd") if isinstance(payload.get("cwd"), str) else None)
+        or (payload.get("workdir") if isinstance(payload.get("workdir"), str) else None)
+        or os.getcwd()
+    )
+    decision = resolve_capture(
+        config.state_path, cwd=cwd,
+        project=args.project, project_root=args.project_root,
+    )
+    if not decision.capture:
+        try:
+            write_health(
+                config.state_path, f"capture-{args.runtime}", "off",
+                f"{decision.reason}:{str(cwd)[:200]}",
+            )
+        except OSError:
+            pass
+        return False, "unscoped", None, decision.reason
+    return True, decision.project or "unscoped", decision.project, None
+
+
 def main(argv: list[str] | None = None) -> int:
     if os.environ.get("PZ_MEMORY_INVOKED_BY") == "memory-v1":
         return 0
@@ -53,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--runtime", required=True, choices=("codex", "claude", "hermes"))
     parser.add_argument("--event", required=True)
+    parser.add_argument("--project", default=None)
+    parser.add_argument("--project-root", dest="project_root", default=None)
     args = parser.parse_args(argv)
     config = MemoryConfig.load(args.config)
     try:
@@ -63,6 +102,62 @@ def main(argv: list[str] | None = None) -> int:
             (log_dir / f"hook-{args.runtime}-{args.event}-stdin.json").write_text(raw_stdin, encoding="utf-8")
         except OSError:
             pass
+
+        try:
+            gate_payload = load_hook_input(None, raw_stdin)
+        except MemoryError:
+            gate_payload = {}
+        capture_on, project, continuity_scope, off_reason = _resolve_scope(
+            config, args, gate_payload
+        )
+
+        if not capture_on:
+            # Fail-closed: no transcript or vault content is read.
+            if args.event == "SessionStart":
+                warn = (
+                    "[MEMORY] Bu repo Memory OS kaydıyla eşleşmiyor "
+                    f"({off_reason}) — hafıza yakalama KAPALI. Düzeltmek için: "
+                    "memory register <path> --project <ad>"
+                )
+                print(json.dumps({
+                    "continue": True,
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart", "additionalContext": warn,
+                    },
+                }, ensure_ascii=False))
+                return 0
+            return _clean_continue()
+
+        if args.event == "UserPromptSubmit":
+            from .recall import associative_recall_fast
+            prompt = ""
+            for key in ("prompt", "user_input", "userPrompt", "user_prompt", "message", "text"):
+                value = gate_payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    prompt = value
+                    break
+            rendered = ""
+            try:
+                if prompt:
+                    rendered = associative_recall_fast(config, prompt)
+            except Exception as exc:  # fail-open: a slow/broken recall never blocks the turn
+                try:
+                    write_health(
+                        config.state_path, f"assoc-recall-{args.runtime}", "blocked",
+                        str(exc)[:200],
+                    )
+                except OSError:
+                    pass
+                rendered = ""
+            if rendered:
+                print(json.dumps({
+                    "continue": True,
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit", "additionalContext": rendered,
+                    },
+                }, ensure_ascii=False))
+                return 0
+            return _clean_continue()
 
         if args.event == "SessionStart":
             try:
@@ -100,7 +195,9 @@ def main(argv: list[str] | None = None) -> int:
                     or "startup"
                 )
             bundle = build_startup_recall_bundle(
-                config, runtime=args.runtime, session_key=startup_session_id
+                config, runtime=args.runtime, session_key=startup_session_id,
+                continuity_scope=continuity_scope,
+                project_filter=(continuity_scope if args.runtime != "hermes" else "unscoped"),
             )
             art_path, art_sha = find_runtime_session_artifact(config, args.runtime, startup_session_id)
             write_recall_evidence(
@@ -138,7 +235,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         payload = load_hook_input(None, raw_stdin)
         queue_path = checkpoint_hook(
-            config, runtime=args.runtime, payload=payload, event_override=args.event
+            config, runtime=args.runtime, payload=payload, event_override=args.event,
+            project=project, continuity_scope=continuity_scope,
         )
         log_dir = config.state_path / "logs"
         ensure_safe_directory(log_dir, create=True)

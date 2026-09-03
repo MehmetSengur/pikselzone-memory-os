@@ -32,6 +32,17 @@ SUMMARY_FIELDS = (
     "open_items", "evidence",
 )
 ALLOWED_KNOWLEDGE_ROOTS = {"concepts", "connections"}
+# Bare, non-referential slugs that are status/artefact words, never durable
+# concepts.  A concept file whose *slug* is exactly one of these is rejected at
+# creation (graph_engine) and heavily down-weighted in retrieval (recall).
+# Multi-word slugs like "trendyol-api" or short proper nouns like "ga4"/"capi"
+# are unaffected -- this is an exact-match denylist, not a stopword filter.
+BARE_CONCEPT_DENYLIST = frozenset({
+    "pass", "fail", "failed", "test", "tests", "error", "errors", "app", "api",
+    "always", "never", "unknown", "success", "result", "results", "status",
+    "done", "todo", "note", "notes", "value", "data", "item", "items", "thing",
+    "step", "steps", "phase", "task", "tasks", "owner", "true", "false", "null",
+})
 SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
     r"private[_-]?key|password|passwd|credential)\b(\s*[:=]\s*[\"']?)"

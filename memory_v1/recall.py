@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .core import (
+    BARE_CONCEPT_DENYLIST,
     MemoryConfig,
     PolicyError,
     SchemaError,
@@ -326,12 +327,30 @@ def _load_identity_and_rules(config: MemoryConfig) -> list[RecallItem]:
     return items
 
 
-def _load_continuity(config: MemoryConfig) -> list[RecallItem]:
-    """Tier B: Load most recent session continuity, active threads, and latest journal."""
+def _load_continuity(
+    config: MemoryConfig, continuity_scope: str | None = None
+) -> list[RecallItem]:
+    """Tier B: Load session continuity, active threads, and latest journal.
+
+    With ``continuity_scope`` (a project slug, or "hermes") Last-Session and
+    Threads are read from ``continuity/<scope>.md`` / ``threads/<scope>.md`` so
+    a session only sees its own project's active state.  Journal stays shared.
+    """
     items: list[RecallItem] = []
 
     # 1. Last Session
-    ls_hit = _find_candidate_path(config.vault_path, "Last-Session.md")
+    if continuity_scope:
+        ls_path = config.vault_path / "continuity" / f"{continuity_scope}.md"
+        ls_hit = (
+            (ls_path, f"continuity/{continuity_scope}.md") if ls_path.is_file() else None
+        )
+        th_path = config.vault_path / "threads" / f"{continuity_scope}.md"
+        scoped_th_hit = (
+            (th_path, f"threads/{continuity_scope}.md") if th_path.is_file() else None
+        )
+    else:
+        ls_hit = _find_candidate_path(config.vault_path, "Last-Session.md")
+        scoped_th_hit = None
     if ls_hit:
         full_path, rel_path = ls_hit
         try:
@@ -354,7 +373,7 @@ def _load_continuity(config: MemoryConfig) -> list[RecallItem]:
             logger.warning("Error reading Last-Session file %s: %s", rel_path, exc)
 
     # 2. Threads
-    th_hit = _find_candidate_path(config.vault_path, "Threads.md")
+    th_hit = scoped_th_hit if continuity_scope else _find_candidate_path(config.vault_path, "Threads.md")
     if th_hit:
         full_path, rel_path = th_hit
         try:
@@ -470,8 +489,18 @@ def _load_knowledge_index_entries(config: MemoryConfig, query: str = "") -> list
     return items
 
 
-def _load_recent_daily_tail(config: MemoryConfig, max_events: int = 3, query: str = "") -> list[RecallItem]:
-    """Tier D: Load a small bounded tail of recent daily events."""
+def _load_recent_daily_tail(
+    config: MemoryConfig, max_events: int = 3, query: str = "",
+    *, project_filter: str | None = None,
+) -> list[RecallItem]:
+    """Tier D: Load a small bounded tail of recent daily events.
+
+    ``project_filter`` (a slug, or "unscoped") keeps only events whose
+    frontmatter ``project`` matches: cross-project *knowledge* transfer happens
+    in associative recall, never in the startup recent-session tail.  Legacy
+    events with no ``project`` field match no filter.  ``None`` = pre-V2.3
+    behaviour (every runtime's recent events).
+    """
     daily_root = config.vault_path / "daily"
     if not daily_root.exists():
         return []
@@ -494,6 +523,8 @@ def _load_recent_daily_tail(config: MemoryConfig, max_events: int = 3, query: st
             reject_symlink_chain(path)
             content, digest = secure_read_text(path, root=config.vault_path, max_bytes=512 * 1024)
             event = parse_event_artifact(content)
+            if project_filter is not None and event.get("project") != project_filter:
+                continue
             rel_path = str(path.relative_to(config.vault_path))
 
             # Build condensed bullet representation
@@ -573,9 +604,17 @@ def build_startup_recall_bundle(
     *,
     runtime: str,
     session_key: str = "startup",
+    continuity_scope: str | None = None,
+    project_filter: str | None = None,
     budget_chars: int | None = None,
 ) -> RecallBundle:
-    """Construct the deterministic Startup Recall Bundle V1."""
+    """Construct the deterministic Startup Recall Bundle V1.
+
+    ``continuity_scope`` routes Tier B to a project's own continuity documents;
+    ``project_filter`` restricts the Tier D recent-daily tail to that project's
+    events.  Tier A (identity + rules), Tier C (knowledge index) and Tier E
+    (skills) always stay shared across the Pikselzone workspace.
+    """
     limit = budget_chars or config.context_budget_chars or TARGET_BUDGET_CHARS
     if limit < MIN_MANDATORY_ENVELOPE_CHARS:
         raise ValueError(
@@ -586,9 +625,9 @@ def build_startup_recall_bundle(
 
     # Gather items from all tiers
     tier_a = _load_identity_and_rules(config)
-    tier_b = _load_continuity(config)
+    tier_b = _load_continuity(config, continuity_scope)
     tier_c = _load_knowledge_index_entries(config)
-    tier_d = _load_recent_daily_tail(config, max_events=3)
+    tier_d = _load_recent_daily_tail(config, max_events=3, project_filter=project_filter)
     tier_e = _load_skills_summary(config)
 
     raw_items = tier_a + tier_b + tier_c + tier_d + tier_e
@@ -743,6 +782,117 @@ def build_startup_recall_bundle(
         text=bundle_text,
         selected_item_ids=selected_item_ids,
     )
+
+
+ASSOCIATIVE_RECALL_SCHEMA = "pikselzone-associative-recall-v1"
+ASSOCIATIVE_RECALL_BUDGET = 2400
+ASSOCIATIVE_MIN_SCORE = 6.0
+_TRIVIAL_PROMPTS = frozenset({
+    "tamam", "devam", "devam et", "evet", "hayir", "hayır", "ok", "okay", "peki",
+    "sagol", "sağol", "sağ ol", "tesekkurler", "teşekkürler", "tesekkur ederim",
+    "commit et", "commit", "push", "push et", "bitir", "kapat", "sonraki",
+    "yes", "no", "go", "continue", "next", "thanks", "done",
+})
+
+
+def _concept_slug_from_index_article(article: str) -> str | None:
+    """Pull the concept slug out of an index article cell in any of the link
+    styles the vault has produced ([t](concepts/slug.md), [[concepts/slug|t]],
+    [[knowledge/concepts/slug|t]])."""
+    m = re.search(r"concepts/([a-z0-9][a-z0-9_-]*)", article)
+    return m.group(1) if m else None
+
+
+def associative_recall_fast(
+    config: MemoryConfig,
+    query: str,
+    *,
+    max_items: int = 3,
+    min_score: float = ASSOCIATIVE_MIN_SCORE,
+    budget_chars: int = ASSOCIATIVE_RECALL_BUDGET,
+) -> str:
+    """Bounded, index-first, synchronous cross-project associative recall.
+
+    Called from the UserPromptSubmit hook.  Returns the ``additionalContext``
+    text to inject, or "" for no injection.  Never scans ``concepts/`` or
+    ``connections/`` wholesale, never walks the graph, never writes.
+    Read-only; failures are the caller's responsibility (fail-open).
+    """
+    normalized = " ".join((query or "").lower().split())
+    if (
+        not normalized
+        or normalized in _TRIVIAL_PROMPTS
+        or len(normalized) < 12
+        or len(_tokenize(normalized)) < 3
+    ):
+        return ""
+
+    # 1. Candidate narrowing: score index.md rows only (one file).
+    index_items = _load_knowledge_index_entries(config, query=query)
+    scored = sorted(
+        (it for it in index_items if it.relevance_score > 0),
+        key=lambda it: -it.relevance_score,
+    )[:5]
+    if not scored:
+        return ""
+
+    # 2. Open at most `max_items` candidate concept files and re-score them.
+    concepts_dir = config.vault_path / "knowledge" / "concepts"
+    picked: list[RecallItem] = []
+    seen: set[str] = set()
+    for it in scored:
+        slug = _concept_slug_from_index_article(it.content.split(":", 1)[0])
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        path = concepts_dir / f"{slug}.md"
+        if not path.is_file():
+            continue
+        try:
+            reject_symlink_chain(path)
+            content, digest = secure_read_text(path, root=config.vault_path, max_bytes=512 * 1024)
+        except Exception:
+            continue
+        sanitized, _ = sanitize_untrusted_memory(content)
+        score = score_text_relevance(sanitized, query, title=slug.replace("-", " "))
+        if slug in BARE_CONCEPT_DENYLIST:
+            score *= 0.1
+        if score < min_score:
+            continue
+        picked.append(RecallItem(
+            item_id=f"assoc-{slug}",
+            item_type="knowledge_concept",
+            title=slug.replace("-", " ").title(),
+            content=sanitized[:1400],
+            source_file=f"knowledge/concepts/{slug}.md",
+            source_sha256=digest,
+            relevance_score=score,
+            derived=True,
+        ))
+        if len(picked) >= max_items:
+            break
+
+    if not picked:
+        return ""
+
+    picked.sort(key=lambda it: -it.relevance_score)
+    lines = [
+        "=== PIKSELZONE ASSOCIATIVE RECALL (cross-project) ===",
+        f"Schema: {ASSOCIATIVE_RECALL_SCHEMA}",
+        AUTHORITY_NOTICE,
+        "",
+        "Benzer bir durum Pikselzone hafızasında bulundu. [DERIVED MEMORY — "
+        "operational truth ile doğrula]:",
+        "",
+    ]
+    for it in picked:
+        lines.append(f"### [{it.relevance_score:.1f}] {it.title} (Source: {it.source_file})")
+        lines.append(it.content)
+        lines.append("")
+    rendered = "\n".join(lines)
+    if len(rendered) > budget_chars:
+        rendered = rendered[: budget_chars - 40] + "\n[TRUNCATED_ASSOCIATIVE_RECALL]\n"
+    return rendered
 
 
 def targeted_recall(
