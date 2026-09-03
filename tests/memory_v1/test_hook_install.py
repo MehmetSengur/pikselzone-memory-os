@@ -89,7 +89,10 @@ class TestHookInstall(unittest.TestCase):
         self._do_install()
         cmd = self._claude()["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         self.assertNotIn("cd ", cmd)                       # no cwd change
-        self.assertIn(f"PYTHONPATH={self.mos}", cmd)
+        # A launcher, not `PYTHONPATH=... -m ...`: cwd would otherwise shadow
+        # PYTHONPATH in any repo carrying its own memory_v1/.
+        self.assertNotIn("PYTHONPATH=", cmd)
+        self.assertTrue(cmd.startswith(str(self.mos / "scripts" / "pz-memory-hook")), cmd)
         self.assertIn(f"--config {self.cfg}", cmd)
         self.assertIn("--runtime claude --event SessionStart", cmd)
         self.assertIn("--project luvaa", cmd)

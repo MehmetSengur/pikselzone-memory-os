@@ -6,15 +6,20 @@ repo's ``.claude/settings.local.json`` and ``.codex/hooks.json``:
     SessionStart  SessionEnd  PreCompact  Stop  UserPromptSubmit
 
 Every entry's command is
-``PYTHONPATH=<memory-os> python3 -m memory_v1.hook_runner --config <abs> \\
-  --runtime <rt> --event <E> --project <slug> --project-root <root>``
-(no ``cd`` -- the hook must run in the session's real cwd so the capture gate's
-``verify_under_root`` check works).
+``<memory-os>/scripts/pz-memory-hook --config <abs> --runtime <rt> --event <E>
+  --project <slug> --project-root <root>``
+
+No ``cd`` -- the hook must run in the session's real cwd so the capture gate's
+``verify_under_root`` check works.  The launcher (rather than
+``PYTHONPATH=... python3 -m ...``) is what makes that safe: Python puts the
+current directory ahead of PYTHONPATH, so a project repo carrying its own
+``memory_v1/`` would otherwise shadow the real package and run stale code.
 
 Merges are non-destructive: existing ``permissions``, a ``PreToolUse`` guard,
 and any other hooks are preserved.  Our own entries are identified by the
-``memory_v1.hook_runner`` marker in the command string, so ``unregister`` removes
-exactly those and nothing else.  Both operations are idempotent.
+``pz-memory-hook`` marker in the command string (and the earlier
+``memory_v1.hook_runner`` form), so ``unregister`` removes exactly those and
+nothing else.  Both operations are idempotent.
 """
 from __future__ import annotations
 
@@ -24,7 +29,11 @@ from pathlib import Path
 
 from .core import atomic_write
 
-MEMORY_MARKER = "memory_v1.hook_runner"
+# Our entries are recognised by either marker: the current launcher, and the
+# earlier `python3 -m memory_v1.hook_runner` form, so unregister still cleans
+# up hooks installed before the launcher existed.
+MEMORY_MARKER = "pz-memory-hook"
+MEMORY_MARKERS = (MEMORY_MARKER, "memory_v1.hook_runner")
 MEMORY_EVENTS = ("SessionStart", "SessionEnd", "PreCompact", "Stop", "UserPromptSubmit")
 _EVENT_TIMEOUT = {
     "SessionStart": 5,
@@ -43,8 +52,9 @@ def _command(
     *, memory_os_root: Path, config_path: Path, runtime: str, event: str,
     project: str, project_root: Path,
 ) -> str:
+    launcher = Path(memory_os_root) / "scripts" / "pz-memory-hook"
     return (
-        f"PYTHONPATH={shlex.quote(str(memory_os_root))} python3 -m memory_v1.hook_runner "
+        f"{shlex.quote(str(launcher))} "
         f"--config {shlex.quote(str(config_path))} "
         f"--runtime {runtime} --event {event} "
         f"--project {shlex.quote(project)} "
@@ -60,7 +70,8 @@ def _is_ours(entry: object) -> bool:
     if not isinstance(entry, dict):
         return False
     for hook in entry.get("hooks", []):
-        if isinstance(hook, dict) and MEMORY_MARKER in str(hook.get("command", "")):
+        command = str(hook.get("command", "")) if isinstance(hook, dict) else ""
+        if any(marker in command for marker in MEMORY_MARKERS):
             return True
     return False
 
@@ -196,6 +207,7 @@ def gitignore_unignored(root: Path) -> list[str]:
 
 __all__ = [
     "MEMORY_MARKER",
+    "MEMORY_MARKERS",
     "MEMORY_EVENTS",
     "install",
     "uninstall",

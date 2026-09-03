@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Launcher for the Memory OS lifecycle hook.
+
+Hooks must run in the *session's* real working directory so the capture gate's
+verify_under_root check is meaningful -- so we cannot `cd` into the Memory OS
+checkout.  But a bare `PYTHONPATH=... python3 -m memory_v1.hook_runner` is not
+safe either: Python puts the current directory ahead of PYTHONPATH, so a
+project repo that happens to contain its own `memory_v1/` (operations-repo
+does, from before the standalone split) silently shadows the real package and
+the hook runs stale code.  PYTHONSAFEPATH would fix it but needs Python 3.11+.
+
+This launcher pins the checkout at sys.path[0] itself, so the hook always runs
+this Memory OS regardless of where the session lives.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+_CHECKOUT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+# Drop any cwd-derived entry, then pin the checkout first.
+sys.path = [p for p in sys.path if p not in ("", ".", os.getcwd())]
+sys.path.insert(0, _CHECKOUT)
+
+from memory_v1.hook_runner import main  # noqa: E402  (path pinned above)
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -24,8 +24,10 @@ class TestHookInstallParity(unittest.TestCase):
             for event, groups in hooks.items():
                 command = groups[0]["hooks"][0]["command"]
                 self.assertNotIn("cd ", command)  # runs in the session's real cwd
-                self.assertTrue(command.startswith("PYTHONPATH={{MEMORY_OS_ROOT}} "), command)
-                self.assertIn("memory_v1.hook_runner", command)
+                self.assertNotIn("PYTHONPATH=", command)
+                self.assertTrue(
+                    command.startswith("{{MEMORY_OS_ROOT}}/scripts/pz-memory-hook "), command
+                )
                 self.assertIn(f"--runtime {runtime} --event {event}", command)
                 self.assertIn("--project {{PROJECT}} --project-root {{PROJECT_ROOT}}", command)
 

@@ -1,12 +1,12 @@
 {
-  "_comment": "V2.3 reference template. Do NOT hand-merge: run `memory --config <c> register <root> --project <slug>` which fills the placeholders and merges this non-destructively into the repo's .claude/settings.local.json.",
+  "_comment": "V2.3 reference template. Do NOT hand-merge: run `memory --config <c> register <root> --project <slug>`, which fills the placeholders and merges this non-destructively into the repo's .claude/settings.local.json.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "PYTHONPATH={{MEMORY_OS_ROOT}} python3 -m memory_v1.hook_runner --config {{CONFIG_ABS}} --runtime claude --event SessionStart --project {{PROJECT}} --project-root {{PROJECT_ROOT}}",
+            "command": "{{MEMORY_OS_ROOT}}/scripts/pz-memory-hook --config {{CONFIG_ABS}} --runtime claude --event SessionStart --project {{PROJECT}} --project-root {{PROJECT_ROOT}}",
             "timeout": 5
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PYTHONPATH={{MEMORY_OS_ROOT}} python3 -m memory_v1.hook_runner --config {{CONFIG_ABS}} --runtime claude --event SessionEnd --project {{PROJECT}} --project-root {{PROJECT_ROOT}}",
+            "command": "{{MEMORY_OS_ROOT}}/scripts/pz-memory-hook --config {{CONFIG_ABS}} --runtime claude --event SessionEnd --project {{PROJECT}} --project-root {{PROJECT_ROOT}}",
             "timeout": 10
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PYTHONPATH={{MEMORY_OS_ROOT}} python3 -m memory_v1.hook_runner --config {{CONFIG_ABS}} --runtime claude --event PreCompact --project {{PROJECT}} --project-root {{PROJECT_ROOT}}",
+            "command": "{{MEMORY_OS_ROOT}}/scripts/pz-memory-hook --config {{CONFIG_ABS}} --runtime claude --event PreCompact --project {{PROJECT}} --project-root {{PROJECT_ROOT}}",
             "timeout": 10
           }
         ]
@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PYTHONPATH={{MEMORY_OS_ROOT}} python3 -m memory_v1.hook_runner --config {{CONFIG_ABS}} --runtime claude --event Stop --project {{PROJECT}} --project-root {{PROJECT_ROOT}}",
+            "command": "{{MEMORY_OS_ROOT}}/scripts/pz-memory-hook --config {{CONFIG_ABS}} --runtime claude --event Stop --project {{PROJECT}} --project-root {{PROJECT_ROOT}}",
             "timeout": 10
           }
         ]
@@ -50,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "PYTHONPATH={{MEMORY_OS_ROOT}} python3 -m memory_v1.hook_runner --config {{CONFIG_ABS}} --runtime claude --event UserPromptSubmit --project {{PROJECT}} --project-root {{PROJECT_ROOT}}",
+            "command": "{{MEMORY_OS_ROOT}}/scripts/pz-memory-hook --config {{CONFIG_ABS}} --runtime claude --event UserPromptSubmit --project {{PROJECT}} --project-root {{PROJECT_ROOT}}",
             "timeout": 5
           }
         ]

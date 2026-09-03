@@ -61,7 +61,7 @@ def _effective_read_write_access(path: Path) -> tuple[bool, str]:
 def _project_registry_rows(config: MemoryConfig) -> list[dict[str, str]]:
     """Report V2.3 project registration: which roots are registered, and any
     drift between the registry and the hook files actually installed in them."""
-    from .hook_install import MEMORY_EVENTS, MEMORY_MARKER
+    from .hook_install import MEMORY_EVENTS, MEMORY_MARKERS
     from .project_registry import RegistryError, load_registry
 
     try:
@@ -98,7 +98,7 @@ def _project_registry_rows(config: MemoryConfig) -> list[dict[str, str]]:
                 for event, groups in (hooks or {}).items():
                     for group in groups if isinstance(groups, list) else []:
                         for hook in (group or {}).get("hooks", []):
-                            if MEMORY_MARKER in str(hook.get("command", "")):
+                            if any(m in str(hook.get("command", "")) for m in MEMORY_MARKERS):
                                 installed.add(event)
             missing = set(MEMORY_EVENTS) - installed
             if missing:
