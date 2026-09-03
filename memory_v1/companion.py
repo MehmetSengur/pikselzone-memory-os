@@ -187,12 +187,26 @@ Memory V1'in aşırı korumacı ve pasif yapısı terk edilerek Second Brain V2 
 """
 
 
-class CompanionManager:
-    """Manages reading, updating, and reconciling companion memory files."""
+_CONTINUITY_SCOPE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 
-    def __init__(self, vault_path: Path) -> None:
+
+class CompanionManager:
+    """Manages reading, updating, and reconciling companion memory files.
+
+    When ``continuity_scope`` is given (a project slug, or "hermes"), the
+    operational-continuity documents (Last-Session, Threads, Threads-Archive) are
+    routed to ``<vault>/continuity/<scope>.md`` and ``<vault>/threads/<scope>.md``
+    so per-project active state never bleeds across projects.  Identity (Core),
+    learned rules (Kurallar) and the Journal always stay shared in
+    ``companion/``.  ``continuity_scope=None`` keeps the pre-V2.3 shared layout.
+    """
+
+    def __init__(self, vault_path: Path, continuity_scope: str | None = None) -> None:
         self.vault_path = vault_path.resolve()
         self.companion_dir = self._resolve_companion_dir()
+        if continuity_scope is not None and not _CONTINUITY_SCOPE_RE.fullmatch(continuity_scope):
+            raise SchemaError(f"continuity-scope-invalid:{continuity_scope[:64]}")
+        self.continuity_scope = continuity_scope
 
     def _resolve_companion_dir(self) -> Path:
         # Check standard Avenox directory first, else use standard companion
@@ -202,8 +216,32 @@ class CompanionManager:
         standard = self.vault_path / "companion"
         return standard
 
+    @property
+    def _last_session_path(self) -> Path:
+        if self.continuity_scope:
+            return self.vault_path / "continuity" / f"{self.continuity_scope}.md"
+        return self.companion_dir / "Last-Session.md"
+
+    @property
+    def _threads_path(self) -> Path:
+        if self.continuity_scope:
+            return self.vault_path / "threads" / f"{self.continuity_scope}.md"
+        return self.companion_dir / "Threads.md"
+
+    @property
+    def _threads_archive_path(self) -> Path:
+        if self.continuity_scope:
+            return self.vault_path / "threads" / f"{self.continuity_scope}-Archive.md"
+        return self.companion_dir / "Threads-Archive.md"
+
     def ensure_companion_files(self) -> None:
-        """Create initial companion seed documents if not present."""
+        """Create initial companion seed documents if not present.
+
+        Core / Kurallar / Journal are always shared.  Last-Session and Threads
+        are seeded in ``companion/`` only for the unscoped layout; a scoped
+        manager seeds ``continuity/<scope>.md`` and ``threads/<scope>.md``
+        instead so it never drops an unused shared file.
+        """
         ensure_safe_directory(self.companion_dir, create=True)
         now_str = iso_now()
         date_str = dt.datetime.now().strftime("%Y-%m-%d")
@@ -211,15 +249,30 @@ class CompanionManager:
         seeds = {
             "Core.md": DEFAULT_CORE_SEED.format(now=now_str),
             "Kurallar.md": DEFAULT_RULES_SEED.format(now=now_str),
-            "Last-Session.md": DEFAULT_LAST_SESSION_SEED.format(now=now_str),
-            "Threads.md": DEFAULT_THREADS_SEED.format(now=now_str, date=date_str),
             "Journal.md": DEFAULT_JOURNAL_SEED.format(now=now_str),
         }
+        if not self.continuity_scope:
+            seeds["Last-Session.md"] = DEFAULT_LAST_SESSION_SEED.format(now=now_str)
+            seeds["Threads.md"] = DEFAULT_THREADS_SEED.format(now=now_str, date=date_str)
 
         for filename, content in seeds.items():
             target = self.companion_dir / filename
             if not target.exists():
                 atomic_write(target, content, mode=0o660)
+
+        if self.continuity_scope:
+            ensure_safe_directory(self.vault_path / "continuity", create=True)
+            ensure_safe_directory(self.vault_path / "threads", create=True)
+            if not self._last_session_path.exists():
+                atomic_write(
+                    self._last_session_path,
+                    DEFAULT_LAST_SESSION_SEED.format(now=now_str), mode=0o660,
+                )
+            if not self._threads_path.exists():
+                atomic_write(
+                    self._threads_path,
+                    DEFAULT_THREADS_SEED.format(now=now_str, date=date_str), mode=0o660,
+                )
 
     # -------------------------------------------------------------------------
     # Core / Identity Management
@@ -324,14 +377,16 @@ class CompanionManager:
     # Last-Session (Operational Continuity)
     # -------------------------------------------------------------------------
     def read_last_session(self) -> str:
-        p = self.companion_dir / "Last-Session.md"
+        p = self._last_session_path
         if not p.is_file():
             self.ensure_companion_files()
         text, _ = secure_read_text(p, root=self.vault_path, max_bytes=256 * 1024)
         return text
 
     def write_last_session(self, data: LastSessionData) -> None:
-        p = self.companion_dir / "Last-Session.md"
+        p = self._last_session_path
+        if self.continuity_scope:
+            ensure_safe_directory(self.vault_path / "continuity", create=True)
         now_str = data.updated_at or iso_now()
 
         completed_str = "\n".join(f"- {item}" for item in data.completed_items) or "- Belirtilmedi."
@@ -375,14 +430,14 @@ updated_at: {now_str}
     # Threads Management
     # -------------------------------------------------------------------------
     def read_threads(self) -> str:
-        p = self.companion_dir / "Threads.md"
+        p = self._threads_path
         if not p.is_file():
             self.ensure_companion_files()
         text, _ = secure_read_text(p, root=self.vault_path, max_bytes=256 * 1024)
         return text
 
     def update_thread(self, thread: ThreadItem) -> None:
-        p = self.companion_dir / "Threads.md"
+        p = self._threads_path
         if not p.is_file():
             self.ensure_companion_files()
         text, _ = secure_read_text(p, root=self.vault_path, max_bytes=256 * 1024)
@@ -420,8 +475,8 @@ updated_at: {now_str}
 
     def archive_resolved_threads(self) -> int:
         """Move resolved threads from Threads.md to Threads-Archive.md."""
-        threads_path = self.companion_dir / "Threads.md"
-        archive_path = self.companion_dir / "Threads-Archive.md"
+        threads_path = self._threads_path
+        archive_path = self._threads_archive_path
         if not threads_path.is_file():
             return 0
         text, _ = secure_read_text(threads_path, root=self.vault_path, max_bytes=256 * 1024)

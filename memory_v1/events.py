@@ -34,6 +34,9 @@ FRONTMATTER_FIELDS = {
     "created_at", "source_runtime", "source_model", "root_task_id", "kanban_ids",
     "source_sha256", "secret_redactions", "generated_by", "authority",
 }
+# Optional frontmatter keys tolerated by parse_event_artifact / _validate_event_object.
+OPTIONAL_FRONTMATTER_FIELDS = {"source_provider", "project"}
+_PROJECT_RE = re.compile(r"unscoped|[a-z0-9][a-z0-9-]{0,63}")
 
 
 FLUSH_INSTRUCTION = """You are the Pikselzone Memory V1 session summarizer.
@@ -58,6 +61,7 @@ class EventWriter:
         source_model: str | None = None,
         root_task_id: str | None = None, kanban_ids: list[str] | None = None,
         created_at: str | None = None,
+        project: str | None = None, continuity_scope: str | None = None,
     ) -> Path:
         if runtime not in RUNTIMES or runtime not in self.config.runtimes:
             raise PolicyError("runtime-not-enabled")
@@ -132,6 +136,7 @@ class EventWriter:
                     root_task_id=existing["root_task_id"], kanban_ids=existing["kanban_ids"],
                     source_digest=source_digest, summary=summary,
                     redaction_count=existing["secret_redactions"],
+                    project=existing.get("project") or project,
                 )
                 atomic_write(event_path, rendered.encode("utf-8"), mode=0o640)
                 atomic_json(state_path, {
@@ -204,7 +209,7 @@ class EventWriter:
                 runtime=runtime, agent_id=agent_id, session_id=session_id,
                 event=event, events_seen=events_seen, created_at=timestamp,
                 source_model=actual_source_model, source_provider=source_provider,
-                root_task_id=root_task_id,
+                root_task_id=root_task_id, project=project,
                 kanban_ids=kanban_ids or [], source_digest=source_digest,
                 summary=summary, redaction_count=(
                     input_redactions
@@ -233,7 +238,9 @@ class EventWriter:
             # 3. Knowledge Graph auto-growth (concepts & connections)
             # 4. Skill candidate observation & auto-synthesis
             try:
-                companion_mgr = CompanionManager(self.config.vault_path)
+                companion_mgr = CompanionManager(
+                    self.config.vault_path, continuity_scope=continuity_scope
+                )
                 rule_learner = RuleLearner(companion_mgr)
                 graph_engine = KnowledgeGraphEngine(self.config.vault_path)
                 skill_engine = SkillEngine(self.config.vault_path)
@@ -256,7 +263,7 @@ class EventWriter:
                         decisions=summary.get("decisions", [])[:5],
                         pending_items=summary.get("open_items", [])[:5],
                         next_steps=summary.get("open_items", [])[:3],
-                        active_project=self.config.vault_path.name,
+                        active_project=continuity_scope or project or self.config.vault_path.name,
                         updated_at=timestamp,
                     )
                     companion_mgr.write_last_session(ls_data)
@@ -367,6 +374,7 @@ class EventWriter:
         source_provider: str | None = None,
         root_task_id: str | None, kanban_ids: list[str], source_digest: str,
         summary: dict[str, Any], redaction_count: int,
+        project: str | None = None,
     ) -> str:
         frontmatter = [
             "---",
@@ -382,6 +390,7 @@ class EventWriter:
         ]
         if source_provider:
             frontmatter.append(f"source_provider: {json.dumps(source_provider)}")
+        frontmatter.append(f"project: {json.dumps(project or 'unscoped')}")
         frontmatter.extend([
             f"root_task_id: {json.dumps(root_task_id or 'unknown')}",
             f"kanban_ids: {json.dumps(kanban_ids, ensure_ascii=False)}",
@@ -421,7 +430,7 @@ def parse_event_artifact(text: str) -> dict[str, Any]:
             frontmatter[key] = json.loads(raw.strip())
         except json.JSONDecodeError as exc:
             raise SchemaError(f"event-frontmatter-value-invalid:{key}") from exc
-    allowed_fields = FRONTMATTER_FIELDS | {"source_provider"}
+    allowed_fields = FRONTMATTER_FIELDS | OPTIONAL_FRONTMATTER_FIELDS
     if not FRONTMATTER_FIELDS.issubset(set(frontmatter)) or not set(frontmatter).issubset(allowed_fields):
         raise SchemaError("event-frontmatter-fields-invalid")
     sections: dict[str, list[str]] = {}
@@ -485,3 +494,7 @@ def _validate_event_object(value: dict[str, Any]) -> None:
         raise SchemaError("event-generator-invalid")
     if value["authority"] != "derived-session-memory-not-operational-truth":
         raise SchemaError("event-authority-invalid")
+    if "project" in value and (
+        not isinstance(value["project"], str) or not _PROJECT_RE.fullmatch(value["project"])
+    ):
+        raise SchemaError("event-project-invalid")

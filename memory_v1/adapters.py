@@ -85,6 +85,7 @@ def _validated_transcript_path(
 def flush_hook(
     config: MemoryConfig, *, runtime: str, payload: dict[str, Any],
     event_override: str | None = None, provider: StructuredResponsesProvider | None = None,
+    project: str | None = None, continuity_scope: str | None = None,
 ) -> Path:
     if runtime not in {"codex", "claude", "hermes"}:
         raise SchemaError("hook-runtime-invalid")
@@ -117,6 +118,7 @@ def flush_hook(
         kanban_ids=[
             str(item) for item in payload.get("kanban_ids", []) if isinstance(item, str)
         ] if isinstance(payload.get("kanban_ids", []), list) else [],
+        project=project, continuity_scope=continuity_scope,
     )
 
 
@@ -191,6 +193,7 @@ def find_pending_turn_checkpoint(
 def checkpoint_hook(
     config: MemoryConfig, *, runtime: str, payload: dict[str, Any],
     event_override: str | None = None,
+    project: str | None = None, continuity_scope: str | None = None,
 ) -> Path:
     """Atomically preserve normalized transcript data before compaction returns."""
     if runtime not in config.runtimes:
@@ -244,6 +247,8 @@ def checkpoint_hook(
     atomic_json(queue_path, {
         "schema": "pikselzone-memory-checkpoint-v1",
         "checkpoint_kind": checkpoint_kind,
+        "project": project or "unscoped",
+        "continuity_scope": continuity_scope or None,
         "runtime": runtime,
         "agent_id": _first_text(payload, ("agent_id", "agentId", "agent_name"))
         or f"{runtime}-main",
@@ -361,6 +366,8 @@ def drain_checkpoint(
             transcript=normalized_transcript,
             source_model=flush_value["source_model"], root_task_id=flush_value["root_task_id"],
             kanban_ids=flush_value["kanban_ids"],
+            project=flush_value.get("project"),
+            continuity_scope=flush_value.get("continuity_scope"),
         )
     except DuplicateEvent as exc:
         event_path = Path(str(exc))
