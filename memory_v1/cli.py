@@ -56,6 +56,11 @@ def _parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("--format", choices=("claude", "chatgpt", "codex", "gemini", "markdown"), default=None)
     parity_cmd = commands.add_parser("parity")
     parity_cmd.add_argument("--align", action="store_true", default=True)
+    register_cmd = commands.add_parser("register")
+    register_cmd.add_argument("root", type=Path)
+    register_cmd.add_argument("--project", required=True)
+    unregister_cmd = commands.add_parser("unregister")
+    unregister_cmd.add_argument("root", type=Path)
     return parser
 
 
@@ -182,6 +187,43 @@ def main(argv: list[str] | None = None) -> int:
             mgr = SharedBrainParityManager(config.vault_path)
             report = mgr.align_shared_brain()
             print(json.dumps(dataclasses.asdict(report), ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "register":
+            from .hook_install import gitignore_unignored, install as hook_install
+            from .project_registry import register as registry_register
+            memory_os_root = Path(__file__).resolve().parents[1]
+            cfg_abs = args.config.resolve()
+            entry = registry_register(config.state_path, args.root, args.project)
+            root_path = Path(entry.root)
+            hooks_changed = {
+                rt: hook_install(
+                    root_path, runtime=rt, memory_os_root=memory_os_root,
+                    config_path=cfg_abs, project=entry.project,
+                )
+                for rt in ("claude", "codex")
+            }
+            print(json.dumps({
+                "status": "registered",
+                "project": entry.project,
+                "root": entry.root,
+                "hooks_changed": hooks_changed,
+                "gitignore_not_excluding": gitignore_unignored(root_path),
+            }, ensure_ascii=False))
+            return 0
+        if args.command == "unregister":
+            from .hook_install import uninstall as hook_uninstall
+            from .project_registry import unregister as registry_unregister
+            root_path = args.root.resolve()
+            registry_removed = registry_unregister(config.state_path, root_path)
+            hooks_changed = {
+                rt: hook_uninstall(root_path, runtime=rt) for rt in ("claude", "codex")
+            }
+            print(json.dumps({
+                "status": "unregistered",
+                "root": str(root_path),
+                "registry_removed": registry_removed,
+                "hooks_changed": hooks_changed,
+            }, ensure_ascii=False))
             return 0
     except DuplicateEvent as exc:
         print(json.dumps({"status": "duplicate", "event_path": str(exc)}))
