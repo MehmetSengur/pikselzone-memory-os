@@ -14,7 +14,6 @@ from .core import (
     exclusive_lock, iso_now, normalize_transcript, reject_symlink_chain,
     path_within, session_key, summary_json_schema, validate_summary, write_health,
 )
-from .graph_engine import ConceptData, KnowledgeGraphEngine
 from .provider import StructuredResponsesProvider
 from .rule_learner import RuleLearner
 from .skill_engine import SkillEngine, WorkflowObservation
@@ -240,14 +239,18 @@ class EventWriter:
             # Second Brain Pipeline:
             # 1. Rule learning & deduplication / reconciliation
             # 2. Companion continuity: Last-Session update & Journal log
-            # 3. Knowledge Graph auto-growth (concepts & connections)
-            # 4. Skill candidate observation & auto-synthesis
+            # 3. Skill candidate observation & auto-synthesis
+            #
+            # The shared knowledge/ graph is deliberately NOT touched here.
+            # concepts/, connections/, index.md and log.md have exactly one
+            # canonical writer -- the VPS knowledge compiler -- because two
+            # hosts rewriting the same synced markdown produced unmergeable
+            # Obsidian Sync conflicts and a collapsing index.
             try:
                 companion_mgr = CompanionManager(
                     self.config.vault_path, continuity_scope=continuity_scope
                 )
                 rule_learner = RuleLearner(companion_mgr)
-                graph_engine = KnowledgeGraphEngine(self.config.vault_path)
                 skill_engine = SkillEngine(self.config.vault_path)
 
                 turn_pairs = []
@@ -283,40 +286,6 @@ class EventWriter:
                             narrative=narrative,
                             runtime=runtime,
                         )
-
-                    # Knowledge Graph: Auto-extract concepts from decisions and learnings
-                    created_slugs: list[str] = []
-                    for item_text in decisions + learnings:
-                        terms = re.findall(r"\b[A-Z][a-zA-Z0-9_\-\.]{2,}\b", item_text)
-                        for term in terms:
-                            if term.lower() not in {
-                                "the", "this", "that", "with", "from", "when", "then",
-                                "true", "false", "none", "null", "user", "assistant"
-                            }:
-                                try:
-                                    c_path = graph_engine.add_or_update_concept(ConceptData(
-                                        title=term,
-                                        summary=item_text[:140],
-                                        details=[f"{event} ({runtime}): {item_text}"],
-                                        sources=[f"{runtime}:{state_key}"],
-                                    ))
-                                except PolicyError:
-                                    continue  # generic bare slug -> skip, keep the rest
-                                if c_path.stem not in created_slugs:
-                                    created_slugs.append(c_path.stem)
-
-                    # Connect concepts co-occurring in this session
-                    if len(created_slugs) >= 2:
-                        for i in range(len(created_slugs) - 1):
-                            sa, sb = created_slugs[i], created_slugs[i + 1]
-                            if sa != sb:
-                                graph_engine.add_or_update_connection(
-                                    concept_a=sa,
-                                    concept_b=sb,
-                                    relationship="aynı oturumda birlikte kararlaştırıldı",
-                                    evidence=[f"{runtime}:{state_key}"],
-                                    source=f"{runtime}:{state_key}",
-                                )
 
                     # Skill Engine: Observe multi-step workflows in conversations and summaries
                     workflow_candidates = []

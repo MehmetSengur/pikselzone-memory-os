@@ -86,9 +86,11 @@ class TestHistoryImportEngine(unittest.TestCase):
         # Verify secret was REDACTED
         self.assertNotIn("sk-proj-1234567890abcdefghijklmn", rules_text)
 
-        # Verify concepts distilled to knowledge/concepts/
-        self.assertTrue((self.vault / "knowledge" / "concepts" / "fastapi.md").is_file())
-        self.assertTrue((self.vault / "knowledge" / "concepts" / "postgresql.md").is_file())
+        # The shared knowledge graph has one canonical writer (the VPS
+        # compiler); the importer distills rules into companion/ and no
+        # longer writes knowledge/concepts directly.
+        self.assertFalse((self.vault / "knowledge" / "concepts" / "fastapi.md").exists())
+        self.assertFalse((self.vault / "knowledge" / "concepts" / "postgresql.md").exists())
 
     # 2. Claude export JSON import
     def test_import_claude_json(self):
@@ -119,8 +121,8 @@ class TestHistoryImportEngine(unittest.TestCase):
         rules_text = (self.vault / "companion" / "Kurallar.md").read_text(encoding="utf-8")
         self.assertIn("restart: always", rules_text)
 
-        # Concept Docker should exist
-        self.assertTrue((self.vault / "knowledge" / "concepts" / "docker.md").is_file())
+        # No direct knowledge write from the importer (single-writer rule).
+        self.assertFalse((self.vault / "knowledge" / "concepts" / "docker.md").exists())
 
     # 3. Markdown chat import
     def test_import_markdown_chat(self):

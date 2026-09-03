@@ -25,7 +25,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .companion import CompanionManager
 from .core import MemoryConfig, PolicyError, atomic_json, atomic_write, iso_now, sha256_bytes
-from .graph_engine import ConceptData, KnowledgeGraphEngine
 from .rule_learner import RuleLearner
 from .skill_engine import SkillEngine, WorkflowObservation
 
@@ -73,7 +72,6 @@ class HistoryImportEngine:
         self.vault_path = config.vault_path
         self.state_path = config.state_path
         self.companion = CompanionManager(self.vault_path)
-        self.graph = KnowledgeGraphEngine(self.vault_path)
         self.rules = RuleLearner(self.companion)
         self.skills = SkillEngine(self.vault_path)
 
@@ -311,15 +309,11 @@ class HistoryImportEngine:
             }
             valid_techs = {e for e in detected_entities if e in tech_whitelist}
 
-            for tech in valid_techs:
-                # Add concept note
-                self.graph.add_or_update_concept(ConceptData(
-                    title=tech,
-                    summary=f"Teknik bileşen: {tech} mimarisi ve kullanımı.",
-                    details=[f"Geçmiş sohbetten aktarıldı: {sess.title}"],
-                    sources=[f"import:{source_format}:{sess.source_id}"],
-                ))
-                concepts_count += 1
+            # Imported history lands in daily/ only.  The shared knowledge/
+            # graph has one canonical writer (the VPS compiler), which picks
+            # these events up on its next batch -- see the import runbook and
+            # memory_v1.knowledge_index.
+            concepts_count += len(valid_techs)
 
             # 4. Extract repeated workflow patterns for skill candidates
             for u_text in user_texts:

@@ -1067,6 +1067,25 @@ def knowledge_relative_path(value: str) -> PurePosixPath:
     raise PolicyError(f"knowledge-path-forbidden:{value[:80]}")
 
 
+KNOWLEDGE_DETERMINISTIC_FILES = ("knowledge/index.md", "knowledge/log.md")
+
+
+def compiler_write_relative_path(value: str) -> PurePosixPath:
+    """Write policy for LLM-proposed knowledge output.
+
+    Narrower than :func:`knowledge_relative_path`, which stays the *read*
+    allowlist for the knowledge snapshot.  ``index.md`` and ``log.md`` are
+    deterministic, single-writer artifacts rebuilt from the canonical concept
+    and connection files after a successful promotion; a model must never
+    propose their contents, otherwise two hosts end up doing divergent
+    whole-file rewrites of the same synced markdown.
+    """
+    path = knowledge_relative_path(value)
+    if str(path) in KNOWLEDGE_DETERMINISTIC_FILES:
+        raise PolicyError(f"knowledge-deterministic-file-not-model-writable:{path}")
+    return path
+
+
 def summary_json_schema() -> dict[str, Any]:
     properties: dict[str, Any] = {
         "status": {"type": "string", "enum": ["memory", "empty"]}

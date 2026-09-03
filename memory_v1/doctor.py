@@ -1071,31 +1071,16 @@ def run_self_healing(config: MemoryConfig) -> dict[str, Any]:
                 missing_articles.append(af)
 
         if needs_index_rebuild or missing_articles:
-            rows = [
-                "# Knowledge Base Index\n\n",
-                "Living concept and connection index for Pikselzone Second Brain.\n\n",
-                "| Article | Summary | Source | Updated |\n",
-                "|---|---|---|---|\n",
-            ]
-            seen_articles = set()
-            for af in sorted(all_articles):
-                is_concept = af.parent.name == "concepts"
-                link = f"[[concepts/{af.stem}|{af.stem}]]" if is_concept else f"[[connections/{af.stem}|{af.stem}]]"
-                if link in seen_articles:
-                    continue
-                seen_articles.add(link)
-                summary_text = "Konsept özeti." if is_concept else "Bağlantı ilişkisi."
-                try:
-                    c_text = af.read_text(encoding="utf-8")
-                    m = re.search(r"## (?:Özet|İlişki Niteliği)\s*\n([^\n#]+)", c_text)
-                    if m:
-                        summary_text = m.group(1).strip()[:100].replace("|", "-")
-                except Exception:
-                    pass
-                rows.append(f"| {link} | {summary_text} | self-heal | {today_str} |\n")
-                indexed_count += 1
-
-            atomic_write(index_file, "".join(rows))
+            # One renderer, one format: the same deterministic rebuild the
+            # compiler runs after a successful promotion.  Self-heal must never
+            # invent a second index shape (that divergence is what produced the
+            # Obsidian Sync conflicts).
+            from .knowledge_index import render_index
+            rendered = render_index(vault)
+            atomic_write(index_file, rendered)
+            indexed_count = sum(
+                1 for line in rendered.splitlines() if line.startswith("| [")
+            )
             repaired_items.append("knowledge/index.md")
             actions_summary["rebuilt_knowledge_index_entries"] = indexed_count
 

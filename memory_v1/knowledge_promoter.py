@@ -15,7 +15,8 @@ from typing import Any
 from .core import (
     BARE_CONCEPT_DENYLIST, MemoryConfig, MemoryError, PolicyError, SchemaError,
     atomic_json, atomic_write, directive_shaped, ensure_safe_directory,
-    exclusive_lock, iso_now, knowledge_relative_path, path_within,
+    compiler_write_relative_path, exclusive_lock, iso_now, knowledge_relative_path,
+    path_within,
     redact_sensitive_text, reject_symlink_chain, safe_unlink,
     secure_read_file, secure_read_text, sha256_file, write_health,
 )
@@ -389,9 +390,12 @@ def promote_knowledge_outbox(
             if not rel_path:
                 raise SchemaError("candidate-path-empty")
 
-            # Path validation & traversal prevention
+            # Path validation & traversal prevention.  The *write* policy is
+            # narrower than the read allowlist: knowledge/index.md and
+            # knowledge/log.md are deterministic single-writer artifacts
+            # rebuilt after promotion, never promoted model output.
             try:
-                knowledge_relative_path(rel_path)
+                compiler_write_relative_path(rel_path)
             except PolicyError as exc:
                 write_health(config.state_path, "compiler", "fail", str(exc))
                 raise
@@ -492,6 +496,20 @@ def promote_knowledge_outbox(
         state["last_changed"] = promoted_paths
         atomic_json(state_path, state)
 
+        # Stage 5: deterministic, single-writer rebuild of the two shared files.
+        # The model never authors these; they are derived from the canonical
+        # concept/connection files that were just promoted.
+        from .knowledge_index import rebuild_after_promotion
+        rebuilt = rebuild_after_promotion(
+            config.vault_path,
+            batch_id=str(manifest.get("batch_id") or "batch-unknown"),
+            promoted=promoted_paths,
+        )
+
         write_health(config.state_path, "compiler", "ok")
-        logger.info("pz-memory-promoter: successfully promoted %d knowledge files", len(promoted_paths))
-        return {"status": "ok", "promoted": promoted_paths}
+        logger.info(
+            "pz-memory-promoter: successfully promoted %d knowledge files, "
+            "index rebuilt deterministically (%d rows)",
+            len(promoted_paths), rebuilt["index_rows"],
+        )
+        return {"status": "ok", "promoted": promoted_paths, "index_rows": rebuilt["index_rows"]}

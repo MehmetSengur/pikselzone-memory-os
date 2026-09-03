@@ -145,10 +145,18 @@ class KnowledgeGraphEngine:
         self.index_file = self.knowledge_dir / "index.md"
         self.log_file = self.knowledge_dir / "log.md"
 
-    def ensure_graph_dirs(self) -> None:
-        """Ensure all required directories and index/log anchors exist."""
+    def ensure_graph_dirs(self, *, seed_anchors: bool = True) -> None:
+        """Ensure the graph directories exist.
+
+        ``seed_anchors=False`` creates only the directories.  Workstation-side
+        callers use it so they never author the shared ``index.md`` / ``log.md``
+        -- those two files have one canonical writer (see
+        :mod:`memory_v1.knowledge_index`).
+        """
         self.concepts_dir.mkdir(parents=True, exist_ok=True)
         self.connections_dir.mkdir(parents=True, exist_ok=True)
+        if not seed_anchors:
+            return
 
         if not self.index_file.is_file():
             initial_index = (

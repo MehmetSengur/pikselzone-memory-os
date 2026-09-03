@@ -134,13 +134,11 @@ def publish_outbox(
                 # Second Brain Pipeline for promoted Hermes event
                 try:
                     from .companion import CompanionManager, LastSessionData
-                    from .graph_engine import KnowledgeGraphEngine, ConceptData
                     from .rule_learner import RuleLearner
                     from .skill_engine import SkillEngine, WorkflowObservation
 
                     companion_mgr = CompanionManager(config.vault_path)
                     rule_learner = RuleLearner(companion_mgr)
-                    graph_engine = KnowledgeGraphEngine(config.vault_path)
                     skill_engine = SkillEngine(config.vault_path)
 
                     # 1. Learn rules from Hermes SessionDB turns or event context
@@ -207,34 +205,13 @@ def publish_outbox(
                             runtime="hermes",
                         )
 
-                    # 3. Knowledge Graph concepts & connections
-                    created_slugs: list[str] = []
-                    for item_text in context_items + decisions + learnings:
-                        terms = re.findall(r"\b[A-Z][a-zA-Z0-9_\-\.]{2,}\b", item_text)
-                        for term in terms:
-                            if term.lower() not in {
-                                "the", "this", "that", "with", "from", "when", "then",
-                                "true", "false", "none", "null", "user", "assistant"
-                            }:
-                                c_path = graph_engine.add_or_update_concept(ConceptData(
-                                    title=term,
-                                    summary=item_text[:140],
-                                    details=[f"{event.get('event', 'session_end')} (hermes): {item_text}"],
-                                    sources=[f"hermes:{session_hash}"],
-                                ))
-                                if c_path.stem not in created_slugs:
-                                    created_slugs.append(c_path.stem)
-                    if len(created_slugs) >= 2:
-                        for i in range(len(created_slugs) - 1):
-                            sa, sb = created_slugs[i], created_slugs[i + 1]
-                            if sa != sb:
-                                graph_engine.add_or_update_connection(
-                                    concept_a=sa,
-                                    concept_b=sb,
-                                    relationship="aynı oturumda birlikte kararlaştırıldı",
-                                    evidence=[f"hermes:{session_hash}"],
-                                    source=f"hermes:{session_hash}",
-                                )
+                    # 3. The shared knowledge/ graph is intentionally NOT
+                    #    written here.  concepts/, connections/, index.md and
+                    #    log.md have a single canonical writer (the VPS
+                    #    knowledge compiler + deterministic post-promotion
+                    #    rebuild in memory_v1.knowledge_index), because two
+                    #    hosts rewriting the same synced markdown produced
+                    #    unmergeable Obsidian Sync conflicts.
 
                     # 4. Skill candidate observation
                     workflow_candidates = []
