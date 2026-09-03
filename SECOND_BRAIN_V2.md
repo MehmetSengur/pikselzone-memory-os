@@ -46,8 +46,9 @@ boundary snapshot is consumed without a daily artifact or Second Brain
 mutation.  The existing `status=empty` and `source_digest` session state is
 the idempotency record for later identical boundaries, which merge their event
 without another provider call.  Provider failures leave pending material
-retryable.  V2.2 is not production activated; Hermes final-turn recovery
-remains a blocker.
+retryable. V2.2 is not production activated; Hermes native turn-durability
+recovery is closed, while the separate stale recall-evidence production gate
+remains pending.
 
 Deployed Hermes 0.19.0 invokes plugin registration once per CLI process after
 the active `HERMES_HOME` has been selected, but does not invoke
@@ -66,16 +67,39 @@ session from the public active Hermes home even before Hermes persists a
 SessionDB row: the initial cursor digest is `null`. If that row already exists
 at first sighting, its current final-turn digest is baseline-only and is never
 replayed. Registration and SessionStart discovery stage only the canonical raw
-checkpoint; neither invokes `PluginLlm` nor writes semantic completion because
-completion is currently session-scoped and must not suppress later turns in a
-continued session. Semantic promotion remains at a native terminal boundary
-pending a separately safe per-turn completion model.
+checkpoint and never invokes `PluginLlm`. In deployed Hermes 0.19.0,
+`on_session_end` is the completed per-`run_conversation()` turn boundary, so
+raw settlement is scoped to the normalized source digest rather than to the
+whole session: an identical digest is idempotent, while a later digest in the
+same session remains eligible. Hermes has no reliable native whole-session
+finalize call site; terminal semantic batching is therefore deferred and is
+not a V2.2 turn-durability blocker.
 
 The failed native canary `20260901_134450_bf9e17` exposed the
 SessionStart-before-SessionDB persistence ordering. The failed native canary
 `20260902_172739_4b7b32` exposed that initial CLI input-prompt readiness does
 not itself invoke SessionStart. Both are contract-discovery evidence only, not
 native-acceptance PASS.
+
+### Hermes native turn-durability acceptance — 2026-09-03
+
+Clean native acceptance at source `1eb9da61693e59296211ba742f4807cedadaef8c`
+proved two completed turns in one real `pz-orchestrator` Hermes session. Each
+native `on_session_end` staged its own isolated canonical raw checkpoint with
+a distinct source digest; the first digest did not suppress the second. Both
+turns made zero per-turn `PluginLlm` calls and no semantic event, the second
+checkpoint survived a SIGKILL of the temporary CLI child, and an exact-session
+resume with zero user input ran native plugin registration without creating a
+duplicate checkpoint. `PZ_MEMORY_BASE_DIR` kept receipts, trace, checkpoints,
+and recall evidence isolated from production. Candidate policy was derived
+from the active manifest while preserving unrelated guarded entries, and the
+five plugin scopes and manifest were restored before policy guard verification.
+
+V2.2 Hermes native turn durability and digest-scoped settlement are closed.
+Terminal semantic batching remains deferred because Hermes 0.19.0 has no
+reliable native whole-session terminal callback. Production V2.2 activation
+remains forbidden; the accepted outstanding production gate is the existing
+stale `companion/Kurallar.md` recall-evidence mismatch.
 
 `PZ_MEMORY_BASE_DIR` redirects every mutable Hermes Memory OS runtime artifact
 for bounded tests and canaries: inbox, cursor, receipts, locks, checkpoints,
