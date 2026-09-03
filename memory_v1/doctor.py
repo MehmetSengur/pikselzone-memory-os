@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .companion import CompanionManager
+from .hook_install import MEMORY_MARKERS
 from .core import (
     MemoryConfig, MemoryError, atomic_json, atomic_write, discover_codex_binary,
     iso_now, path_within, safe_unlink, secure_read_file, secure_read_text,
@@ -61,7 +62,7 @@ def _effective_read_write_access(path: Path) -> tuple[bool, str]:
 def _project_registry_rows(config: MemoryConfig) -> list[dict[str, str]]:
     """Report V2.3 project registration: which roots are registered, and any
     drift between the registry and the hook files actually installed in them."""
-    from .hook_install import MEMORY_EVENTS, MEMORY_MARKERS
+    from .hook_install import MEMORY_EVENTS
     from .project_registry import RegistryError, load_registry
 
     try:
@@ -601,11 +602,12 @@ def _hook_registration_row(
     registered = isinstance(hooks, dict)
     for event in ("SessionStart", "PreCompact", "SessionEnd"):
         commands = _commands(hooks.get(event)) if registered else []
-        expected = (
-            "memory_v1.hook_runner", f"--runtime {runtime}", f"--event {event}"
-        )
+        # Accept either launcher form: scripts/pz-memory-hook (current) or the
+        # earlier `python3 -m memory_v1.hook_runner`.
+        required = (f"--runtime {runtime}", f"--event {event}")
         if not any(
-            all(marker in command for marker in expected)
+            any(m in command for m in MEMORY_MARKERS)
+            and all(marker in command for marker in required)
             and "dangerously-bypass-hook-trust" not in command
             for command in commands
         ):
