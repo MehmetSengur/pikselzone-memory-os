@@ -58,6 +58,61 @@ def _effective_read_write_access(path: Path) -> tuple[bool, str]:
     return (True, "read-write-posix-identity") if permitted else (False, "insufficient")
 
 
+def _project_registry_rows(config: MemoryConfig) -> list[dict[str, str]]:
+    """Report V2.3 project registration: which roots are registered, and any
+    drift between the registry and the hook files actually installed in them."""
+    from .hook_install import MEMORY_EVENTS, MEMORY_MARKER
+    from .project_registry import RegistryError, load_registry
+
+    try:
+        entries = load_registry(config.state_path)
+    except RegistryError as exc:
+        return [_row("project_registry", "fail", str(exc))]
+
+    if not entries:
+        return [_row("project_registry", "warn", "no-registered-projects")]
+
+    by_project: dict[str, list[str]] = {}
+    for entry in entries:
+        by_project.setdefault(entry.project, []).append(entry.root)
+    summary = "; ".join(
+        f"{project}={len(roots)}" for project, roots in sorted(by_project.items())
+    )
+    rows = [_row("project_registry", "pass", f"{len(entries)} roots: {summary}")]
+
+    incomplete: list[str] = []
+    for entry in entries:
+        root = Path(entry.root)
+        for runtime, rel in (
+            ("claude", ".claude/settings.local.json"),
+            ("codex", ".codex/hooks.json"),
+        ):
+            target = root / rel
+            installed = set()
+            if target.is_file():
+                try:
+                    hooks = json.loads(target.read_text(encoding="utf-8")).get("hooks", {})
+                except (OSError, ValueError):
+                    incomplete.append(f"{entry.project}:{runtime}:unreadable")
+                    continue
+                for event, groups in (hooks or {}).items():
+                    for group in groups if isinstance(groups, list) else []:
+                        for hook in (group or {}).get("hooks", []):
+                            if MEMORY_MARKER in str(hook.get("command", "")):
+                                installed.add(event)
+            missing = set(MEMORY_EVENTS) - installed
+            if missing:
+                incomplete.append(
+                    f"{entry.project}:{runtime}:missing={','.join(sorted(missing))}"
+                )
+    rows.append(_row(
+        "project_hook_install",
+        "pass" if not incomplete else "warn",
+        "complete" if not incomplete else "; ".join(incomplete[:6]),
+    ))
+    return rows
+
+
 def run_doctor(config: MemoryConfig) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
     vault = config.vault_path
@@ -156,6 +211,7 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
     checks.append(_graph_health_row(config))
     checks.extend(_event_tree_rows(config))
     checks.append(_memory_secret_row(config))
+    checks.extend(_project_registry_rows(config))
     pending = config.state_path / "queue" / "pending"
     pending_count = len(list(pending.glob("*.json"))) if pending.is_dir() else 0
     checks.append(_row(

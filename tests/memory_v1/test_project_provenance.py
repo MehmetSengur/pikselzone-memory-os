@@ -142,6 +142,34 @@ class ProjectProvenanceTest(unittest.TestCase):
         self.assertTrue((self.vault / "companion" / "Last-Session.md").is_file())
         self.assertFalse((self.vault / "continuity").exists())
 
+    # --- §9: hermes bypasses the registry gate ----------------------
+    def test_hermes_hook_runner_bypasses_registry_gate(self) -> None:
+        import io, json as _json
+        from unittest import mock
+        import memory_v1.hook_runner as hook_runner
+
+        cfg = self._config(["hermes"])
+        payload = _json.dumps({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-hermes-gate",
+            "transcript_path": str(self._transcript("hermes-gate.jsonl")),
+        })
+        with mock.patch.object(hook_runner.MemoryConfig, "load", return_value=cfg), \
+             mock.patch.object(hook_runner, "_spawn_drain") as spawn, \
+             mock.patch("sys.stdin", io.StringIO(payload)):
+            rc = hook_runner.main([
+                "--config", str(self.root / "c.json"),
+                "--runtime", "hermes", "--event", "SessionEnd",
+            ])
+        # No --project, no registry entry: hermes still captures.
+        self.assertEqual(0, rc)
+        spawn.assert_called_once()
+        pending = list((self.root / "state" / "queue" / "pending").glob("*.json"))
+        self.assertEqual(1, len(pending))
+        checkpoint = _json.loads(pending[0].read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint["project"], "unscoped")
+        self.assertEqual(checkpoint["continuity_scope"], "hermes")
+
     # --- CompanionManager scope validation --------------------------
     def test_companion_rejects_bad_scope(self) -> None:
         from memory_v1.core import SchemaError
