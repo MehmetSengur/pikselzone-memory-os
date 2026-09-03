@@ -124,8 +124,12 @@ class TestRecallV1(unittest.TestCase):
         )
 
     def _seed_basic_vault(self):
-        # Canonical operating context
+        # Canonical operating context -- declares itself current, so it still
+        # anchors Tier A identity under the canonical authority contract.
         op_context = (
+            "---\n"
+            "status: active\n"
+            "---\n"
             "# Pikselzone Agency Operating Context\n"
             "## Amac\n"
             "Agency operations coordination and verified human approvals.\n"
@@ -203,7 +207,10 @@ class TestRecallV1(unittest.TestCase):
     def test_hard_cap_truncation(self):
         # Long lines that make the extract exceed HARD_MAX_CHARS
         (self.vault / "canonical" / "Pikselzone Agency Operating Context.md").write_text(
-            "# Huge\n" + (("Sensitive policy line " * 50) + "\n") * 35, encoding="utf-8"
+            "---\nstatus: active\n---\n"
+            + "# Huge\n"
+            + (("Sensitive policy line " * 50) + "\n") * 35,
+            encoding="utf-8",
         )
         bundle = build_startup_recall_bundle(self.config, runtime="claude", budget_chars=25000)
         self.assertLessEqual(bundle.total_chars, HARD_MAX_CHARS)
