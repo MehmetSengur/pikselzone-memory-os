@@ -198,7 +198,6 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
 
     def test_double_flush_prevention(self):
         plugin = load_hermes_plugin()
-        plugin._IN_MEMORY_COMPLETED.clear()
         plugin._IN_MEMORY_EXECUTING.clear()
         sess_id = "sess-test-double-flush-1"
         self.assertTrue(plugin._claim_session(sess_id))
@@ -454,46 +453,58 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         if promoted_evidence_path.exists():
             self.assertFalse(_activation_evidence_valid(cfg, "hermes", promoted_evidence_path, None))
 
-    def test_transient_failure_recovery(self):
+    def test_on_session_end_stages_raw_checkpoint_without_provider_or_settlement(self):
         plugin = load_hermes_plugin()
-        sess_id = "sess-transient-failure-1"
-        date_str = dt.datetime.now().astimezone().strftime("%Y-%m-%d")
-        vault_daily = str(self.vault / "daily" / date_str)
+        sess_id = "sess-per-turn-raw-1"
+        transcript = "USER: hello\nASSISTANT: hi"
+        source_sha = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), \
+             mock.patch.object(plugin, "_get_session_transcript", return_value=(transcript, "gpt-5.4-mini", "task-1", 0)), \
+             mock.patch.object(plugin, "_summarize_with_hermes") as summarize:
+            plugin.on_session_end(session_id=sess_id)
+            summarize.assert_not_called()
+            self.assertEqual(1, len(plugin._checkpoint_paths(sess_id)))
+            self.assertFalse(plugin._is_source_settled(sess_id, source_sha))
 
+    def test_digest_scoped_settlement_allows_second_source_and_retries_failure(self):
+        plugin = load_hermes_plugin()
+        sess_id = "sess-digest-settlement-1"
+        turn_a = "USER: first\nASSISTANT: one"
+        turn_b = "USER: second\nASSISTANT: two"
+        sha_a = hashlib.sha256(turn_a.encode("utf-8")).hexdigest()
+        sha_b = hashlib.sha256(turn_b.encode("utf-8")).hexdigest()
+        summary = {
+            "status": "ok", "context": ["Recovered context"],
+            "important_conversations": [], "decisions": [], "learnings": [],
+            "open_items": [], "evidence": [],
+        }
         with mock.patch.dict(os.environ, {
             "PZ_MEMORY_TEST_MODE": "1",
             "PZ_MEMORY_BASE_DIR": str(self.outbox_root),
-            "PZ_MEMORY_VAULT_DAILY": vault_daily,
+            "PZ_MEMORY_VAULT_DAILY": str(self.vault / "daily" / "2026-09-03"),
         }):
-            plugin._IN_MEMORY_COMPLETED.clear()
+            plugin._IN_MEMORY_SETTLED.clear()
             plugin._IN_MEMORY_EXECUTING.clear()
+            with mock.patch.object(plugin, "_get_session_transcript", return_value=(turn_a, "model", "task", 0)), \
+                 mock.patch.object(plugin, "_summarize_with_hermes", return_value=(summary, "custom", "model")) as summarize:
+                plugin.on_session_finalize(session_id=sess_id)
+                self.assertEqual(1, summarize.call_count)
+                plugin.on_session_finalize(session_id=sess_id)
+                self.assertEqual(1, summarize.call_count)
+            self.assertTrue(plugin._is_source_settled(sess_id, sha_a))
 
-            with mock.patch.object(plugin, "_get_session_transcript", return_value=("USER: hello\nASSISTANT: hi", "gpt-5.4-mini", "task-1", 0)):
-                # 1. First run: summarizer fails (returns None)
-                with mock.patch.object(plugin, "_summarize_with_hermes", return_value=(None, "", "")):
-                    plugin.on_session_end(session_id=sess_id)
-                    # Session must NOT be durably completed
-                    self.assertFalse(plugin._is_session_completed(sess_id, locks_dir=str(self.outbox_root / "state" / "locks")))
+            with mock.patch.object(plugin, "_get_session_transcript", return_value=(turn_b, "model", "task", 0)), \
+                 mock.patch.object(plugin, "_summarize_with_hermes", return_value=(None, "", "")):
+                plugin.on_session_finalize(session_id=sess_id)
+            self.assertFalse(plugin._is_source_settled(sess_id, sha_b))
+            self.assertTrue(plugin._is_source_settled(sess_id, sha_a))
 
-                # 2. Second run: summarizer succeeds
-                summary_ok = {
-                    "status": "ok",
-                    "context": ["Recovered context"],
-                    "important_conversations": [],
-                    "decisions": ["Retry on transient failure"],
-                    "learnings": [],
-                    "open_items": [],
-                    "evidence": [],
-                }
-                with mock.patch.object(plugin, "_summarize_with_hermes", return_value=(summary_ok, "custom", "gpt-5.4-mini")):
-                    plugin.on_session_finalize(session_id=sess_id)
-                    # Now session MUST be durably completed
-                    self.assertTrue(plugin._is_session_completed(sess_id, locks_dir=str(self.outbox_root / "state" / "locks")))
-
-                # 3. Third run: duplicate invocation is ignored
-                with mock.patch.object(plugin, "_render_and_stage_event") as mock_stage:
-                    plugin.on_session_end(session_id=sess_id)
-                    mock_stage.assert_not_called()
+            with mock.patch.object(plugin, "_get_session_transcript", return_value=(turn_b, "model", "task", 0)), \
+                 mock.patch.object(plugin, "_summarize_with_hermes", return_value=(summary, "custom", "model")) as summarize:
+                plugin.on_session_finalize(session_id=sess_id)
+                self.assertEqual(1, summarize.call_count)
+            self.assertTrue(plugin._is_source_settled(sess_id, sha_b))
+            self.assertEqual(2, len(list(self.events_outbox.glob("*.md"))))
 
     def test_sessiondb_turn_checkpoint_is_provider_free_and_idempotent(self):
         plugin = load_hermes_plugin()
@@ -594,26 +605,30 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             "status": "ok", "context": ["isolated"], "important_conversations": [],
             "decisions": [], "learnings": [], "open_items": [], "evidence": [],
         }
-        plugin._IN_MEMORY_COMPLETED.clear()
+        source_sha = "a" * 64
+        plugin._IN_MEMORY_SETTLED.clear()
         plugin._IN_MEMORY_EXECUTING.clear()
         with mock.patch.object(plugin, "BASE_DIR", str(live_base)), \
              mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(isolated_base)}):
             receipt = plugin._record_lifecycle_receipt(session_id, "on_session_end")
             event_path = plugin._render_and_stage_event(
                 session_id=session_id, summary=summary, source_model="model", source_provider="provider",
-                root_task_id="task", source_sha="a" * 64, redactions=0,
+                root_task_id="task", source_sha=source_sha, redactions=0,
                 hook_event="on_session_end", receipt=receipt,
             )
-            plugin._mark_durable_completion(session_id, status="staged-event", event_path=event_path)
+            self.assertTrue(plugin._mark_durable_settlement(
+                session_id, source_sha, status="staged-event", event_path=event_path,
+            ))
             self.assertTrue(plugin._stage_completed_turn_checkpoint(
                 session_id, "USER: isolated\nASSISTANT: complete", "model", "task", 0,
             ))
             self.assertTrue(plugin._checkpoint_paths(session_id))
 
         self.assertTrue(event_path and Path(event_path).is_file())
-        self.assertTrue((isolated_base / "state" / "locks" / f"{session_id}.completed").is_file())
+        self.assertTrue((isolated_base / "state" / "settlements").is_dir())
+        self.assertTrue(plugin._is_source_settled(session_id, source_sha))
         self.assertFalse(live_base.exists())
-        plugin._IN_MEMORY_COMPLETED.clear()
+        plugin._IN_MEMORY_SETTLED.clear()
         plugin._IN_MEMORY_EXECUTING.clear()
 
     def test_unrelated_historical_recent_sessions_remain_untracked(self):
@@ -922,7 +937,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
                 self.assertTrue(plugin._stage_turn_checkpoint("identity-parity"))
             self.assertEqual(expected, plugin._checkpoint_paths("identity-parity"))
 
-    def test_startup_discovery_skips_completed_and_user_only_sessions(self):
+    def test_startup_discovery_stages_new_digest_after_prior_settlement(self):
         plugin = load_hermes_plugin()
         completed = self._fake_session("already-completed", [{"role": "user", "content": "u"}])
         user_only = self._fake_session("user-only", [{"role": "user", "content": "u"}])
@@ -931,10 +946,12 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
              mock.patch.object(plugin, "_recover_pending_turn_checkpoints"):
             plugin.on_session_start(session_id="already-completed")
             completed["messages"].append({"role": "assistant", "content": "done"})
-            plugin._IN_MEMORY_COMPLETED.add("already-completed")
+            self.assertTrue(plugin._mark_durable_settlement(
+                "already-completed", "a" * 64, status="old-source",
+            ))
             plugin.on_session_start(session_id="already-completed")
             plugin.on_session_start(session_id="user-only")
-            self.assertEqual([], plugin._checkpoint_paths("already-completed"))
+            self.assertEqual(1, len(plugin._checkpoint_paths("already-completed")))
             self.assertEqual([], plugin._checkpoint_paths("user-only"))
 
     def test_checkpoint_failure_leaves_tracked_digest_discoverable(self):
@@ -972,9 +989,8 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
                 plugin._recover_pending_turn_checkpoints()
                 self.assertEqual(1, summarize.call_count)
         self.assertFalse(plugin._checkpoint_paths("discovery-memory"))
-        self.assertTrue(plugin._is_session_completed(
-            "discovery-memory", locks_dir=str(self.outbox_root / "state" / "locks"),
-        ))
+        digest = hashlib.sha256("USER: u\nASSISTANT: done".encode("utf-8")).hexdigest()
+        self.assertTrue(plugin._is_source_settled("discovery-memory", digest))
         self.assertEqual(1, len(list(self.events_outbox.glob("*.md"))))
 
     def test_discovery_handoff_recovers_no_memory_without_event_or_replay(self):
@@ -993,9 +1009,8 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
                 plugin._recover_pending_turn_checkpoints()
                 self.assertEqual(1, summarize.call_count)
         self.assertFalse(plugin._checkpoint_paths("discovery-empty"))
-        self.assertTrue(plugin._is_session_completed(
-            "discovery-empty", locks_dir=str(self.outbox_root / "state" / "locks"),
-        ))
+        digest = hashlib.sha256("USER: u\nASSISTANT: done".encode("utf-8")).hexdigest()
+        self.assertTrue(plugin._is_source_settled("discovery-empty", digest))
         self.assertEqual([], list(self.events_outbox.glob("*.md")))
 
     def test_startup_discovery_is_bounded_and_profile_failure_is_degraded(self):
@@ -1028,7 +1043,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             "PZ_MEMORY_BASE_DIR": str(self.outbox_root),
             "PZ_MEMORY_VAULT_DAILY": str(self.vault / "daily" / "2026-08-31"),
         }):
-            plugin._IN_MEMORY_COMPLETED.clear()
+            plugin._IN_MEMORY_SETTLED.clear()
             plugin._IN_MEMORY_EXECUTING.clear()
             with mock.patch.object(
                 plugin, "_get_session_transcript",
@@ -1039,7 +1054,8 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
                 plugin._recover_pending_turn_checkpoints()
                 self.assertEqual(1, summarize.call_count)
             self.assertFalse(plugin._checkpoint_paths(sess_id))
-            self.assertTrue(plugin._is_session_completed(sess_id, locks_dir=str(self.outbox_root / "state" / "locks")))
+            digest = hashlib.sha256("USER: recover\nASSISTANT: pending".encode("utf-8")).hexdigest()
+            self.assertTrue(plugin._is_source_settled(sess_id, digest))
             event_paths = list((self.outbox_root / "outbox" / "events").glob("*.md"))
             self.assertEqual(1, len(event_paths))
             self.assertEqual("checkpoint_recovery", parse_event_artifact(event_paths[0].read_text())["event"])

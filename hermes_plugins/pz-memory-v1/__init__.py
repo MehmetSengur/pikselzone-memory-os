@@ -1,13 +1,15 @@
 """Pikselzone Memory V1 native Hermes lifecycle adapter and outbox writer.
 
 Listens to native Hermes lifecycle events (on_session_end, on_session_finalize).
-Extracts session conversation history via internal hermes_state.SessionDB,
-normalizes and redacts secrets, invokes Hermes-native PluginLlm with the
-configured flush prompt, validates the structured output against Memory V1 schema,
-and atomically writes candidate event markdown artifacts to the shared Memory V1 outbox.
+Extracts durable session conversation history through Hermes SessionDB and
+atomically persists normalized completed-turn checkpoints.  A semantic
+consolidation, when a true terminal callback is available, is deduplicated by
+the normalized source digest rather than by session identity.
 
 Enforces:
-- Single terminal flush per session (no double-flush across on_session_end and on_session_finalize).
+- Raw completed-turn durability at each native on_session_end callback.
+- Digest-scoped semantic settlement; a later turn in the same session is never
+  hidden by settlement of an earlier source digest.
 - Authenticated lifecycle receipt verification: records stack frame caller to guarantee true native invoke.
 - Re-entrancy guard via PZ_MEMORY_INTERNAL_CALL.
 - Zero direct credential access or OpenAI endpoints.
@@ -189,36 +191,55 @@ def _record_lifecycle_receipt(
     return receipt
 
 
-_IN_MEMORY_COMPLETED: set[str] = set()
 _IN_MEMORY_EXECUTING: set[str] = set()
+_IN_MEMORY_SETTLED: set[str] = set()
 
 
-def _is_session_completed(session_id: str, locks_dir: Optional[str] = None) -> bool:
-    """Check if session has already been durably completed."""
-    if not session_id or session_id in _IN_MEMORY_COMPLETED:
+def _settlement_root() -> str:
+    return _memory_path("state", "settlements")
+
+
+def _settlement_key(session_id: str, source_sha: str) -> str:
+    return f"{session_id}\0{source_sha}"
+
+
+def _settlement_destination(session_id: str, settlements_dir: Optional[str] = None) -> str:
+    """Return the bounded per-session record for its last settled source digest."""
+    root = settlements_dir or _settlement_root()
+    session_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    return posixpath.join(root, f"hermes-{session_hash}.json")
+
+
+def _is_source_settled(
+    session_id: str,
+    source_sha: str,
+    settlements_dir: Optional[str] = None,
+) -> bool:
+    """Return true only when this exact normalized source is durably settled."""
+    if not session_id or not source_sha:
+        return False
+    key = _settlement_key(session_id, source_sha)
+    if key in _IN_MEMORY_SETTLED:
         return True
-    target_dir = locks_dir or _memory_path("state", "locks")
-    comp_file = posixpath.join(target_dir, f"{session_id}.completed")
-    if os.path.isfile(comp_file):
-        _IN_MEMORY_COMPLETED.add(session_id)
-        return True
-    legacy_lock = posixpath.join(target_dir, f"{session_id}.lock")
-    if os.path.isfile(legacy_lock):
-        try:
-            with open(legacy_lock, "r", encoding="utf-8") as fh:
-                content = fh.read().strip()
-                if "executing" not in content:
-                    _IN_MEMORY_COMPLETED.add(session_id)
-                    return True
-        except OSError:
-            _IN_MEMORY_COMPLETED.add(session_id)
+    path = _settlement_destination(session_id, settlements_dir)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            value = json.load(fh)
+        if (
+            value.get("schema") == "pikselzone-memory-hermes-settlement-v1"
+            and value.get("session_id") == session_id
+            and value.get("source_sha256") == source_sha
+        ):
+            _IN_MEMORY_SETTLED.add(key)
             return True
+    except (OSError, ValueError, TypeError):
+        pass
     return False
 
 
 def _acquire_execution_lock(session_id: str, locks_dir: Optional[str] = None) -> bool:
-    """Acquire a transient execution lock for session_id. Returns False if in progress or completed."""
-    if not session_id or _is_session_completed(session_id, locks_dir) or session_id in _IN_MEMORY_EXECUTING:
+    """Acquire a transient execution lock for one bounded settlement attempt."""
+    if not session_id or session_id in _IN_MEMORY_EXECUTING:
         return False
 
     target_dir = locks_dir or _memory_path("state", "locks")
@@ -265,51 +286,51 @@ def _release_execution_lock(session_id: str, locks_dir: Optional[str] = None) ->
         pass
 
 
-def _mark_durable_completion(
+def _mark_durable_settlement(
     session_id: str,
-    locks_dir: Optional[str] = None,
+    source_sha: str,
+    settlements_dir: Optional[str] = None,
     status: str = "completed",
     event_path: Optional[str] = None,
-) -> None:
-    """Mark session as durably completed only after successful event generation or explicit empty result."""
-    _IN_MEMORY_COMPLETED.add(session_id)
-    target_dir = locks_dir or _memory_path("state", "locks")
+) -> bool:
+    """Persist the last successful semantic source for one session.
+
+    This bounded record intentionally does not make the session permanently
+    complete: a later normalized transcript has a different source digest and
+    remains eligible for settlement.
+    """
+    if not session_id or not source_sha:
+        return False
+    target_dir = settlements_dir or _settlement_root()
     try:
         os.makedirs(target_dir, mode=0o770, exist_ok=True)
         now_iso = dt.datetime.now().astimezone().isoformat(timespec="seconds")
         data = {
+            "schema": "pikselzone-memory-hermes-settlement-v1",
             "session_id": session_id,
+            "source_sha256": source_sha,
             "status": status,
-            "completed_at": now_iso,
+            "settled_at": now_iso,
             "event_path": event_path,
         }
         raw = json.dumps(data, indent=2).encode("utf-8")
-        comp_file = posixpath.join(target_dir, f"{session_id}.completed")
-        tmp_file = f"{comp_file}.{os.getpid()}.tmp"
+        final_file = _settlement_destination(session_id, target_dir)
+        tmp_file = f"{final_file}.{os.getpid()}.tmp"
         with open(tmp_file, "wb") as fh:
             fh.write(raw)
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp_file, 0o660)
-        os.replace(tmp_file, comp_file)
-
-        lock_file = posixpath.join(target_dir, f"{session_id}.lock")
-        try:
-            with open(lock_file, "wb") as fh:
-                fh.write(raw)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.chmod(lock_file, 0o660)
-        except OSError:
-            pass
+        os.replace(tmp_file, final_file)
+        _IN_MEMORY_SETTLED.add(_settlement_key(session_id, source_sha))
+        return True
     except Exception as exc:
-        logger.debug("pz-memory-v1: failed to write completion marker for %s: %s", session_id, exc)
+        logger.debug("pz-memory-v1: failed to write settlement for %s: %s", session_id, exc)
+        return False
 
 
 def _claim_session(session_id: str, locks_dir: Optional[str] = None) -> bool:
     """Backward compatibility wrapper for existing tests."""
-    if _is_session_completed(session_id, locks_dir):
-        return False
     return _acquire_execution_lock(session_id, locks_dir)
 
 
@@ -759,10 +780,6 @@ def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -
                     sessions[identity] = entry
                     changed = True
                     continue
-                if _is_session_completed(session_id):
-                    sessions[identity] = entry
-                    changed = True
-                    continue
                 destination = _checkpoint_destination(session_id, digest)
                 if os.path.isfile(destination) or _stage_completed_turn_checkpoint(
                     session_id, turn, model, task_id, redactions,
@@ -793,7 +810,12 @@ def _clear_turn_checkpoints(session_id: str) -> None:
 
 
 def _recover_pending_turn_checkpoints() -> None:
-    """Best-effort startup recovery for crashed sessions; never blocks Hermes."""
+    """Settle raw checkpoints only from a verified terminal semantic boundary.
+
+    Plugin registration and on_session_end intentionally never invoke this:
+    they provide raw durability only.  Hermes 0.19 exposes no reliable native
+    whole-session finalizer, so this remains dormant in the deployed runtime.
+    """
     root = _checkpoint_root()
     try:
         names = sorted(name for name in os.listdir(root) if name.endswith(".json"))
@@ -826,17 +848,22 @@ def _recover_pending_turn_checkpoints() -> None:
                 continue
             seen.add(digest)
             unique.append(item)
-        if not unique or _is_session_completed(session_id):
+        if not unique:
             continue
         transcript = "\n".join(item["normalized_transcript"] for item in unique)
+        source_sha = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+        if _is_source_settled(session_id, source_sha):
+            _clear_turn_checkpoints(session_id)
+            continue
         summary, provider, model = _summarize_with_hermes(transcript)
         if not summary:
             continue
         if summary.get("status") == "empty":
-            _mark_durable_completion(session_id, status="checkpoint-recovery-empty")
-            _clear_turn_checkpoints(session_id)
+            if _mark_durable_settlement(
+                session_id, source_sha, status="checkpoint-recovery-empty",
+            ):
+                _clear_turn_checkpoints(session_id)
             continue
-        source_sha = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
         staged = _render_and_stage_event(
             session_id=session_id, summary=summary,
             source_model=model or str(unique[-1].get("source_model") or "unknown"),
@@ -846,8 +873,9 @@ def _recover_pending_turn_checkpoints() -> None:
             redactions=sum(int(item.get("secret_redactions") or 0) for item in unique),
             hook_event="checkpoint_recovery",
         )
-        if staged:
-            _mark_durable_completion(session_id, status="checkpoint-recovery", event_path=staged)
+        if staged and _mark_durable_settlement(
+            session_id, source_sha, status="checkpoint-recovery", event_path=staged,
+        ):
             _clear_turn_checkpoints(session_id)
 
 
@@ -948,7 +976,9 @@ def _render_and_stage_event(
     os.makedirs(outbox_events_dir, mode=0o770, exist_ok=True)
     os.makedirs(outbox_evidence_dir, mode=0o770, exist_ok=True)
 
-    filename = f"hermes-{session_hash}.md"
+    # A source digest is part of the outbox identity.  Different completed
+    # turns in one Hermes session must not overwrite or suppress each other.
+    filename = f"hermes-{session_hash}-{source_sha[:16]}.md"
     tmp_path = posixpath.join(outbox_events_dir, f".{filename}.{os.getpid()}.tmp")
     final_path = posixpath.join(outbox_events_dir, filename)
 
@@ -967,7 +997,7 @@ def _render_and_stage_event(
             pass
         return None
 
-    evidence_filename = f"hermes-{session_hash}.json"
+    evidence_filename = f"hermes-{session_hash}-{source_sha[:16]}.json"
     evidence_tmp = posixpath.join(outbox_evidence_dir, f".{evidence_filename}.{os.getpid()}.tmp")
     evidence_final = posixpath.join(outbox_evidence_dir, evidence_filename)
 
@@ -1038,34 +1068,43 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
     # Record unforgeable lifecycle receipt immediately at registered callback entry
     receipt = _record_lifecycle_receipt(session_id, event_name)
 
-    if _is_session_completed(session_id):
-        logger.debug("pz-memory-v1: session %s already completed", session_id)
+    transcript, model, task_id, redactions = _get_session_transcript(session_id)
+    if not transcript:
+        logger.debug("pz-memory-v1: no durable conversation for session %s", session_id)
         return
 
+    if event_name == "on_session_end":
+        # Hermes 0.19 calls this after every run_conversation(), before the
+        # interactive prompt returns.  Keep this boundary cheap and provider
+        # free: one atomic canonical checkpoint is the durable handoff.
+        turn = _last_completed_turn(transcript)
+        if turn and _stage_completed_turn_checkpoint(session_id, turn, model, task_id, redactions):
+            logger.info("pz-memory-v1: durably staged completed turn for session %s", session_id)
+        elif turn:
+            logger.warning("pz-memory-v1: failed to stage completed turn for session %s", session_id)
+        return
+
+    if event_name != "on_session_finalize":
+        return
+
+    # Retain semantic settlement only for a future Hermes runtime that proves
+    # this callback is a genuine terminal boundary.  Its identity is the
+    # current normalized source digest, never the whole session ID.
+    source_sha = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+    if _is_source_settled(session_id, source_sha):
+        logger.debug("pz-memory-v1: source %s already settled", source_sha[:16])
+        return
     if not _acquire_execution_lock(session_id):
         logger.debug("pz-memory-v1: session %s already executing in another task/thread", session_id)
         return
-
     try:
-        logger.info("pz-memory-v1: processing lifecycle %s for session %s", event_name, session_id)
-
-        transcript, model, task_id, redactions = _get_session_transcript(session_id)
-        if not transcript:
-            logger.debug("pz-memory-v1: no durable conversation for session %s (leaving uncompleted)", session_id)
-            return
-
-        source_sha = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
-
         summary, provider, model = _summarize_with_hermes(transcript)
         if summary is None:
-            logger.warning("pz-memory-v1: summarizer failed for session %s (leaving uncompleted for retry)", session_id)
+            logger.warning("pz-memory-v1: summarizer failed for session %s; source remains retryable", session_id)
             return
-
         if summary.get("status") == "empty":
-            logger.info("pz-memory-v1: summarizer returned empty/no memory for session %s", session_id)
-            _mark_durable_completion(session_id, status="validated-empty")
+            _mark_durable_settlement(session_id, source_sha, status="validated-empty")
             return
-
         staged_path = _render_and_stage_event(
             session_id=session_id,
             summary=summary,
@@ -1074,16 +1113,13 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
             root_task_id=task_id,
             source_sha=source_sha,
             redactions=redactions,
-            hook_event="session_end" if event_name in {"on_session_end", "on_session_finalize"} else event_name,
+            hook_event="session_finalize",
             receipt=receipt,
         )
-        if staged_path:
-            _mark_durable_completion(session_id, status="staged-event", event_path=staged_path)
+        if staged_path and _mark_durable_settlement(
+            session_id, source_sha, status="staged-event", event_path=staged_path,
+        ):
             _clear_turn_checkpoints(session_id)
-            logger.info("pz-memory-v1: durably completed session %s with staged event %s", session_id, staged_path)
-        else:
-            logger.warning("pz-memory-v1: staging failed for session %s (leaving uncompleted)", session_id)
-
     finally:
         _release_execution_lock(session_id)
 

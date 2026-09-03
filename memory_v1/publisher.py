@@ -26,8 +26,11 @@ from .events import parse_event_artifact
 
 logger = logging.getLogger(__name__)
 
-HERMES_EVENT_FILENAME_RE = re.compile(r"^hermes-[0-9a-f]{32}\.md$")
-HERMES_EVIDENCE_FILENAME_RE = re.compile(r"^hermes-[0-9a-f]{32}\.json$")
+# Legacy session-only names remain accepted.  Newer Hermes settlements carry
+# the first 16 source-digest characters so distinct completed turns in one
+# session cannot overwrite each other.
+HERMES_EVENT_FILENAME_RE = re.compile(r"^hermes-([0-9a-f]{32})(?:-([0-9a-f]{16}))?\.md$")
+HERMES_EVIDENCE_FILENAME_RE = re.compile(r"^hermes-([0-9a-f]{32})(?:-([0-9a-f]{16}))?\.json$")
 
 
 def publish_outbox(
@@ -56,7 +59,8 @@ def publish_outbox(
     candidates = sorted([p for p in events_dir.iterdir() if p.is_file() and not p.name.startswith(".")])
 
     for event_path in candidates:
-        if not HERMES_EVENT_FILENAME_RE.match(event_path.name):
+        filename_match = HERMES_EVENT_FILENAME_RE.match(event_path.name)
+        if not filename_match:
             logger.warning("Skipping non-matching outbox filename: %s", event_path.name)
             continue
 
@@ -85,7 +89,8 @@ def publish_outbox(
             if not path_within(target_file, config.vault_path / "daily"):
                 raise PolicyError("target-daily-path-outside-vault")
 
-            session_hash = event_path.name.replace("hermes-", "").replace(".md", "")
+            session_hash = filename_match.group(1)
+            source_suffix = f"-{filename_match.group(2)}" if filename_match.group(2) else ""
 
             # Deduplication check
             if target_file.exists():
@@ -253,7 +258,7 @@ def publish_outbox(
                     logger.warning("Second brain pipeline warning during event publish: %s", sb_exc)
 
             # Check and promote corresponding evidence receipt if available
-            evidence_file = evidence_dir / f"hermes-{session_hash}.json"
+            evidence_file = evidence_dir / f"hermes-{session_hash}{source_suffix}.json"
             if evidence_file.exists():
                 try:
                     reject_symlink_chain(evidence_file)
