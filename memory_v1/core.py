@@ -42,6 +42,11 @@ BARE_CONCEPT_DENYLIST = frozenset({
     "always", "never", "unknown", "success", "result", "results", "status",
     "done", "todo", "note", "notes", "value", "data", "item", "items", "thing",
     "step", "steps", "phase", "task", "tasks", "owner", "true", "false", "null",
+    # Turkish generics: the vault is bilingual, so an English-only denylist left
+    # the same defect class open (a live noise run matched the bare slug "yeni").
+    "yeni", "aktif", "mevcut", "durum", "sonuc", "sonuç", "adim", "adım",
+    "kural", "kurallar", "deger", "değer", "islem", "işlem", "genel", "ozet",
+    "özet", "not", "notlar", "veri", "bilgi", "dosya", "hata", "test-notu",
 })
 SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"

@@ -787,6 +787,9 @@ def build_startup_recall_bundle(
 ASSOCIATIVE_RECALL_SCHEMA = "pikselzone-associative-recall-v1"
 ASSOCIATIVE_RECALL_BUDGET = 2400
 ASSOCIATIVE_MIN_SCORE = 6.0
+# Minimum meaningful-token overlap between the prompt and the injected
+# concept.  Mirrors the acceptance harness's "defensible injection" rule.
+MIN_ASSOCIATIVE_SHARED_TOKENS = 2
 _TRIVIAL_PROMPTS = frozenset({
     "tamam", "devam", "devam et", "evet", "hayir", "hayır", "ok", "okay", "peki",
     "sagol", "sağol", "sağ ol", "tesekkurler", "teşekkürler", "tesekkur ederim",
@@ -858,6 +861,12 @@ def associative_recall_fast(
         if slug in BARE_CONCEPT_DENYLIST:
             score *= 0.1
         if score < min_score:
+            continue
+        # A single shared token is not evidence of a cross-project association,
+        # in any language -- it is how a bare generic slug sneaks in. Require the
+        # same overlap the acceptance harness uses to call an injection
+        # defensible, so the runtime and the gate agree by construction.
+        if len(_tokenize(query) & _tokenize(sanitized)) < MIN_ASSOCIATIVE_SHARED_TOKENS:
             continue
         picked.append(RecallItem(
             item_id=f"assoc-{slug}",
