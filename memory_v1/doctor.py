@@ -218,6 +218,7 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
     checks.append(_row(
         "pending_checkpoints", "pass" if pending_count == 0 else "warn", str(pending_count)
     ))
+    checks.append(_checkpoint_retry_row(config))
     checks.extend(_recall_rows(config))
     if config.can_run_compiler:
         checks.append(_compiler_backlog_row(config))
@@ -242,6 +243,24 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
         "summary": {"fail": failures, "blocked": blocked, "warning": warnings},
         "checks": checks,
     }
+
+
+def _checkpoint_retry_row(config: MemoryConfig) -> dict[str, str]:
+    """Surface bounded drain-retry state.
+
+    Reported as pass/warn only: a checkpoint waiting on backoff, or one that
+    exhausted its attempts, is operator information, not a doctor failure --
+    the raw checkpoint is still preserved either way.
+    """
+    from .retry import retry_summary
+
+    counts = retry_summary(config)
+    total = sum(counts.values())
+    detail = (
+        f"scheduled={counts['scheduled']};"
+        f"exhausted={counts['exhausted']};permanent={counts['permanent']}"
+    )
+    return _row("checkpoint_retry", "pass" if total == 0 else "warn", detail)
 
 
 WIKILINK_RE = re.compile(r"(?<!!)\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")

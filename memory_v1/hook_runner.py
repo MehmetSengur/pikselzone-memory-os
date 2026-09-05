@@ -12,12 +12,14 @@ from pathlib import Path
 from .adapters import (
     MAX_TURN_CHECKPOINTS_PER_SESSION,
     checkpoint_hook,
+    empty_lifecycle_reason,
     find_pending_turn_checkpoint,
     load_hook_input,
     pending_turn_checkpoint_count,
 )
 from .core import MemoryConfig, MemoryError, ensure_safe_directory, write_health
 from .provider import scrubbed_subprocess_env
+from .retry import find_stale_recoverable_checkpoints, prune_orphan_retry_states
 
 
 def build_drain_command(
@@ -224,6 +226,22 @@ def main(argv: list[str] | None = None) -> int:
                     log_dir = config.state_path / "logs"
                     ensure_safe_directory(log_dir, create=True)
                     _spawn_drain(args.config, pending_turn, log_dir / f"drain-{args.runtime}.log")
+            # A terminal checkpoint whose drain hit a transient provider
+            # failure was previously never looked at again.  Retry it here --
+            # the same detached, best-effort worker, bounded by attempt count,
+            # backoff, age and a hard spawn cap, and never blocking startup.
+            try:
+                prune_orphan_retry_states(config)
+                stale = find_stale_recoverable_checkpoints(config, runtime=args.runtime)
+                if stale:
+                    log_dir = config.state_path / "logs"
+                    ensure_safe_directory(log_dir, create=True)
+                    for stale_path in stale:
+                        _spawn_drain(
+                            args.config, stale_path, log_dir / f"drain-{args.runtime}.log"
+                        )
+            except Exception:
+                pass
             wire = {
                 "continue": True,
                 "hookSpecificOutput": {
@@ -234,10 +252,25 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(wire, ensure_ascii=False))
             return 0
         payload = load_hook_input(None, raw_stdin)
-        queue_path = checkpoint_hook(
-            config, runtime=args.runtime, payload=payload, event_override=args.event,
-            project=project, continuity_scope=continuity_scope,
-        )
+        try:
+            queue_path = checkpoint_hook(
+                config, runtime=args.runtime, payload=payload, event_override=args.event,
+                project=project, continuity_scope=continuity_scope,
+            )
+        except MemoryError as exc:
+            empty_reason = empty_lifecycle_reason(
+                config, runtime=args.runtime, payload=payload, exc=exc
+            )
+            if empty_reason is None:
+                raise
+            # A session that never produced a turn is an empty lifecycle
+            # boundary, not a blocked capture.  Reporting it as blocked was a
+            # monitoring false positive; there is no memory to lose here.
+            write_health(
+                config.state_path, f"hook-{args.runtime}", "ok",
+                f"lifecycle-empty:{empty_reason}",
+            )
+            return 0
         log_dir = config.state_path / "logs"
         ensure_safe_directory(log_dir, create=True)
         if args.event == "Stop":

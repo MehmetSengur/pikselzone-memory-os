@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from .core import (
-    DuplicateEvent, MemoryConfig, NoMemory, NormalizedTranscript, PolicyError, SchemaError,
+    DuplicateEvent, MemoryConfig, MemoryError, NoMemory, NormalizedTranscript, PolicyError,
+    SchemaError,
     atomic_json, clamp_transcript, discover_codex_binary, ensure_safe_directory, iso_now,
     normalize_transcript,
     path_within, reject_symlink_chain, safe_unlink, session_key, sha256_file,
@@ -191,6 +192,78 @@ def find_pending_turn_checkpoint(
     return paths[0] if paths else None
 
 
+#: The two deterministic ways a lifecycle boundary can carry nothing to
+#: capture.  Both are produced by the transcript read itself, before any
+#: provider call, and neither is a capture failure.
+EMPTY_LIFECYCLE_MARKERS = (
+    # The transcript exists but holds no user/assistant turn at all.
+    "checkpoint-transcript-empty",
+    # The transcript file was never created: a session that ended with zero
+    # turns leaves its project directory behind but no ``.jsonl``.
+    "secure-read-open:FileNotFoundError",
+)
+
+
+def session_has_prior_memory(
+    config: MemoryConfig, *, runtime: str, session_id: str
+) -> bool:
+    """True when this session already produced durable or pending memory.
+
+    This is the guard that keeps the zero-turn classification honest: if a
+    session ever reached the flush pipeline or left a raw checkpoint behind,
+    then a transcript that is now unreadable is a real loss and must stay
+    fail-closed, not be reclassified as empty.
+    """
+    try:
+        key = session_key(session_id)
+    except SchemaError:
+        return True
+    if (config.state_path / "sessions" / runtime / f"{key}.json").exists():
+        return True
+    return bool(_checkpoint_paths_for_session(config, runtime=runtime, state_key=key))
+
+
+def empty_lifecycle_reason(
+    config: MemoryConfig, *, runtime: str, payload: dict[str, Any], exc: BaseException
+) -> str | None:
+    """Classify a failed checkpoint as a deterministic zero-turn no-op.
+
+    Returns a machine-readable reason, or ``None`` when the failure must keep
+    its existing fail-closed handling.  No security check is relaxed: the
+    secure read has already run and failed; this only inspects existence of the
+    path the runtime itself supplied, and only after proving the session has no
+    other memory.
+    """
+    marker = str(exc)
+    if marker not in EMPTY_LIFECYCLE_MARKERS:
+        return None
+    session_id = _first_text(
+        payload, ("session_id", "sessionId", "thread_id", "threadId", "conversation_id")
+    )
+    transcript = _first_text(
+        payload, ("transcript_path", "transcriptPath", "rollout_path", "history_path")
+    )
+    if not session_id or not transcript:
+        return None
+    if session_has_prior_memory(config, runtime=runtime, session_id=session_id):
+        return None
+    if marker == "checkpoint-transcript-empty":
+        return "transcript-zero-turns"
+    try:
+        path = _validated_transcript_path(config, runtime, transcript)
+    except MemoryError:
+        return None
+    # "Never created" means the runtime's own session directory is there and
+    # the transcript leaf simply is not.  A missing parent, a symlink, or any
+    # other read failure stays blocked.
+    if path.exists() or path.is_symlink():
+        return None
+    parent = path.parent
+    if not parent.is_dir() or parent.is_symlink():
+        return None
+    return "transcript-never-created"
+
+
 def checkpoint_hook(
     config: MemoryConfig, *, runtime: str, payload: dict[str, Any],
     event_override: str | None = None,
@@ -271,14 +344,67 @@ def checkpoint_hook(
     return queue_path
 
 
+def _hook_config_sha(config: MemoryConfig, runtime: str) -> str:
+    path = (
+        config.codex_hooks_path if runtime == "codex"
+        else (config.claude_settings_path if runtime == "claude" else None)
+    )
+    return sha256_file(path) if (path and path.is_file()) else ""
+
+
+def _hook_config_matches_current(
+    config: MemoryConfig, runtime: str, checkpoint_sha: str
+) -> bool:
+    """True when the checkpoint was captured under the live hook config.
+
+    An empty recorded sha means the checkpoint predates the field; it is
+    treated as current, exactly as the evidence writer already did.
+    """
+    if not checkpoint_sha:
+        return True
+    return checkpoint_sha == _hook_config_sha(config, runtime)
+
+
 def drain_checkpoint(
+    config: MemoryConfig, queue_path: Path, *,
+    provider: StructuredResponsesProvider | None = None,
+) -> Path:
+    """Promote one pending checkpoint, recording bounded retry state.
+
+    The drain itself is unchanged.  What is new is that a failure is written
+    down: a transient provider failure schedules a bounded retry, a permanent
+    one does not, and any settlement (success, duplicate, or no-memory) clears
+    the record.  Nothing here deletes a raw checkpoint -- only the existing
+    ``settle_selected`` path does.
+    """
+    from .retry import clear_retry_state, record_drain_failure
+
+    pending = config.state_path / "queue" / "pending"
+    if not queue_path.is_absolute() or not path_within(queue_path, pending):
+        raise PolicyError("checkpoint-path-outside-queue")
+    if not queue_path.exists() and not queue_path.is_symlink():
+        # An earlier drain already settled this checkpoint.  Re-running the
+        # same recovery is a no-op, never a second event artifact.
+        clear_retry_state(config, queue_path)
+        raise NoMemory("checkpoint-already-settled")
+    try:
+        event_path = _drain_validated_checkpoint(config, queue_path, provider=provider)
+    except (DuplicateEvent, NoMemory):
+        clear_retry_state(config, queue_path)
+        raise
+    except MemoryError as exc:
+        record_drain_failure(config, queue_path, exc)
+        raise
+    clear_retry_state(config, queue_path)
+    return event_path
+
+
+def _drain_validated_checkpoint(
     config: MemoryConfig, queue_path: Path, *,
     provider: StructuredResponsesProvider | None = None,
 ) -> Path:
     worker_started_at = iso_now()
     pending = config.state_path / "queue" / "pending"
-    if not queue_path.is_absolute() or not path_within(queue_path, pending):
-        raise PolicyError("checkpoint-path-outside-queue")
     reject_symlink_chain(queue_path)
     info = queue_path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -404,6 +530,13 @@ def drain_checkpoint(
         config.codex_smoke_evidence_path if runtime == "codex"
         else (config.claude_smoke_evidence_path if runtime == "claude" else None)
     )
+    # Activation evidence attests that the *currently registered* hook
+    # configuration produces working automatic drains.  A recovered checkpoint
+    # captured under a hook configuration that has since changed cannot say
+    # that, so it must leave the existing evidence alone rather than replace it
+    # with a receipt the activation check will read as stale.
+    if evidence_path and not _hook_config_matches_current(config, runtime, hook_cfg_sha):
+        evidence_path = None
     if evidence_path:
         runtime_version = "unknown"
         if runtime == "codex":
@@ -422,12 +555,7 @@ def drain_checkpoint(
                 pass
 
         if not hook_cfg_sha:
-            cfg_path = (
-                config.codex_hooks_path if runtime == "codex"
-                else (config.claude_settings_path if runtime == "claude" else None)
-            )
-            if cfg_path and cfg_path.is_file():
-                hook_cfg_sha = sha256_file(cfg_path)
+            hook_cfg_sha = _hook_config_sha(config, runtime)
 
         worker_receipt = {
             "runtime": runtime,
