@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import unicodedata
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -112,6 +113,77 @@ class TestProjectRegistry(unittest.TestCase):
         )
         self.assertFalse(d.capture)
         self.assertEqual(d.reason, "project-slug-invalid")
+
+    # --- macOS Unicode identity -----------------------------------------
+    def _unicode_repo(self, name: str) -> Path:
+        path = self.root / unicodedata.normalize("NFD", name)
+        path.mkdir()
+        return path
+
+    def test_resolve_capture_accepts_nfc_hook_root_for_nfd_registry_root(self) -> None:
+        repo = self._unicode_repo("İçerik-Otomasyon")
+        pr.register(self.state, repo, "icerik-otomasyon")
+        nfc_root = Path(unicodedata.normalize("NFC", str(repo)))
+        self.assertTrue(nfc_root.is_dir(), "filesystem must prove NFC/NFD equivalence")
+
+        decision = pr.resolve_capture(
+            self.state, cwd=nfc_root, project="icerik-otomasyon", project_root=nfc_root
+        )
+        self.assertTrue(decision.capture)
+        self.assertEqual(decision.reason, "ok")
+
+    def test_resolve_capture_accepts_nfd_hook_root_for_nfc_registry_root(self) -> None:
+        repo = self._unicode_repo("İçerik-Otomasyon")
+        nfc_root = Path(unicodedata.normalize("NFC", str(repo)))
+        self.assertTrue(nfc_root.is_dir(), "filesystem must prove NFC/NFD equivalence")
+        pr.register(self.state, nfc_root, "icerik-otomasyon")
+
+        decision = pr.resolve_capture(
+            self.state, cwd=repo, project="icerik-otomasyon", project_root=repo
+        )
+        self.assertTrue(decision.capture)
+        self.assertEqual(decision.reason, "ok")
+
+    def test_unicode_normalisation_does_not_match_different_path(self) -> None:
+        repo = self._unicode_repo("İçerik-Otomasyon")
+        sibling = self._unicode_repo("İçerik-Otomasyon-archive")
+        pr.register(self.state, repo, "icerik-otomasyon")
+
+        decision = pr.resolve_capture(
+            self.state, cwd=sibling, project="icerik-otomasyon", project_root=sibling
+        )
+        self.assertFalse(decision.capture)
+        self.assertEqual(decision.reason, "not-in-registry")
+
+    def test_unicode_normalisation_does_not_allow_prefix_sibling_or_escape(self) -> None:
+        repo = self._unicode_repo("İçerik-Otomasyon")
+        prefix_sibling = self._unicode_repo("İçerik-Otomasyon-copy")
+        outside = self.root / "outside"
+        outside.mkdir()
+        pr.register(self.state, repo, "icerik-otomasyon")
+        nfc_root = Path(unicodedata.normalize("NFC", str(repo)))
+
+        for cwd in (prefix_sibling, outside):
+            decision = pr.resolve_capture(
+                self.state, cwd=cwd, project="icerik-otomasyon", project_root=nfc_root
+            )
+            self.assertFalse(decision.capture)
+            self.assertEqual(decision.reason, "cwd-outside-root")
+
+    def test_unicode_normalisation_preserves_symlink_escape_rejection(self) -> None:
+        repo = self._unicode_repo("İçerik-Otomasyon")
+        outside = self.root / "outside"
+        outside.mkdir()
+        escape = repo / "escape"
+        escape.symlink_to(outside, target_is_directory=True)
+        pr.register(self.state, repo, "icerik-otomasyon")
+        nfc_root = Path(unicodedata.normalize("NFC", str(repo)))
+
+        decision = pr.resolve_capture(
+            self.state, cwd=escape, project="icerik-otomasyon", project_root=nfc_root
+        )
+        self.assertFalse(decision.capture)
+        self.assertEqual(decision.reason, "cwd-outside-root")
 
     # --- corrupt / missing registry ------------------------------------
     def test_missing_registry_is_empty_not_error(self) -> None:

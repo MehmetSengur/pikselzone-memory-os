@@ -16,7 +16,9 @@ Single authority rule (see V2.3 plan 1c) applied on every claude/codex hook call
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -56,10 +58,27 @@ def validate_slug(project: str) -> str:
 
 
 def _normalize_root(root: Path | str) -> str:
+    """Return the filesystem-canonical identity string for a project root.
+
+    ``Path.resolve`` remains the authority for traversal and symlink handling.
+    macOS may preserve a decomposed Unicode spelling when it renders that path,
+    even though its NFC spelling names the very same directory.  We use an NFC
+    spelling only after ``samefile`` proves that it resolves to that directory;
+    on filesystems where the spellings are distinct, the resolved spelling is
+    retained.  This is identity canonicalisation, never fuzzy matching.
+    """
     path = Path(str(root))
     if not path.is_absolute():
         raise RegistryError("project-root-not-absolute")
     resolved = path.resolve(strict=False)
+    nfc = Path(unicodedata.normalize("NFC", str(resolved)))
+    try:
+        if nfc != resolved and nfc.exists() and os.path.samefile(resolved, nfc):
+            resolved = nfc.resolve(strict=False)
+    except OSError:
+        # A missing or inaccessible NFC spelling cannot be treated as an
+        # equivalent root.  Keep the filesystem-resolved spelling fail-closed.
+        pass
     return str(resolved)
 
 
@@ -116,7 +135,10 @@ def register(state_path: Path, root: Path | str, project: str) -> ProjectEntry:
     norm_root = _normalize_root(root)
     if not Path(norm_root).is_dir():
         raise RegistryError(f"project-root-not-a-directory:{norm_root}")
-    entries = [e for e in load_registry(state_path) if e.root != norm_root]
+    entries = [
+        e for e in load_registry(state_path)
+        if _normalize_root(e.root) != norm_root
+    ]
     entry = ProjectEntry(project=slug, root=norm_root, registered_at=iso_now())
     entries.append(entry)
     _write_registry(state_path, entries)
@@ -128,7 +150,7 @@ def unregister(state_path: Path, root: Path | str) -> bool:
     are untouched; ``continuity/<slug>.md`` is left in place."""
     norm_root = _normalize_root(root)
     entries = load_registry(state_path)
-    kept = [e for e in entries if e.root != norm_root]
+    kept = [e for e in entries if _normalize_root(e.root) != norm_root]
     if len(kept) == len(entries):
         return False
     _write_registry(state_path, kept)
@@ -141,18 +163,20 @@ def lookup(state_path: Path, project: str) -> list[ProjectEntry]:
 
 
 def lookup_root(state_path: Path, root: Path | str) -> ProjectEntry | None:
-    """The entry whose root matches ``root`` exactly, if any."""
+    """The entry whose filesystem-canonical root matches ``root``, if any."""
     norm_root = _normalize_root(root)
     for entry in load_registry(state_path):
-        if entry.root == norm_root:
+        if _normalize_root(entry.root) == norm_root:
             return entry
     return None
 
 
 def verify_under_root(cwd: Path | str, project_root: Path | str) -> bool:
     try:
-        return path_within(Path(str(cwd)), Path(str(project_root)))
-    except (OSError, ValueError):
+        return path_within(
+            Path(_normalize_root(cwd)), Path(_normalize_root(project_root))
+        )
+    except (OSError, ValueError, RegistryError):
         return False
 
 
