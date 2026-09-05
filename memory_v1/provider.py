@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import subprocess
 import tempfile
 import urllib.error
@@ -11,7 +12,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from .core import MemoryConfig, ProviderBlocked, SchemaError, discover_codex_binary
+from .core import (
+    MemoryConfig, ProviderBlocked, SchemaError, discover_codex_binary,
+    redact_sensitive_text,
+)
 
 
 Transport = Callable[[str, dict[str, Any], dict[str, str]], dict[str, Any]]
@@ -258,13 +262,42 @@ def scrubbed_subprocess_env(extra: dict[str, str] | None = None) -> dict[str, st
     return clean
 
 
+CLAUDE_TIMEOUT_BASE_SECONDS = 60
+CLAUDE_TIMEOUT_MAX_SECONDS = 300
+
+
+def claude_timeout_for(prompt_chars: int) -> int:
+    """Scale the subprocess timeout with the prompt, within a hard ceiling.
+
+    A flat 60s was sized for small turn checkpoints.  A transcript near the
+    120k capture ceiling needs materially longer: 114,015 chars measured at
+    90.3s on haiku, which a flat 60s cuts off as ``claude-timeout`` even though
+    the run would have succeeded.
+    """
+    scaled = CLAUDE_TIMEOUT_BASE_SECONDS + max(0, prompt_chars) // 1000
+    return min(CLAUDE_TIMEOUT_MAX_SECONDS, max(CLAUDE_TIMEOUT_BASE_SECONDS, scaled))
+
+
+def _stderr_hint(stderr: str | None, limit: int = 200) -> str:
+    """Bounded, redacted stderr tail so a non-zero exit is diagnosable.
+
+    An over-context prompt makes the CLI exit non-zero with *empty* stderr, so
+    an absent hint is itself the signal: look at input size, not at the CLI.
+    """
+    text = (stderr or "").strip()
+    if not text:
+        return ""
+    redacted, _ = redact_sensitive_text(text[-limit:])
+    return ":" + re.sub(r"\s+", " ", redacted).strip()
+
+
 def summarize_with_claude(
     *,
     instruction: str,
     untrusted_input: str,
     schema: dict[str, Any],
     model: str | None = None,
-    timeout: int = 60,
+    timeout: int | None = None,
     runner: Callable[..., Any] | None = None,
 ) -> tuple[dict[str, Any], str, str]:
     if os.environ.get("PZ_MEMORY_INVOKED_BY") == "memory-v1":
@@ -289,13 +322,14 @@ def summarize_with_claude(
     ]
     env = scrubbed_subprocess_env()
     run_func = runner or subprocess.run
+    effective_timeout = timeout if timeout is not None else claude_timeout_for(len(prompt))
     try:
         res = run_func(
             cmd,
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
-            timeout=timeout,
+            timeout=effective_timeout,
             env=env,
             check=False,
         )
@@ -305,7 +339,9 @@ def summarize_with_claude(
         raise ProviderBlocked(f"claude-exec-error:{exc.__class__.__name__}") from None
 
     if res.returncode != 0:
-        raise ProviderBlocked(f"claude-process-failed:{res.returncode}")
+        raise ProviderBlocked(
+            f"claude-process-failed:{res.returncode}{_stderr_hint(res.stderr)}"
+        )
 
     try:
         data = json.loads(res.stdout)

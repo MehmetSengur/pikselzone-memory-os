@@ -924,9 +924,31 @@ def _message_from_record(record: dict[str, Any]) -> tuple[str, Any, bool]:
     return "", None, False
 
 
+TRANSCRIPT_MAX_CHARS = 120000
+
+
+def clamp_transcript(rendered: str, max_chars: int = TRANSCRIPT_MAX_CHARS) -> str:
+    """Keep the most recent ``max_chars`` and drop the partial leading turn.
+
+    The summarizer ceiling is enforced wherever a transcript is assembled, not
+    only at capture time: a recovery drain concatenates several already-capped
+    checkpoints, and without re-clamping the combined text the prompt can grow
+    past the model's context window.  A prompt that does exceed it makes the
+    runtime exit non-zero with empty stderr, which surfaces as an
+    undiagnosable ``claude-process-failed:1``.
+    """
+    if len(rendered) <= max_chars:
+        return rendered
+    rendered = rendered[-max_chars:]
+    boundary = rendered.find("\n")
+    if boundary >= 0:
+        rendered = rendered[boundary + 1:]
+    return rendered
+
+
 def normalize_transcript(
     source: Path | str | Sequence[dict[str, Any]], *,
-    max_turns: int = 200, max_chars: int = 120000,
+    max_turns: int = 200, max_chars: int = TRANSCRIPT_MAX_CHARS,
     allowed_roots: Sequence[Path] | None = None,
     state_path: Path | None = None,
 ) -> tuple[str, int, str]:
@@ -1008,11 +1030,7 @@ def normalize_transcript(
 
     turns = turns[-max_turns:]
     rendered = "\n".join(f"{role.upper()}: {text}" for role, text in turns)
-    if len(rendered) > max_chars:
-        rendered = rendered[-max_chars:]
-        boundary = rendered.find("\n")
-        if boundary >= 0:
-            rendered = rendered[boundary + 1:]
+    rendered = clamp_transcript(rendered, max_chars)
     digest = sha256_bytes(rendered.encode("utf-8"))
     return rendered, len(turns), digest
 

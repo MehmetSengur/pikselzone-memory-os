@@ -12,7 +12,8 @@ from typing import Any
 
 from .core import (
     DuplicateEvent, MemoryConfig, NoMemory, NormalizedTranscript, PolicyError, SchemaError,
-    atomic_json, discover_codex_binary, ensure_safe_directory, iso_now, normalize_transcript,
+    atomic_json, clamp_transcript, discover_codex_binary, ensure_safe_directory, iso_now,
+    normalize_transcript,
     path_within, reject_symlink_chain, safe_unlink, session_key, sha256_file,
 )
 from .events import EventWriter, parse_event_artifact
@@ -349,7 +350,9 @@ def drain_checkpoint(
             checkpoint_values.append(item)
         if not checkpoint_values:
             raise SchemaError("checkpoint-recovery-empty")
-        combined = "\n".join(item["normalized_transcript"] for item in checkpoint_values)
+        combined = clamp_transcript(
+            "\n".join(item["normalized_transcript"] for item in checkpoint_values)
+        )
         combined_digest = hashlib.sha256(combined.encode("utf-8")).hexdigest()
         normalized_transcript = NormalizedTranscript.from_checkpoint(combined, combined_digest)
         flush_value = {**value, "source_digest": combined_digest, "normalized_transcript": combined}
