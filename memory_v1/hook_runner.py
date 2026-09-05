@@ -271,6 +271,17 @@ def main(argv: list[str] | None = None) -> int:
                 f"lifecycle-empty:{empty_reason}",
             )
             return 0
+        # The raw checkpoint is durable now, so the capture half of this
+        # lifecycle hook genuinely succeeded.  Record that: without a success
+        # write this component only ever moves to "blocked", so a failure that
+        # was fixed long ago keeps showing red to anyone reading the file.
+        # The drain that follows is detached and reports itself separately
+        # under "drain" and "flush-<runtime>"; a later drain failure must not
+        # retroactively invalidate a capture that did work.
+        write_health(
+            config.state_path, f"hook-{args.runtime}", "ok",
+            f"lifecycle-ok:{args.event}",
+        )
         log_dir = config.state_path / "logs"
         ensure_safe_directory(log_dir, create=True)
         if args.event == "Stop":
