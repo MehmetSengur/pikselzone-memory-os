@@ -13,8 +13,9 @@ import unittest
 
 from memory_v1.core import TRANSCRIPT_MAX_CHARS, clamp_transcript
 from memory_v1.provider import (
-    CLAUDE_TIMEOUT_BASE_SECONDS, CLAUDE_TIMEOUT_MAX_SECONDS,
-    ProviderBlocked, claude_timeout_for, summarize_with_claude,
+    SUMMARIZER_TIMEOUT_BASE_SECONDS, SUMMARIZER_TIMEOUT_MAX_SECONDS,
+    ProviderBlocked, summarizer_timeout_for, summarize_with_claude,
+    summarize_with_codex,
 )
 
 
@@ -35,17 +36,17 @@ class TranscriptCeilingTests(unittest.TestCase):
         self.assertEqual("ASSISTANT: tail", clamped)
 
 
-class ClaudeTimeoutScalingTests(unittest.TestCase):
+class SummarizerTimeoutScalingTests(unittest.TestCase):
     def test_small_prompt_keeps_the_base_timeout(self):
-        self.assertEqual(CLAUDE_TIMEOUT_BASE_SECONDS, claude_timeout_for(0))
-        self.assertEqual(CLAUDE_TIMEOUT_BASE_SECONDS, claude_timeout_for(-1))
+        self.assertEqual(SUMMARIZER_TIMEOUT_BASE_SECONDS, summarizer_timeout_for(0))
+        self.assertEqual(SUMMARIZER_TIMEOUT_BASE_SECONDS, summarizer_timeout_for(-1))
 
     def test_ceiling_sized_prompt_gets_headroom_over_the_measured_duration(self):
         # 114,015 chars measured at 90.3s on haiku; a flat 60s cut it off.
-        self.assertGreater(claude_timeout_for(114_015), 90)
+        self.assertGreater(summarizer_timeout_for(114_015), 90)
 
     def test_timeout_is_bounded(self):
-        self.assertEqual(CLAUDE_TIMEOUT_MAX_SECONDS, claude_timeout_for(10_000_000))
+        self.assertEqual(SUMMARIZER_TIMEOUT_MAX_SECONDS, summarizer_timeout_for(10_000_000))
 
     def test_explicit_timeout_still_wins(self):
         seen = {}
@@ -71,7 +72,42 @@ class ClaudeTimeoutScalingTests(unittest.TestCase):
             summarize_with_claude(
                 instruction="i", untrusted_input="u" * 100_000, schema={}, runner=runner,
             )
-        self.assertGreater(seen["timeout"], CLAUDE_TIMEOUT_BASE_SECONDS)
+        self.assertGreater(seen["timeout"], SUMMARIZER_TIMEOUT_BASE_SECONDS)
+
+
+class CodexTimeoutScalingTests(unittest.TestCase):
+    """The codex path kept a flat 60s after the claude path learned to scale.
+
+    A 39,830-char session_end checkpoint timed out and its summary was lost,
+    so both paths now derive the timeout the same way.
+    """
+
+    def test_absent_timeout_is_derived_from_the_prompt(self):
+        seen = {}
+
+        def runner(cmd, **kwargs):
+            seen["timeout"] = kwargs["timeout"]
+            raise subprocess.TimeoutExpired(cmd, timeout=kwargs["timeout"])
+
+        with self.assertRaises(ProviderBlocked):
+            summarize_with_codex(
+                instruction="i", untrusted_input="u" * 39_830, schema={}, runner=runner,
+            )
+        self.assertEqual(summarizer_timeout_for(39_830 + 3), seen["timeout"])
+        self.assertGreater(seen["timeout"], SUMMARIZER_TIMEOUT_BASE_SECONDS)
+
+    def test_explicit_timeout_still_wins(self):
+        seen = {}
+
+        def runner(cmd, **kwargs):
+            seen["timeout"] = kwargs["timeout"]
+            raise subprocess.TimeoutExpired(cmd, timeout=kwargs["timeout"])
+
+        with self.assertRaises(ProviderBlocked):
+            summarize_with_codex(
+                instruction="i", untrusted_input="u", schema={}, timeout=7, runner=runner,
+            )
+        self.assertEqual(7, seen["timeout"])
 
 
 class NonZeroExitDiagnosabilityTests(unittest.TestCase):

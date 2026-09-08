@@ -262,20 +262,26 @@ def scrubbed_subprocess_env(extra: dict[str, str] | None = None) -> dict[str, st
     return clean
 
 
-CLAUDE_TIMEOUT_BASE_SECONDS = 60
-CLAUDE_TIMEOUT_MAX_SECONDS = 300
+SUMMARIZER_TIMEOUT_BASE_SECONDS = 60
+SUMMARIZER_TIMEOUT_MAX_SECONDS = 300
 
 
-def claude_timeout_for(prompt_chars: int) -> int:
+def summarizer_timeout_for(prompt_chars: int) -> int:
     """Scale the subprocess timeout with the prompt, within a hard ceiling.
 
     A flat 60s was sized for small turn checkpoints.  A transcript near the
     120k capture ceiling needs materially longer: 114,015 chars measured at
-    90.3s on haiku, which a flat 60s cuts off as ``claude-timeout`` even though
-    the run would have succeeded.
+    90.3s on haiku, which a flat 60s cuts off as a timeout even though the run
+    would have succeeded.
+
+    Nothing here is runtime-specific -- a long transcript costs a long
+    summarize on any of them -- so every subprocess summarizer shares it.  A
+    session_end checkpoint of 39,830 chars was lost to a flat 60s on the codex
+    path while the claude path already scaled; keeping one helper is what stops
+    that divergence from coming back.
     """
-    scaled = CLAUDE_TIMEOUT_BASE_SECONDS + max(0, prompt_chars) // 1000
-    return min(CLAUDE_TIMEOUT_MAX_SECONDS, max(CLAUDE_TIMEOUT_BASE_SECONDS, scaled))
+    scaled = SUMMARIZER_TIMEOUT_BASE_SECONDS + max(0, prompt_chars) // 1000
+    return min(SUMMARIZER_TIMEOUT_MAX_SECONDS, max(SUMMARIZER_TIMEOUT_BASE_SECONDS, scaled))
 
 
 def _stderr_hint(stderr: str | None, limit: int = 200) -> str:
@@ -322,7 +328,7 @@ def summarize_with_claude(
     ]
     env = scrubbed_subprocess_env()
     run_func = runner or subprocess.run
-    effective_timeout = timeout if timeout is not None else claude_timeout_for(len(prompt))
+    effective_timeout = timeout if timeout is not None else summarizer_timeout_for(len(prompt))
     try:
         res = run_func(
             cmd,
@@ -382,7 +388,7 @@ def summarize_with_codex(
     untrusted_input: str,
     schema: dict[str, Any],
     model: str | None = None,
-    timeout: int = 60,
+    timeout: int | None = None,
     runner: Callable[..., Any] | None = None,
 ) -> tuple[dict[str, Any], str, str]:
     if os.environ.get("PZ_MEMORY_INVOKED_BY") == "memory-v1":
@@ -390,6 +396,7 @@ def summarize_with_codex(
 
     codex_binary = discover_codex_binary(config) or "codex"
     prompt = f"{instruction}\n\n{untrusted_input}"
+    effective_timeout = timeout if timeout is not None else summarizer_timeout_for(len(prompt))
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as schema_file:
         schema_path = Path(schema_file.name)
@@ -419,7 +426,7 @@ def summarize_with_codex(
                     capture_output=True,
                     text=True,
                     stdin=subprocess.DEVNULL,
-                    timeout=timeout,
+                    timeout=effective_timeout,
                     env=env,
                     check=False,
                 )
