@@ -946,14 +946,28 @@ def clamp_transcript(rendered: str, max_chars: int = TRANSCRIPT_MAX_CHARS) -> st
     return rendered
 
 
-def normalize_transcript(
+def _transcript_records(
     source: Path | str | Sequence[dict[str, Any]], *,
-    max_turns: int = 200, max_chars: int = TRANSCRIPT_MAX_CHARS,
     allowed_roots: Sequence[Path] | None = None,
-    state_path: Path | None = None,
-) -> tuple[str, int, str]:
-    """Extract user/assistant prose only; tool results and reasoning are ignored."""
+    strict: bool = True,
+) -> list[dict[str, Any]]:
+    """Decode a transcript into raw records.
+
+    ``strict`` is the live capture path: a malformed JSONL line means the
+    runtime handed us a truncated transcript and the flush must fail loudly.
+    History import passes ``strict=False`` because an archived export is
+    allowed to carry a partial trailing line.
+    """
     records: list[dict[str, Any]] = []
+
+    def _absorb(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        if "messages" in value and isinstance(value["messages"], list):
+            records.extend(item for item in value["messages"] if isinstance(item, dict))
+        else:
+            records.append(value)
+
     if isinstance(source, Path):
         roots = tuple(allowed_roots or ())
         matching_root = next(
@@ -964,20 +978,14 @@ def normalize_transcript(
         source_text, _ = secure_read_text(
             source, root=matching_root, max_bytes=20 * 1024 * 1024
         )
-        for line_number, raw_line in enumerate(
-            source_text.splitlines(), start=1
-        ):
+        for line_number, raw_line in enumerate(source_text.splitlines(), start=1):
             if not raw_line.strip():
                 continue
             try:
-                value = json.loads(raw_line)
+                _absorb(json.loads(raw_line))
             except json.JSONDecodeError as exc:
-                raise SchemaError(f"transcript-jsonl-invalid:{line_number}") from exc
-            if isinstance(value, dict):
-                if "messages" in value and isinstance(value["messages"], list):
-                    records.extend(item for item in value["messages"] if isinstance(item, dict))
-                else:
-                    records.append(value)
+                if strict:
+                    raise SchemaError(f"transcript-jsonl-invalid:{line_number}") from exc
     elif isinstance(source, str):
         try:
             value = json.loads(source)
@@ -993,16 +1001,30 @@ def normalize_transcript(
                 if not raw_line.strip():
                     continue
                 try:
-                    val = json.loads(raw_line)
-                    if isinstance(val, dict):
-                        if "messages" in val and isinstance(val["messages"], list):
-                            records.extend(item for item in val["messages"] if isinstance(item, dict))
-                        else:
-                            records.append(val)
+                    _absorb(json.loads(raw_line))
                 except json.JSONDecodeError as exc:
-                    raise SchemaError("transcript-jsonl-invalid") from exc
+                    if strict:
+                        raise SchemaError("transcript-jsonl-invalid") from exc
     else:
         records = [item for item in source if isinstance(item, dict)]
+
+    return records
+
+
+def transcript_turns(
+    source: Path | str | Sequence[dict[str, Any]], *,
+    max_turns: int = 200,
+    allowed_roots: Sequence[Path] | None = None,
+    state_path: Path | None = None,
+    strict: bool = True,
+) -> list[tuple[str, str]]:
+    """Extract chronological ``(role, text)`` prose turns.
+
+    Tool results and reasoning blocks are ignored.  This is the single record
+    reader shared by live capture and history import, so a transcript shape
+    that one of them understands is never silently unreadable to the other.
+    """
+    records = _transcript_records(source, allowed_roots=allowed_roots, strict=strict)
 
     turns: list[tuple[str, str]] = []
     candidates_count = 0
@@ -1026,9 +1048,23 @@ def normalize_transcript(
                 "warn",
                 f"0 turns extracted from {candidates_count} conversation-shaped candidate records",
             )
-        raise SchemaError(f"transcript-zero-turns-from-{candidates_count}-candidates")
+        if strict:
+            raise SchemaError(f"transcript-zero-turns-from-{candidates_count}-candidates")
 
-    turns = turns[-max_turns:]
+    return turns[-max_turns:]
+
+
+def normalize_transcript(
+    source: Path | str | Sequence[dict[str, Any]], *,
+    max_turns: int = 200, max_chars: int = TRANSCRIPT_MAX_CHARS,
+    allowed_roots: Sequence[Path] | None = None,
+    state_path: Path | None = None,
+) -> tuple[str, int, str]:
+    """Extract user/assistant prose only; tool results and reasoning are ignored."""
+    turns = transcript_turns(
+        source, max_turns=max_turns, allowed_roots=allowed_roots,
+        state_path=state_path, strict=True,
+    )
     rendered = "\n".join(f"{role.upper()}: {text}" for role, text in turns)
     rendered = clamp_transcript(rendered, max_chars)
     digest = sha256_bytes(rendered.encode("utf-8"))

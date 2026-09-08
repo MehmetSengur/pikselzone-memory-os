@@ -172,6 +172,98 @@ class TestHistoryImportEngine(unittest.TestCase):
         self.assertEqual(receipt.sessions_imported, 0)
         self.assertEqual(receipt.rules_extracted, 0)
 
+    # 5. Claude Code transcript JSONL (regression: the codex path used to
+    #    import a module that no longer exists, so every .jsonl import crashed)
+    def test_import_claude_code_jsonl(self):
+        lines = [
+            {"parentUuid": None, "sessionId": "abc", "cwd": "/repo",
+             "type": "user",
+             "message": {"role": "user", "content": "Bundan sonra migration dosyalarini daima UTC ile adlandir."}},
+            {"parentUuid": "1", "sessionId": "abc", "type": "assistant",
+             "message": {"role": "assistant",
+                         "content": [{"type": "text", "text": "Anlasildi, Alembic revizyonlarini UTC damgasiyla ureteceğim."}]}},
+        ]
+        source_file = self.root / "session.jsonl"
+        source_file.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+
+        self.assertEqual(self.importer._detect_format(source_file), "claude-code")
+        receipt = self.importer.import_file(source_file)
+        self.assertEqual(receipt.source_format, "claude-code")
+        self.assertEqual(receipt.total_sessions_found, 1)
+        self.assertEqual(receipt.sessions_imported, 1)
+
+    # 6. Codex rollout JSONL still routes to the codex label
+    def test_import_codex_rollout_jsonl(self):
+        lines = [
+            {"type": "item_completed",
+             "item": {"type": "user_message", "text": "Deploy adimlarini her zaman staging ile basla."}},
+            {"type": "item_completed",
+             "item": {"type": "agent_message", "text": "Tamam, staging once calisacak sekilde plani guncelledim."}},
+        ]
+        source_file = self.root / "rollout-2026.jsonl"
+        source_file.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+
+        self.assertEqual(self.importer._detect_format(source_file), "codex")
+        receipt = self.importer.import_file(source_file)
+        self.assertEqual(receipt.source_format, "codex")
+        self.assertEqual(receipt.sessions_imported, 1)
+
+    # 7. A truncated trailing line is tolerated on import, not fatal
+    def test_import_tolerates_truncated_trailing_line(self):
+        good = json.dumps({
+            "sessionId": "abc", "cwd": "/repo", "type": "user",
+            "message": {"role": "user", "content": "Raporlarda once sonucu yaz, sonra kaniti."},
+        })
+        good2 = json.dumps({
+            "sessionId": "abc", "type": "assistant",
+            "message": {"role": "assistant", "content": "Anlasildi, sonuc ustte olacak."},
+        })
+        source_file = self.root / "truncated.jsonl"
+        source_file.write_text(f"{good}\n{good2}\n{{\"type\": \"assis", encoding="utf-8")
+
+        receipt = self.importer.import_file(source_file)
+        self.assertEqual(receipt.sessions_imported, 1)
+
+    # 8. project scoping reaches the receipt and the rule provenance
+    def test_project_scoping_recorded(self):
+        lines = [
+            {"sessionId": "abc", "cwd": "/repo", "type": "user",
+             "message": {"role": "user",
+                         "content": "Bundan sonra release notlarinda breaking changes bolumunu en uste koy."}},
+            {"sessionId": "abc", "type": "assistant",
+             "message": {"role": "assistant", "content": "Tamam, breaking changes ilk bolum olacak."}},
+        ]
+        source_file = self.root / "scoped.jsonl"
+        source_file.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+
+        receipt = self.importer.import_file(source_file, project="demo-proje")
+        self.assertEqual(receipt.project, "demo-proje")
+        rules_text = (self.vault / "companion" / "Kurallar.md").read_text(encoding="utf-8")
+        self.assertIn("demo-proje", rules_text)
+
+    # 9. dry run reports without writing anything
+    def test_dry_run_writes_nothing(self):
+        lines = [
+            {"sessionId": "abc", "cwd": "/repo", "type": "user",
+             "message": {"role": "user",
+                         "content": "Bundan sonra tum PR aciklamalarini Turkce yaz."}},
+            {"sessionId": "abc", "type": "assistant",
+             "message": {"role": "assistant", "content": "Anlasildi, aciklamalar Turkce olacak."}},
+        ]
+        source_file = self.root / "dry.jsonl"
+        source_file.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+
+        rules_file = self.vault / "companion" / "Kurallar.md"
+        before = rules_file.read_text(encoding="utf-8") if rules_file.exists() else ""
+
+        receipt = self.importer.import_file(source_file, project="demo-proje", dry_run=True)
+        self.assertTrue(receipt.dry_run)
+        self.assertEqual(receipt.sessions_imported, 1)
+
+        after = rules_file.read_text(encoding="utf-8") if rules_file.exists() else ""
+        self.assertEqual(before, after)
+        self.assertFalse(list((self.state / "imports").glob("*.json")) if (self.state / "imports").exists() else [])
+
 
 if __name__ == "__main__":
     unittest.main()

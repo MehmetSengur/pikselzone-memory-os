@@ -10,7 +10,9 @@ from pathlib import Path
 from .adapters import checkpoint_hook, drain_checkpoint, flush_hook, load_hook_input
 from .compiler import TerraCompiler
 from .context import build_context
-from .core import DuplicateEvent, MemoryConfig, MemoryError, NoMemory, write_health
+from .core import (
+    DuplicateEvent, MemoryConfig, MemoryError, NoMemory, PolicyError, write_health,
+)
 from .doctor import run_doctor
 from .provider import StructuredResponsesProvider, create_provider
 
@@ -53,7 +55,19 @@ def _parser() -> argparse.ArgumentParser:
     recall_cmd.add_argument("--session-key", type=str, default="cli-recall")
     import_cmd = commands.add_parser("import-history")
     import_cmd.add_argument("--file", required=True, type=Path)
-    import_cmd.add_argument("--format", choices=("claude", "chatgpt", "codex", "gemini", "markdown"), default=None)
+    import_cmd.add_argument(
+        "--format",
+        choices=("claude", "claude-code", "chatgpt", "codex", "gemini", "markdown"),
+        default=None,
+    )
+    import_cmd.add_argument(
+        "--project", default=None,
+        help="registered project slug the imported history belongs to",
+    )
+    import_cmd.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="report what would be extracted without writing rules or skills",
+    )
     parity_cmd = commands.add_parser("parity")
     parity_cmd.add_argument("--align", action="store_true", default=True)
     register_cmd = commands.add_parser("register")
@@ -177,8 +191,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "import-history":
             import dataclasses
             from .importers import HistoryImportEngine
+            if args.project:
+                from .project_registry import lookup, validate_slug
+                slug = validate_slug(args.project)
+                if not lookup(config.state_path, slug):
+                    # A typo here would attribute the backfill to a project
+                    # that does not exist, which no later query could correct.
+                    raise PolicyError(f"import-project-not-registered:{slug}")
             engine = HistoryImportEngine(config)
-            receipt = engine.import_file(args.file, source_format=args.format)
+            receipt = engine.import_file(
+                args.file, source_format=args.format,
+                project=args.project, dry_run=args.dry_run,
+            )
             print(json.dumps(dataclasses.asdict(receipt), ensure_ascii=False, indent=2))
             return 0
         if args.command == "parity":
