@@ -198,6 +198,30 @@ class TestRegisterCli(unittest.TestCase):
         self.assertTrue(out2["registry_removed"])
         self.assertEqual(pr.lookup(self.state, "luvaa"), [])
 
+    def test_codex_lifecycle_timeouts_respect_runtime_ceiling(self) -> None:
+        """Codex clamps SessionEnd/PreCompact to 3s and warns on every session."""
+        self._run("register", str(self.repo), "--project", "luvaa")
+
+        codex = json.loads((self.repo / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+        timeouts = {
+            event: groups[0]["hooks"][0]["timeout"]
+            for event, groups in codex["hooks"].items()
+        }
+        self.assertEqual(timeouts["SessionEnd"], 3)
+        self.assertEqual(timeouts["PreCompact"], 3)
+        self.assertEqual(timeouts["SessionStart"], 5)
+
+        # Claude Code has no such ceiling, so it keeps the full budget.
+        claude = json.loads(
+            (self.repo / ".claude" / "settings.local.json").read_text(encoding="utf-8")
+        )
+        claude_timeouts = {
+            event: groups[0]["hooks"][0]["timeout"]
+            for event, groups in claude["hooks"].items()
+        }
+        self.assertEqual(claude_timeouts["SessionEnd"], 10)
+        self.assertEqual(claude_timeouts["PreCompact"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

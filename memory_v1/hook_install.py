@@ -42,6 +42,16 @@ _EVENT_TIMEOUT = {
     "PreCompact": 10,
     "Stop": 10,
 }
+# Codex CLI enforces its own per-event ceiling and silently clamps anything
+# above it, printing "clamping <event> hook timeout to Ns" on every session.
+# Declaring a value it will not honour is noise, not headroom, so cap ours to
+# what the runtime actually grants.  This is safe because the synchronous half
+# of a lifecycle hook is only the durable checkpoint write -- the summarizer
+# runs in the detached drain worker (see hook_runner._spawn_drain), which
+# outlives the hook and is unaffected by the ceiling.
+_RUNTIME_EVENT_TIMEOUT_CEILING = {
+    "codex": {"SessionEnd": 3, "PreCompact": 3},
+}
 _RUNTIME_FILE = {
     "claude": (".claude", "settings.local.json"),
     "codex": (".codex", "hooks.json"),
@@ -62,8 +72,18 @@ def _command(
     )
 
 
-def _our_block(command: str, event: str) -> dict:
-    return {"hooks": [{"type": "command", "command": command, "timeout": _EVENT_TIMEOUT[event]}]}
+def _event_timeout(runtime: str, event: str) -> int:
+    """Our declared timeout, lowered to the runtime's ceiling where it has one."""
+    timeout = _EVENT_TIMEOUT[event]
+    ceiling = _RUNTIME_EVENT_TIMEOUT_CEILING.get(runtime, {}).get(event)
+    return min(timeout, ceiling) if ceiling is not None else timeout
+
+
+def _our_block(command: str, event: str, runtime: str) -> dict:
+    return {"hooks": [{
+        "type": "command", "command": command,
+        "timeout": _event_timeout(runtime, event),
+    }]}
 
 
 def _is_ours(entry: object) -> bool:
@@ -152,6 +172,7 @@ def install(
                 runtime=runtime, event=event, project=project, project_root=root,
             ),
             event,
+            runtime,
         )
         for event in MEMORY_EVENTS
     }
