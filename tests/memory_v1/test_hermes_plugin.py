@@ -29,6 +29,41 @@ def load_hermes_plugin():
 
 
 class HermesPluginAndPublisherTests(unittest.TestCase):
+    def test_flush_model_override_uses_native_facade_and_restores_guard(self):
+        plugin = load_hermes_plugin()
+        facade = mock.Mock()
+        facade.complete_structured.return_value = types.SimpleNamespace(
+            parsed={"status": "empty"}, provider="custom", model="gpt-5.6-luna",
+        )
+        module = types.ModuleType("agent.plugin_llm")
+        module.PluginLlm = mock.Mock(return_value=facade)
+        module.PluginLlmTextInput = lambda **kw: kw
+        with mock.patch.dict(sys.modules, {"agent.plugin_llm": module}), \
+             mock.patch.dict(os.environ, {"PZ_MEMORY_FLUSH_MODEL": " gpt-5.6-luna ",
+                                         "PZ_MEMORY_INTERNAL_CALL": "previous"}):
+            result = plugin._summarize_with_hermes("real transcript")
+            self.assertEqual(result[2], "gpt-5.6-luna")
+            self.assertEqual(facade.complete_structured.call_args.kwargs["model"], "gpt-5.6-luna")
+            self.assertEqual(os.environ["PZ_MEMORY_INTERNAL_CALL"], "previous")
+            # A denied/failed native override must not fall back to another model.
+            facade.complete_structured.side_effect = PermissionError("model-override-denied")
+            self.assertEqual(plugin._summarize_with_hermes("real transcript"), (None, "", ""))
+            self.assertEqual(os.environ["PZ_MEMORY_INTERNAL_CALL"], "previous")
+
+    def test_unset_flush_model_preserves_runtime_routing(self):
+        plugin = load_hermes_plugin()
+        facade = mock.Mock()
+        facade.complete_structured.return_value = types.SimpleNamespace(
+            parsed={"status": "empty"}, provider="custom", model="runtime-selected",
+        )
+        module = types.ModuleType("agent.plugin_llm")
+        module.PluginLlm = mock.Mock(return_value=facade)
+        module.PluginLlmTextInput = lambda **kw: kw
+        with mock.patch.dict(sys.modules, {"agent.plugin_llm": module}), \
+             mock.patch.dict(os.environ, {"PZ_MEMORY_FLUSH_MODEL": ""}):
+            plugin._summarize_with_hermes("real transcript")
+        self.assertNotIn("model", facade.complete_structured.call_args.kwargs)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="pz-plugin-test-")
         self.root = Path(self.temp.name).resolve()

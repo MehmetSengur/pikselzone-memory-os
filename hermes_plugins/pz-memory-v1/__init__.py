@@ -887,6 +887,10 @@ def _summarize_with_hermes(transcript: str) -> tuple[Optional[dict[str, Any]], s
     prev_env = os.environ.get("PZ_MEMORY_INTERNAL_CALL")
     os.environ["PZ_MEMORY_INTERNAL_CALL"] = "1"
     try:
+        # Optional deployment routing stays inside Hermes' credential and plugin
+        # trust boundary. Unset preserves the existing runtime-selected model.
+        flush_model = os.environ.get("PZ_MEMORY_FLUSH_MODEL", "").strip()
+        routing = {"model": flush_model} if flush_model else {}
         res = llm.complete_structured(
             instructions=FLUSH_INSTRUCTION,
             input=[PluginLlmTextInput(text=transcript)],
@@ -894,6 +898,7 @@ def _summarize_with_hermes(transcript: str) -> tuple[Optional[dict[str, Any]], s
             json_mode=True,
             timeout=120.0,
             purpose="memory-session-flush",
+            **routing,
         )
         parsed = res.parsed if isinstance(res.parsed, dict) else {}
         provider = str(res.provider or "custom:pz-openai-serial")
