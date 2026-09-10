@@ -190,3 +190,117 @@ class PreflightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NegativeResultRejectionTests(unittest.TestCase):
+    """Each case is a failure the harness used to score as a success."""
+
+    def _target(self):
+        return CONTABO_TARGET
+
+    def test_absent_marker_is_not_read_as_present(self):
+        # "NOT_FOUND" contains "FOUND": a substring test on the negative answer
+        # reported the startup bundle as already refreshed.
+        from memory_v1.harness import wait_for_vps_publisher_refresh
+
+        calls = []
+
+        def fake_ssh(target, command, check=False):
+            calls.append(command)
+            return mock.Mock(returncode=0, stdout="MARKER_ABSENT\n", stderr="")
+
+        with mock.patch("memory_v1.harness.ssh", side_effect=fake_ssh):
+            with self.assertRaises(TimeoutError):
+                wait_for_vps_publisher_refresh(self._target(), "PZ-M4-CANARY-abcd1234", timeout=1)
+
+    def test_failed_probe_is_not_read_as_all_paths_present(self):
+        # An SSH hiccup returns empty stdout; with no MISS line the old check
+        # concluded every required path existed.
+        def fake_ssh(target, command, check=False):
+            if command == "hostname":
+                return mock.Mock(returncode=0, stdout="vmi3566230\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("memory_v1.harness.ssh", side_effect=fake_ssh):
+            with self.assertRaisesRegex(RuntimeError, "no result for"):
+                preflight(self._target())
+
+    def test_ssh_error_during_probe_aborts(self):
+        def fake_ssh(target, command, check=False):
+            if command == "hostname":
+                return mock.Mock(returncode=0, stdout="vmi3566230\n", stderr="")
+            return mock.Mock(returncode=255, stdout="", stderr="connection reset")
+
+        with mock.patch("memory_v1.harness.ssh", side_effect=fake_ssh):
+            with self.assertRaisesRegex(RuntimeError, "Path probe failed"):
+                preflight(self._target())
+
+    def test_preexisting_hermes_session_is_rejected(self):
+        # Membership in the store is not evidence: the id has to be one this
+        # run created, or the model could name any session it likes.
+        from memory_v1.harness import _HERMES_SESSION_MARK, run_hermes_retrieval
+
+        old_id = "20260909_120000_aaaaaa"
+        new_id = "20260910_130000_bbbbbb"
+        # A session really was created by this run, but the runtime names an
+        # older one. The old code accepted it because it existed in the store.
+        listings = [
+            f"Title Workspace Last ID\n{old_id}\n",
+            f"Title Workspace Last ID\n{old_id}\n{new_id}\n",
+        ]
+        reply = f"value\n{_HERMES_SESSION_MARK} {old_id}\n".encode()
+
+        with mock.patch("memory_v1.harness.ssh",
+                        side_effect=[mock.Mock(returncode=0, stdout=item, stderr="")
+                                     for item in listings]), \
+             mock.patch("memory_v1.harness.subprocess.run",
+                        return_value=mock.Mock(returncode=0, stdout=reply, stderr=b"")):
+            with self.assertRaisesRegex(RuntimeError, "Cannot bind evidence to a Hermes session"):
+                run_hermes_retrieval(self._target(), "PZ-M4-CANARY-abcd1234")
+
+    def test_reported_and_new_hermes_session_is_accepted(self):
+        from memory_v1.harness import _HERMES_SESSION_MARK, run_hermes_retrieval
+
+        new_id = "20260910_130000_bbbbbb"
+        listings = [
+            "Title Workspace Last ID\n20260909_120000_aaaaaa\n",
+            f"Title Workspace Last ID\n20260909_120000_aaaaaa\n{new_id}\n",
+        ]
+        reply = f"value\n{_HERMES_SESSION_MARK} {new_id}\n".encode()
+
+        with mock.patch("memory_v1.harness.ssh",
+                        side_effect=[mock.Mock(returncode=0, stdout=item, stderr="")
+                                     for item in listings]), \
+             mock.patch("memory_v1.harness.subprocess.run",
+                        return_value=mock.Mock(returncode=0, stdout=reply, stderr=b"")):
+            session_id, _, _, obs = run_hermes_retrieval(self._target(), "PZ-M4-CANARY-abcd1234")
+        self.assertEqual(new_id, session_id)
+        self.assertEqual("runtime-reported-and-new-during-run", obs["identification_basis"])
+
+    def test_codex_tool_output_does_not_stand_in_for_the_answer(self):
+        # A grep that printed the value must not satisfy the check when the
+        # model's final answer says it found nothing.
+        from memory_v1.core import codex_final_agent_message
+
+        stream = "\n".join([
+            json.dumps({"type": "item.completed", "item": {
+                "item_type": "command_execution",
+                "aggregated_output": "check_value: PZ-HARNESS-TESTVALUE-deadbeef00",
+            }}),
+            json.dumps({"type": "item.completed", "item": {
+                "item_type": "agent_message",
+                "text": "I could not find any recorded check value for that marker.",
+            }}),
+        ])
+        answer = codex_final_agent_message(stream)
+        self.assertIn("could not find", answer)
+        self.assertNotIn("PZ-HARNESS-TESTVALUE-deadbeef00", answer)
+
+    def test_codex_final_answer_is_the_last_agent_message(self):
+        from memory_v1.core import codex_final_agent_message
+
+        stream = "\n".join([
+            json.dumps({"type": "item.completed", "item": {"item_type": "agent_message", "text": "thinking"}}),
+            json.dumps({"type": "item.completed", "item": {"item_type": "agent_message", "text": "final answer"}}),
+        ])
+        self.assertEqual("final answer", codex_final_agent_message(stream))

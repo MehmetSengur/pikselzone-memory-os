@@ -33,6 +33,7 @@ from .core import (
     PolicyError,
     SchemaError,
     atomic_write,
+    codex_final_agent_message,
     ensure_safe_directory,
     iso_now,
     reject_symlink_chain,
@@ -2000,9 +2001,13 @@ def verify_cross_runtime_continuity_evidence(config: MemoryConfig) -> tuple[bool
         clean_dec_core = clean_dec.rstrip(".")
 
         codex_raw_stdout = (config.state_path / artifacts["codex_stdout"]["path"]).read_text(encoding="utf-8", errors="replace")
-        clean_codex = re.sub(r"[*_`\"'“”]", "", codex_raw_stdout).strip().lower()
+        # Judge the run's final answer. Tool events in the captured stream carry
+        # their own output, so a search over the whole stream would accept a run
+        # whose last word was that it found nothing.
+        codex_answer = codex_final_agent_message(codex_raw_stdout) or codex_raw_stdout
+        clean_codex = re.sub(r"[*_`\"'“”]", "", codex_answer).strip().lower()
         if clean_dec not in clean_codex and clean_dec_core not in clean_codex:
-            return False, "codex-raw-stdout-decision-mismatch"
+            return False, "codex-final-answer-decision-mismatch"
 
         hermes_raw_stdout = (config.state_path / artifacts["hermes_stdout"]["path"]).read_text(encoding="utf-8", errors="replace")
         clean_hermes = re.sub(r"[*_`\"'“”]", "", hermes_raw_stdout).strip().lower()

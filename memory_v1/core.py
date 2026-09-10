@@ -739,12 +739,49 @@ def exclusive_lock(path: Path, *, nonblocking: bool = False) -> Iterator[None]:
         yield
 
 
-def write_health(state_path: Path, component: str, status: str, detail: str = "") -> None:
+CODEX_AGENT_MESSAGE_TYPES = {"agent_message", "assistant_message"}
+
+
+def codex_final_agent_message(stdout_text: str) -> str:
+    """Return the last agent message from a `codex exec --json` stream.
+
+    Matching against the whole stream is not the same thing: tool events carry
+    `aggregated_output`, so a grep that happened to print the value would
+    satisfy the check even when the model's final answer said it found nothing.
+    """
+    final = ""
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("item_type") or item.get("type")
+        if kind in CODEX_AGENT_MESSAGE_TYPES and isinstance(item.get("text"), str):
+            final = item["text"]
+    return final
+
+
+def write_health(
+    state_path: Path, component: str, status: str, detail: str = "",
+    observed_at: str = "",
+) -> None:
+    """Record a component's health.
+
+    ``observed_at`` carries the time the state was actually observed, for
+    health that is promoted from elsewhere: stamping promotion time would
+    present a stale observation as current.
+    """
     payload = {
         "schema": "pikselzone-memory-health-v1",
         "component": component,
         "status": status,
-        "updated_at": iso_now(),
+        "updated_at": observed_at or iso_now(),
     }
     if detail:
         payload["detail"] = detail[:500]

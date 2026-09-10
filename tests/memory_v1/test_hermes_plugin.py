@@ -1158,3 +1158,31 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FlushHealthConcurrencyTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def test_staging_uses_a_unique_temp_name(self):
+        # Every profile writes into the same shared outbox, so a fixed .tmp
+        # name lets two finalizing sessions clobber each other mid-write.
+        plugin = load_hermes_plugin()
+        base = self.root / "concurrent-base"
+        seen = []
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            seen.append(str(src))
+            return real_replace(src, dst)
+
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(base)}), \
+             mock.patch.object(plugin.os, "replace", side_effect=spy_replace):
+            plugin._record_flush_health("ok", "first")
+            plugin._record_flush_health("ok", "second")
+
+        self.assertEqual(2, len(seen))
+        self.assertNotEqual(seen[0], seen[1], "temp paths collided across writes")
+        for path in seen:
+            self.assertTrue(path.endswith(".tmp"))

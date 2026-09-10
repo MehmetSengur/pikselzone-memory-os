@@ -26,6 +26,7 @@ import logging
 import os
 import posixpath
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1081,7 +1082,10 @@ def _record_flush_health(status: str, detail: str = "") -> None:
         evidence_root = _memory_path("outbox", "evidence")
         os.makedirs(evidence_root, exist_ok=True)
         final_path = posixpath.join(evidence_root, "flush-hermes.json")
-        tmp_path = final_path + ".tmp"
+        # Every profile writes into the same shared outbox, so a fixed .tmp name
+        # would let two finalizing sessions clobber each other's partial file
+        # before either rename.
+        tmp_path = f"{final_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         payload = {
             "schema": FLUSH_HEALTH_SCHEMA,
             "runtime": "hermes",

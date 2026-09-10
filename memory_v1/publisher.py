@@ -309,11 +309,16 @@ def publish_outbox(
                 and status in {"ok", "blocked", "fail"}
             ):
                 detail = fh_data.get("detail")
+                observed_at = fh_data.get("observed_at")
                 write_health(
                     config.state_path,
                     "flush-hermes",
                     status,
                     str(detail)[:200] if isinstance(detail, str) else "",
+                    # Keep the time the flush was observed. Stamping promotion
+                    # time would make a stale observation, or one the publisher
+                    # only reached minutes later, read as current health.
+                    observed_at=observed_at if isinstance(observed_at, str) else "",
                 )
                 safe_unlink(flush_health, root=evidence_dir)
             else:

@@ -391,6 +391,23 @@ class TestRecallV1(unittest.TestCase):
         self.assertEqual(data["status"], "ok")
         self.assertEqual(data["detail"], "no-memory")
 
+    def test_promoted_flush_health_keeps_the_observation_time(self):
+        # Stamping promotion time would present a stale observation -- or one
+        # the publisher only reached minutes later -- as current health.
+        observed = "2026-09-10T09:15:00+03:00"
+        outbox, _ = self._seed_flush_health_outbox({
+            "schema": "pikselzone-memory-flush-health-v1",
+            "runtime": "hermes",
+            "status": "ok",
+            "detail": "",
+            "observed_at": observed,
+        })
+
+        publish_outbox(self.config, outbox_root=outbox)
+
+        data = json.loads((self.state / "health" / "flush-hermes.json").read_text(encoding="utf-8"))
+        self.assertEqual(observed, data["updated_at"])
+
     def test_publisher_rejects_malformed_flush_health(self):
         # A bogus status must not become a health verdict, and the rejected
         # observation stays in the outbox rather than being silently dropped.

@@ -29,7 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
-    from .core import MemoryConfig, iso_now, sha256_bytes, sha256_file
+    from .core import MemoryConfig, codex_final_agent_message, iso_now, sha256_bytes, sha256_file
     from .recall import (
         CROSS_RUNTIME_CONTINUITY_PROVENANCE_MACHINE,
         HarnessExecutionRun,
@@ -37,7 +37,7 @@ try:
         verify_cross_runtime_continuity_evidence,
     )
 except ImportError:
-    from memory_v1.core import MemoryConfig, iso_now, sha256_bytes, sha256_file
+    from memory_v1.core import MemoryConfig, codex_final_agent_message, iso_now, sha256_bytes, sha256_file
     from memory_v1.recall import (
         CROSS_RUNTIME_CONTINUITY_PROVENANCE_MACHINE,
         HarnessExecutionRun,
@@ -206,9 +206,24 @@ def preflight(target: HarnessTarget) -> dict[str, Any]:
         f"test -e {shlex.quote(p)} && echo 'OK {k}' || echo 'MISS {k}'" for k, p in required.items()
     )
     res = ssh(target, probe)
-    missing = [line.split(None, 1)[1] for line in res.stdout.splitlines() if line.startswith("MISS")]
+    if res.returncode != 0:
+        raise RuntimeError(f"Path probe failed on {target.name}: {res.stderr.strip()}")
+    reported = {
+        line.split(None, 1)[1]: line.split(None, 1)[0]
+        for line in res.stdout.splitlines()
+        if line.startswith(("OK ", "MISS ")) and len(line.split(None, 1)) == 2
+    }
+    missing = sorted(k for k, v in reported.items() if v == "MISS")
     if missing:
         raise RuntimeError(f"Target {target.name} is missing required paths: {missing}")
+    # An SSH hiccup yields empty or partial output with no MISS line at all;
+    # requiring an answer per path stops that reading as a clean preflight.
+    unanswered = sorted(set(required) - set(reported))
+    if unanswered:
+        raise RuntimeError(
+            f"Path probe on {target.name} returned no result for: {unanswered}. "
+            f"Refusing to treat an incomplete probe as a passing preflight."
+        )
 
     if target.hermes_run_user:
         who = ssh(target, f"sudo -n -u {shlex.quote(target.hermes_run_user)} id -un")
@@ -378,10 +393,12 @@ def wait_for_vps_publisher_refresh(target: HarnessTarget, canary_marker: str, ti
     """Wait for the publisher timer to refresh the Hermes startup bundle on its own."""
     start_time = time.time()
     bundle = shlex.quote(target.startup_bundle_path)
-    check_cmd = f"grep -q {shlex.quote(canary_marker)} {bundle} && echo FOUND || echo NOT_FOUND"
+    # Distinct sentinels: "NOT_FOUND" contains "FOUND", so a substring test on
+    # a negative answer would report the bundle as already refreshed.
+    check_cmd = f"grep -q {shlex.quote(canary_marker)} {bundle} && echo MARKER_PRESENT || echo MARKER_ABSENT"
     while time.time() - start_time < timeout:
         res = ssh(target, check_cmd)
-        if "FOUND" in res.stdout:
+        if res.returncode == 0 and res.stdout.strip() == "MARKER_PRESENT":
             j_res = ssh(target, f"journalctl -u {shlex.quote(target.publisher_service)} -n 15 --no-pager")
             h_res = ssh(target, f"sha256sum {bundle}")
             return h_res.stdout.split()[0], j_res.stdout
@@ -531,20 +548,21 @@ def run_hermes_retrieval(target: HarnessTarget, canary_marker: str) -> tuple[str
     after = _hermes_session_ids(target)
     new_ids = after - before
 
-    if reported_id and reported_id in after:
-        session_id = reported_id
-        basis = "runtime-reported-and-store-confirmed"
-    elif len(new_ids) == 1:
-        session_id = next(iter(new_ids))
-        basis = "single-new-session-during-run"
-    elif not new_ids:
+    if not new_ids:
         raise RuntimeError(
             "Hermes run produced no new session in the profile store; cannot bind evidence to a session."
         )
+    # The id has to be both runtime-reported and new. Membership in the store
+    # alone would accept a pre-existing session the model happened to name, and
+    # "the only new session" alone cannot be told apart from a Telegram message
+    # that arrived mid-run when our own session failed to register.
+    if reported_id and reported_id in new_ids:
+        session_id = reported_id
+        basis = "runtime-reported-and-new-during-run"
     else:
         raise RuntimeError(
-            f"Ambiguous Hermes session: {sorted(new_ids)} appeared during the run and the runtime "
-            f"did not report a confirmable id (reported={reported_id!r}). Refusing to guess."
+            f"Cannot bind evidence to a Hermes session: runtime reported {reported_id!r}; "
+            f"sessions created during this run were {sorted(new_ids)}. Refusing to guess."
         )
 
     hermes_session_observation = {
@@ -623,7 +641,10 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
     print("[5/6] Launching fresh normal trusted Codex session...")
     codex_session_id, codex_stdout_bytes, codex_stderr_bytes, codex_mapping = run_codex_retrieval(config, marker, repo_root)
     codex_stdout_str = codex_stdout_bytes.decode("utf-8", errors="replace")
-    clean_codex = re.sub(r"[*_`\"'“”]", "", codex_stdout_str).strip().casefold()
+    codex_answer = codex_final_agent_message(codex_stdout_str)
+    if not codex_answer:
+        raise RuntimeError("Codex run produced no final agent message to judge.")
+    clean_codex = re.sub(r"[*_`\"'“”]", "", codex_answer).strip().casefold()
     codex_matched = expected_token in clean_codex
     codex_stdout_sha = sha256_bytes(codex_stdout_bytes)
     print(f"      Codex Session ID: {codex_session_id}")
