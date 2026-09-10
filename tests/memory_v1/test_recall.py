@@ -364,6 +364,48 @@ class TestRecallV1(unittest.TestCase):
         self.assertFalse(recall_evidence.exists())
         self.assertEqual(json.loads(promoted.read_text(encoding="utf-8"))["status"], "pass")
 
+    def _seed_flush_health_outbox(self, payload):
+        outbox = self.root / "hermes-data" / "memory-v1"
+        ev_dir = outbox / "outbox" / "evidence"
+        ev_dir.mkdir(parents=True, exist_ok=True)
+        (outbox / "outbox" / "events").mkdir(parents=True, exist_ok=True)
+        staged = ev_dir / "flush-hermes.json"
+        staged.write_text(json.dumps(payload), encoding="utf-8")
+        return outbox, staged
+
+    def test_publisher_promotes_native_flush_health(self):
+        outbox, staged = self._seed_flush_health_outbox({
+            "schema": "pikselzone-memory-flush-health-v1",
+            "runtime": "hermes",
+            "status": "ok",
+            "detail": "no-memory",
+            "observed_at": iso_now(),
+        })
+
+        publish_outbox(self.config, outbox_root=outbox)
+
+        promoted = self.state / "health" / "flush-hermes.json"
+        self.assertTrue(promoted.exists())
+        self.assertFalse(staged.exists())
+        data = json.loads(promoted.read_text(encoding="utf-8"))
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["detail"], "no-memory")
+
+    def test_publisher_rejects_malformed_flush_health(self):
+        # A bogus status must not become a health verdict, and the rejected
+        # observation stays in the outbox rather than being silently dropped.
+        outbox, staged = self._seed_flush_health_outbox({
+            "schema": "pikselzone-memory-flush-health-v1",
+            "runtime": "hermes",
+            "status": "definitely-fine",
+            "observed_at": iso_now(),
+        })
+
+        publish_outbox(self.config, outbox_root=outbox)
+
+        self.assertFalse((self.state / "health" / "flush-hermes.json").exists())
+        self.assertTrue(staged.exists())
+
 
 
     def test_forged_valid_64_hex_sha_rejected(self):

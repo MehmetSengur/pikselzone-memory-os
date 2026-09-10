@@ -570,6 +570,28 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         self.assertTrue((isolated_base / "outbox" / "evidence" / "recall-hermes.json").is_file())
         self.assertFalse((live_base / "outbox" / "evidence" / "recall-hermes.json").exists())
 
+    def test_flush_health_is_staged_for_publisher_promotion(self):
+        plugin = load_hermes_plugin()
+        base = self.root / "flush-health-base"
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(base)}):
+            plugin._record_flush_health("ok", "no-memory")
+
+        staged = base / "outbox" / "evidence" / "flush-hermes.json"
+        self.assertTrue(staged.is_file())
+        payload = json.loads(staged.read_text(encoding="utf-8"))
+        self.assertEqual("pikselzone-memory-flush-health-v1", payload["schema"])
+        self.assertEqual("hermes", payload["runtime"])
+        self.assertEqual("ok", payload["status"])
+        self.assertEqual("no-memory", payload["detail"])
+
+    def test_flush_health_refuses_unknown_status(self):
+        plugin = load_hermes_plugin()
+        base = self.root / "flush-health-reject"
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(base)}):
+            plugin._record_flush_health("green", "made up")
+
+        self.assertFalse((base / "outbox" / "evidence" / "flush-hermes.json").exists())
+
     def test_recall_receipt_lookup_respects_memory_base_override(self):
         plugin = load_hermes_plugin()
         session_id = "receipt-isolation"

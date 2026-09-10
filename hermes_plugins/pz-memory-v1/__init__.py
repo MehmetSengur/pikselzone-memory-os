@@ -1061,6 +1061,44 @@ def _render_and_stage_event(
     return final_path
 
 
+FLUSH_HEALTH_SCHEMA = "pikselzone-memory-flush-health-v1"
+FLUSH_HEALTH_STATUSES = ("ok", "blocked", "fail")
+
+
+def _record_flush_health(status: str, detail: str = "") -> None:
+    """Stage a flush health observation for the host publisher to promote.
+
+    The transcript-based flush path in ``memory_v1.events`` records
+    ``flush-<runtime>`` health directly, but Hermes memory is written natively
+    here instead, so without this the engine doctor reports the native runtime
+    as never having flushed.  The plugin owns no engine state, so the
+    observation goes to the outbox and the publisher promotes it.
+    """
+    if status not in FLUSH_HEALTH_STATUSES:
+        logger.warning("pz-memory-v1: refusing to record unknown flush health status %r", status)
+        return
+    try:
+        evidence_root = _memory_path("outbox", "evidence")
+        os.makedirs(evidence_root, exist_ok=True)
+        final_path = posixpath.join(evidence_root, "flush-hermes.json")
+        tmp_path = final_path + ".tmp"
+        payload = {
+            "schema": FLUSH_HEALTH_SCHEMA,
+            "runtime": "hermes",
+            "status": status,
+            "detail": detail[:200],
+            "observed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_path, 0o660)
+        os.replace(tmp_path, final_path)
+    except Exception as exc:
+        logger.warning("pz-memory-v1: failed to stage flush health: %s", exc)
+
+
 def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
     if _is_internal_call():
         logger.debug("pz-memory-v1: ignoring internal recursive call")
@@ -1106,9 +1144,11 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
         summary, provider, model = _summarize_with_hermes(transcript)
         if summary is None:
             logger.warning("pz-memory-v1: summarizer failed for session %s; source remains retryable", session_id)
+            _record_flush_health("blocked", "summarizer-failed")
             return
         if summary.get("status") == "empty":
             _mark_durable_settlement(session_id, source_sha, status="validated-empty")
+            _record_flush_health("ok", "no-memory")
             return
         staged_path = _render_and_stage_event(
             session_id=session_id,
@@ -1125,6 +1165,7 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
             session_id, source_sha, status="staged-event", event_path=staged_path,
         ):
             _clear_turn_checkpoints(session_id)
+            _record_flush_health("ok")
     finally:
         _release_execution_lock(session_id)
 

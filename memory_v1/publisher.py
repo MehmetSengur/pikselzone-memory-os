@@ -292,6 +292,35 @@ def publish_outbox(
         except Exception as r_exc:
             logger.warning("Failed to promote recall evidence: %s", r_exc)
 
+    # Promote the native flush health observation.  The Hermes plugin performs
+    # the flush itself and cannot write engine state, so without this the
+    # doctor's flush-hermes row stays "never-run" while the native path works.
+    flush_health = evidence_dir / "flush-hermes.json"
+    if flush_health.exists():
+        try:
+            reject_symlink_chain(flush_health)
+            fh_text, _ = secure_read_text(flush_health, root=evidence_dir, max_bytes=16 * 1024)
+            fh_data = json.loads(fh_text)
+            status = fh_data.get("status")
+            if (
+                isinstance(fh_data, dict)
+                and fh_data.get("schema") == "pikselzone-memory-flush-health-v1"
+                and fh_data.get("runtime") == "hermes"
+                and status in {"ok", "blocked", "fail"}
+            ):
+                detail = fh_data.get("detail")
+                write_health(
+                    config.state_path,
+                    "flush-hermes",
+                    status,
+                    str(detail)[:200] if isinstance(detail, str) else "",
+                )
+                safe_unlink(flush_health, root=evidence_dir)
+            else:
+                logger.warning("Rejecting malformed flush health observation")
+        except Exception as f_exc:
+            logger.warning("Failed to promote flush health: %s", f_exc)
+
     try:
         from .recall import update_hermes_startup_snapshot
         update_hermes_startup_snapshot(config)
