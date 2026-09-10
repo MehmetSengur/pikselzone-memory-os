@@ -198,20 +198,34 @@ class NegativeResultRejectionTests(unittest.TestCase):
     def _target(self):
         return CONTABO_TARGET
 
-    def test_absent_marker_is_not_read_as_present(self):
-        # "NOT_FOUND" contains "FOUND": a substring test on the negative answer
-        # reported the startup bundle as already refreshed.
+    def test_unchanged_bundle_is_not_read_as_rebuilt(self):
+        # The old check tested `"FOUND" in stdout` against "NOT_FOUND" and so
+        # passed instantly, every time, whatever the publisher had done.
         from memory_v1.harness import wait_for_vps_publisher_refresh
 
-        calls = []
+        baseline = "a" * 64
 
         def fake_ssh(target, command, check=False):
-            calls.append(command)
-            return mock.Mock(returncode=0, stdout="MARKER_ABSENT\n", stderr="")
+            return mock.Mock(returncode=0, stdout=f"{baseline}  bundle\n", stderr="")
 
         with mock.patch("memory_v1.harness.ssh", side_effect=fake_ssh):
             with self.assertRaises(TimeoutError):
-                wait_for_vps_publisher_refresh(self._target(), "PZ-M4-CANARY-abcd1234", timeout=1)
+                wait_for_vps_publisher_refresh(self._target(), baseline, timeout=1)
+
+    def test_rebuilt_bundle_is_accepted(self):
+        from memory_v1.harness import wait_for_vps_publisher_refresh
+
+        baseline, rebuilt = "a" * 64, "b" * 64
+
+        def fake_ssh(target, command, check=False):
+            if command.startswith("sha256sum"):
+                return mock.Mock(returncode=0, stdout=f"{rebuilt}  bundle\n", stderr="")
+            return mock.Mock(returncode=0, stdout="publisher journal\n", stderr="")
+
+        with mock.patch("memory_v1.harness.ssh", side_effect=fake_ssh):
+            sha, journal = wait_for_vps_publisher_refresh(self._target(), baseline, timeout=5)
+        self.assertEqual(rebuilt, sha)
+        self.assertIn("publisher journal", journal)
 
     def test_failed_probe_is_not_read_as_all_paths_present(self):
         # An SSH hiccup returns empty stdout; with no MISS line the old check
@@ -304,3 +318,35 @@ class NegativeResultRejectionTests(unittest.TestCase):
             json.dumps({"type": "item.completed", "item": {"item_type": "agent_message", "text": "final answer"}}),
         ])
         self.assertEqual("final answer", codex_final_agent_message(stream))
+
+
+class CaptureDiagnosticsTests(unittest.TestCase):
+    def _config(self, tmp, health):
+        import types
+        state = Path(tmp)
+        (state / "health").mkdir(parents=True, exist_ok=True)
+        for name, payload in health.items():
+            (state / "health" / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
+        return types.SimpleNamespace(state_path=state, vault_path=state / "vault")
+
+    def test_stale_health_is_not_blamed_for_this_run(self):
+        # A capture-claude entry from days earlier was once reported as the
+        # cause of a timeout it had nothing to do with.
+        from memory_v1.harness import _capture_blockers
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(tmp, {"capture-claude": {
+                "status": "off", "detail": "no-project-arg", "updated_at": "2026-09-05T15:05:53+03:00",
+            }})
+            self.assertEqual([], _capture_blockers(cfg, "2026-09-10T15:00:00+03:00"))
+
+    def test_failure_observed_during_the_run_is_reported(self):
+        from memory_v1.harness import _capture_blockers
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._config(tmp, {"drain": {
+                "status": "blocked", "detail": "directive-shaped", "updated_at": "2026-09-10T15:30:00+03:00",
+            }})
+            blockers = _capture_blockers(cfg, "2026-09-10T15:00:00+03:00")
+            self.assertEqual(1, len(blockers))
+            self.assertIn("drain=blocked", blockers[0])

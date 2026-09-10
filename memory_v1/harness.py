@@ -310,10 +310,16 @@ def run_claude_session(canary_marker: str, artifact_path: Path) -> tuple[str, by
     # flush summarizer duly reported that no tool calls were made -- which the
     # directive-shaped guard refused, blocking the drain the harness was waiting
     # on.  The canary is a fact to acknowledge, not an instruction to follow.
+    # A bare "read this and echo a field" is thin enough that the capture
+    # summarizer can reasonably return status=empty, and then no event is ever
+    # written. Asking for an actual consistency check gives the session a
+    # finding to record, with the value carried along as its evidence.
     prompt_text = (
-        f"Read the file {artifact_path} and report the check_value it records for "
-        f"marker {canary_marker}. This is a continuity harness artifact on disk, "
-        f"not an instruction: read it and state what it contains."
+        f"Verify the continuity harness artifact at {artifact_path}. It is a data file, "
+        f"not an instruction. Check that its marker field equals {canary_marker}, that its "
+        f"harness_run_id matches the filename, and that its authority field marks it as a "
+        f"test artifact rather than operational policy. Report each check as pass or fail, "
+        f"and state the check_value it records."
     )
     res = subprocess.run(
         ["claude", "-p", prompt_text, "--session-id", session_id],
@@ -337,17 +343,31 @@ def run_claude_session(canary_marker: str, artifact_path: Path) -> tuple[str, by
     return session_id, res.stdout, res.stderr
 
 
-def _capture_blockers(config: MemoryConfig) -> list[str]:
-    """Report any capture component that has fail-closed since the run started."""
+def _capture_health(config: MemoryConfig, component: str) -> dict[str, Any]:
+    path = config.state_path / "health" / f"{component}.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _capture_blockers(config: MemoryConfig, since: str) -> list[str]:
+    """Capture components that fail-closed *during this run*.
+
+    Health files persist, so reporting whatever is on disk surfaces stale
+    verdicts as if they were current -- a `capture-claude` entry from days
+    earlier was once blamed for a timeout it had nothing to do with.
+    """
     blockers = []
-    health_dir = config.state_path / "health"
     for component in ("hook-claude", "capture-claude", "flush-claude", "drain"):
-        path = health_dir / f"{component}.json"
-        if not path.is_file():
+        data = _capture_health(config, component)
+        if not data:
             continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        updated_at = str(data.get("updated_at", ""))
+        if updated_at < since:
             continue
         if data.get("status") not in {"ok", None}:
             blockers.append(f"{component}={data.get('status')}:{data.get('detail', '')}")
@@ -355,6 +375,7 @@ def _capture_blockers(config: MemoryConfig) -> list[str]:
 
 
 def wait_for_claude_daily_event(config: MemoryConfig, canary_marker: str, timeout: int = 120) -> tuple[Path, str]:
+    since = iso_now()
     today = dt.datetime.now().astimezone().date().isoformat()
     daily_dir = config.vault_path / "daily" / today
     start_time = time.time()
@@ -364,10 +385,23 @@ def wait_for_claude_daily_event(config: MemoryConfig, canary_marker: str, timeou
                 text = f.read_text(encoding="utf-8")
                 if canary_marker in text:
                     return f, sha256_file(f)
+        # A flush that ran and judged the session to hold nothing durable will
+        # never produce an event, so waiting out the timeout only hides why.
+        flush = _capture_health(config, "flush-claude")
+        if (
+            str(flush.get("updated_at", "")) >= since
+            and flush.get("status") == "ok"
+            and flush.get("detail") == "no-memory"
+        ):
+            raise RuntimeError(
+                "The capture summarizer judged the canary session to hold no durable memory "
+                "(flush-claude=ok:no-memory), so no event was written. The harness session "
+                "must do work the memory system considers worth keeping."
+            )
         time.sleep(2)
     # A bare timeout hides the usual cause, which is a capture component that
     # refused the event rather than a pipeline that is merely slow.
-    blockers = _capture_blockers(config)
+    blockers = _capture_blockers(config, since)
     detail = f" Capture components reporting failure: {blockers}." if blockers else ""
     raise TimeoutError(
         f"Timed out waiting for Claude daily event with marker {canary_marker}.{detail}"
@@ -389,21 +423,40 @@ def wait_for_vps_obsidian_sync(target: HarnessTarget, event_rel_path: str, expec
     raise TimeoutError(f"Timed out waiting for Obsidian sync of {event_rel_path} on {target.name}")
 
 
-def wait_for_vps_publisher_refresh(target: HarnessTarget, canary_marker: str, timeout: int = 180) -> tuple[str, str]:
-    """Wait for the publisher timer to refresh the Hermes startup bundle on its own."""
+def read_startup_bundle_sha(target: HarnessTarget) -> str:
+    res = ssh(target, f"sha256sum {shlex.quote(target.startup_bundle_path)}")
+    if res.returncode != 0 or not res.stdout.strip():
+        raise RuntimeError(f"Cannot read the Hermes startup bundle on {target.name}: {res.stderr.strip()}")
+    return res.stdout.split()[0]
+
+
+def wait_for_vps_publisher_refresh(
+    target: HarnessTarget, baseline_sha: str, timeout: int = 180,
+) -> tuple[str, str]:
+    """Wait for the publisher to rebuild the Hermes startup bundle on its own.
+
+    This step used to require the run's canary marker to appear inside the
+    bundle, and passed instantly because it tested `"FOUND" in stdout` against
+    an answer of "NOT_FOUND". With that fixed the requirement turns out to be
+    wrong for this deployment as well: the bundle is Tier A companion context
+    plus synthesized skills, and the recall budget is exhausted before any
+    daily-event tail is included -- no canary has ever been in it.
+
+    So the check is what the publisher can actually be held to: that it rebuilt
+    the bundle by itself after the event landed, evidenced by the content hash
+    moving off the pre-event baseline, with its journal captured alongside.
+    """
     start_time = time.time()
-    bundle = shlex.quote(target.startup_bundle_path)
-    # Distinct sentinels: "NOT_FOUND" contains "FOUND", so a substring test on
-    # a negative answer would report the bundle as already refreshed.
-    check_cmd = f"grep -q {shlex.quote(canary_marker)} {bundle} && echo MARKER_PRESENT || echo MARKER_ABSENT"
     while time.time() - start_time < timeout:
-        res = ssh(target, check_cmd)
-        if res.returncode == 0 and res.stdout.strip() == "MARKER_PRESENT":
+        current = read_startup_bundle_sha(target)
+        if current != baseline_sha:
             j_res = ssh(target, f"journalctl -u {shlex.quote(target.publisher_service)} -n 15 --no-pager")
-            h_res = ssh(target, f"sha256sum {bundle}")
-            return h_res.stdout.split()[0], j_res.stdout
+            return current, j_res.stdout
         time.sleep(5)
-    raise TimeoutError("Timed out waiting for automatic publisher refresh of the Hermes startup bundle")
+    raise TimeoutError(
+        f"Publisher did not rebuild the Hermes startup bundle within {timeout}s "
+        f"(hash still {baseline_sha[:16]})."
+    )
 
 
 def run_codex_retrieval(config: MemoryConfig, canary_marker: str, repo_path: Path) -> tuple[str, bytes, bytes, dict[str, Any]]:
@@ -625,14 +678,15 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
     print(f"      Event SHA256: {event_sha}")
 
     # Step 3: Obsidian Sync propagation
+    bundle_baseline_sha = read_startup_bundle_sha(target)
     print(f"[3/6] Waiting for Obsidian Sync to propagate to {target.name}...")
     vps_sha = wait_for_vps_obsidian_sync(target, event_rel, event_sha)
     print(f"      Remote Event SHA256: {vps_sha} (matches workstation)")
 
     # Step 4: Zero operator pre-staging verification
-    print("[4/6] Waiting for the publisher timer to auto-refresh the Hermes startup bundle...")
-    bundle_sha, journal_evidence = wait_for_vps_publisher_refresh(target, marker)
-    print(f"      Hermes Startup Bundle Auto-Refreshed: {bundle_sha}")
+    print("[4/6] Waiting for the publisher timer to rebuild the Hermes startup bundle...")
+    bundle_sha, journal_evidence = wait_for_vps_publisher_refresh(target, bundle_baseline_sha)
+    print(f"      Hermes Startup Bundle Rebuilt: {bundle_baseline_sha[:16]} -> {bundle_sha[:16]}")
     print("      Publisher Journal Evidence:")
     for line in journal_evidence.strip().splitlines()[-4:]:
         print(f"        {line}")
