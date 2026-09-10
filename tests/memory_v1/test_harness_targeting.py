@@ -21,7 +21,31 @@ from memory_v1.harness import (
     build_canary,
     load_target,
     preflight,
+    stage_canary_artifact,
 )
+
+
+class CanaryArtifactTests(unittest.TestCase):
+    def test_check_value_originates_from_a_file_on_disk(self):
+        # The value must be something a session reads, not something a prompt
+        # asserts: an asserted token that a later session is asked to repeat is
+        # the shape of an exfiltration attempt, and capture flagged it as one.
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = stage_canary_artifact(
+                Path(tmp), "PZ-M4-CANARY-abcd1234", "PZV-0123456789ab", "harness-test"
+            )
+            self.assertTrue(artifact.is_file())
+            data = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertEqual("PZV-0123456789ab", data["check_value"])
+            self.assertEqual("PZ-M4-CANARY-abcd1234", data["marker"])
+
+    def test_artifact_declares_itself_non_authoritative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = stage_canary_artifact(
+                Path(tmp), "PZ-M4-CANARY-abcd1234", "PZV-0123456789ab", "harness-test"
+            )
+            data = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertEqual("test-artifact-not-operational-policy", data["authority"])
 
 
 class CanaryShapeTests(unittest.TestCase):
@@ -42,6 +66,32 @@ class CanaryShapeTests(unittest.TestCase):
         canary = build_canary("PZ-M4-CANARY-abcd1234", "PZV-0123456789ab").casefold()
         for forbidden in ("tool call", "system prompt", "execute this", "run this command"):
             self.assertNotIn(forbidden, canary)
+
+
+class HermesInvocationTests(unittest.TestCase):
+    def test_hermes_leg_runs_as_the_service_user(self):
+        # SSH lands as root; a root-run session writes outbox recall evidence
+        # root-owned, and the publisher (running as the service user) then
+        # cannot read it -- one such run blocked every later promotion.
+        from memory_v1.harness import hermes_cmd
+
+        command = hermes_cmd(CONTABO_TARGET, "sessions list")
+        self.assertIn("sudo -n -u pzhermes", command)
+        self.assertIn(CONTABO_TARGET.hermes_cli, command)
+        self.assertIn(CONTABO_TARGET.hermes_profile, command)
+
+    def test_no_user_switch_when_target_declares_none(self):
+        from memory_v1.harness import hermes_cmd
+
+        target = dataclasses_replace(CONTABO_TARGET, hermes_run_user="")
+        command = hermes_cmd(target, "sessions list")
+        self.assertNotIn("sudo", command)
+
+
+def dataclasses_replace(instance, **changes):
+    import dataclasses
+
+    return dataclasses.replace(instance, **changes)
 
 
 class CodexSessionIdTests(unittest.TestCase):
@@ -94,6 +144,8 @@ class PreflightTests(unittest.TestCase):
         def fake_ssh(target, command, check=False):
             if command == "hostname":
                 return mock.Mock(returncode=0, stdout=hostname + "\n", stderr="")
+            if command.endswith("id -un"):
+                return mock.Mock(returncode=0, stdout=target.hermes_run_user + "\n", stderr="")
             return mock.Mock(returncode=0, stdout=probe_output, stderr="")
 
         with mock.patch("memory_v1.harness.ssh", side_effect=fake_ssh):
@@ -122,6 +174,18 @@ class PreflightTests(unittest.TestCase):
         info = self._run_preflight_with("vmi3566230", self._all_paths_present())
         self.assertEqual("vmi3566230", info["hostname"])
         self.assertFalse(info["policy_guard_available"])
+
+    def test_refuses_when_the_service_user_cannot_be_assumed(self):
+        def fake_ssh(target, command, check=False):
+            if command == "hostname":
+                return mock.Mock(returncode=0, stdout="vmi3566230\n", stderr="")
+            if command.endswith("id -un"):
+                return mock.Mock(returncode=1, stdout="", stderr="sudo: a password is required")
+            return mock.Mock(returncode=0, stdout=self._all_paths_present(), stderr="")
+
+        with mock.patch("memory_v1.harness.ssh", side_effect=fake_ssh):
+            with self.assertRaisesRegex(RuntimeError, "Cannot run as service user"):
+                preflight(CONTABO_TARGET)
 
 
 if __name__ == "__main__":

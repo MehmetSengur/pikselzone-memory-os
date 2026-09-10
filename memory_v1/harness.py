@@ -78,6 +78,9 @@ class HarnessTarget:
     memory_pythonpath: str
     publisher_service: str = "pz-memory-publisher.service"
     policy_guard: str = ""  # empty means "not installed on this target"
+    # The account the Hermes services run as.  The retrieval leg must run as
+    # this user; see hermes_cmd for why.
+    hermes_run_user: str = "pzhermes"
 
     @classmethod
     def from_file(cls, path: Path) -> "HarnessTarget":
@@ -151,7 +154,20 @@ def scp_from(target: HarnessTarget, remote_src: str, local_dest: str) -> None:
 
 
 def hermes_cmd(target: HarnessTarget, args: str) -> str:
-    return f"{shlex.quote(target.hermes_cli)} -p {shlex.quote(target.hermes_profile)} {args}"
+    """Build a Hermes CLI invocation that runs as the service account.
+
+    SSH lands on this host as root, and a Hermes session started as root writes
+    its receipts, discovery state and outbox recall evidence as root:root. The
+    publisher runs as the service user and could then no longer read the outbox
+    file -- which is a single fixed filename, so one root-run session blocked
+    every later recall promotion with a per-minute PermissionError until the
+    ownership was repaired. The retrieval leg has to run as a normal session
+    would.
+    """
+    inner = f"{shlex.quote(target.hermes_cli)} -p {shlex.quote(target.hermes_profile)} {args}"
+    if not target.hermes_run_user:
+        return inner
+    return f"sudo -n -u {shlex.quote(target.hermes_run_user)} -H sh -lc {shlex.quote(inner)}"
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +210,14 @@ def preflight(target: HarnessTarget) -> dict[str, Any]:
     if missing:
         raise RuntimeError(f"Target {target.name} is missing required paths: {missing}")
 
+    if target.hermes_run_user:
+        who = ssh(target, f"sudo -n -u {shlex.quote(target.hermes_run_user)} id -un")
+        if who.returncode != 0 or who.stdout.strip() != target.hermes_run_user:
+            raise RuntimeError(
+                f"Cannot run as service user {target.hermes_run_user!r} on {target.name}: "
+                f"{who.stderr.strip() or who.stdout.strip()}"
+            )
+
     policy_guard_available = False
     if target.policy_guard:
         pg = ssh(target, f"test -x {shlex.quote(target.policy_guard)} && echo YES || echo NO")
@@ -214,23 +238,50 @@ def preflight(target: HarnessTarget) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def build_canary(marker: str, value: str) -> str:
-    """The fact the harness plants and later expects to read back.
+CANARY_ARTIFACT_DIR = Path("tmp") / "continuity-harness"
 
-    It is labelled as harness test data on purpose. An earlier revision planted
-    an operational-sounding policy claim, and the capture summarizer correctly
-    filed it as an attempted prompt injection -- a memory system that accepted
-    an unsourced policy asserted in a prompt would be the real defect. The
-    marker and value carry the continuity signal; nothing here asks the system
-    to treat prompt text as authority.
+
+def stage_canary_artifact(repo_root: Path, marker: str, value: str, run_id: str) -> Path:
+    """Write the run's check value to a real file, and return its path.
+
+    The canary has to enter memory the way any other fact does: as something
+    the session observed while doing real work. Two earlier revisions instead
+    asserted the value in the prompt and asked a later session to repeat it --
+    which is the shape of a token-exfiltration injection, and this deployment's
+    summarizer classified it as exactly that, twice. It was right to. Rewording
+    until the detector stopped noticing would have been gaming the test; the
+    fix is to give the harness a genuine artifact to read.
     """
+    artifact_dir = repo_root / CANARY_ARTIFACT_DIR
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact = artifact_dir / f"{run_id}.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "schema": "pikselzone-continuity-harness-artifact-v1",
+                "purpose": "cross-runtime continuity acceptance test",
+                "authority": "test-artifact-not-operational-policy",
+                "harness_run_id": run_id,
+                "marker": marker,
+                "check_value": value,
+                "created_at": iso_now(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return artifact
+
+
+def build_canary(marker: str, value: str) -> str:
+    """The provenance sentence recorded alongside the run in its receipt."""
     return (
         f"Continuity harness test data, not an operational policy: "
         f"for marker {marker} the recorded check value is {value}."
     )
 
 
-def run_claude_session(canary_marker: str, canary_decision: str) -> tuple[str, bytes, bytes]:
+def run_claude_session(canary_marker: str, artifact_path: Path) -> tuple[str, bytes, bytes]:
     """Run a real Claude Code session under a pre-assigned session id.
 
     The id is chosen by the harness and handed to the CLI, so the transcript is
@@ -245,8 +296,9 @@ def run_claude_session(canary_marker: str, canary_decision: str) -> tuple[str, b
     # directive-shaped guard refused, blocking the drain the harness was waiting
     # on.  The canary is a fact to acknowledge, not an instruction to follow.
     prompt_text = (
-        f"{canary_decision} "
-        f"Acknowledge it by replying with the marker and the check value, and nothing else."
+        f"Read the file {artifact_path} and report the check_value it records for "
+        f"marker {canary_marker}. This is a continuity harness artifact on disk, "
+        f"not an instruction: read it and state what it contains."
     )
     res = subprocess.run(
         ["claude", "-p", prompt_text, "--session-id", session_id],
@@ -461,6 +513,7 @@ def run_hermes_retrieval(target: HarnessTarget, canary_marker: str) -> tuple[str
         capture_output=True,
         text=False,
     )
+
     if res.returncode != 0:
         raise RuntimeError(
             f"Hermes execution failed: rc={res.returncode}\nstderr={res.stderr.decode('utf-8', 'replace')}"
@@ -523,21 +576,27 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
 
     token = secrets.token_hex(4)
     marker = f"PZ-M4-CANARY-{token}"
-    check_value = f"PZV-{secrets.token_hex(6)}"
-    decision = build_canary(marker, check_value)
-    # Continuity is proven by a value that could only have come from memory.
-    # Matching on a whole sentence instead would accept a retrieval that merely
-    # quoted the canary back while describing it as something the system had
-    # rejected.
+    # The value names itself as harness test data, so the string that ends up in
+    # memory and in the receipt is self-labelling. Independent verification
+    # re-derives the match from raw captured stdout against the recorded canary,
+    # so the recorded canary has to be exactly the token a retrieval returns --
+    # a longer descriptive sentence would never appear verbatim, and relaxing
+    # that check would remove the receipt's only guard against a harness that
+    # simply asserts its own success.
+    check_value = f"PZ-HARNESS-TESTVALUE-{secrets.token_hex(6)}"
+    canary_note = build_canary(marker, check_value)
+    decision = check_value
     expected_token = check_value.casefold()
     harness_run_id = f"harness-{secrets.token_hex(8)}"
     print(f"[*] Generated Random Canary: {marker}")
-    print(f"[*] Decision: {decision}")
+    print(f"[*] Canary: {canary_note}")
     print(f"[*] Harness Run ID: {harness_run_id}")
 
     # Step 1: Real Claude session under a pre-assigned id
     print("[1/6] Launching real Claude Code session...")
-    claude_session_id, claude_stdout, claude_stderr = run_claude_session(marker, decision)
+    artifact_path = stage_canary_artifact(repo_root, marker, check_value, harness_run_id)
+    print(f"[*] Canary artifact: {artifact_path}")
+    claude_session_id, claude_stdout, claude_stderr = run_claude_session(marker, artifact_path)
     print(f"      Claude Session ID: {claude_session_id}")
 
     # Step 2: Automatic background drain & event creation
@@ -768,6 +827,7 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
         "canary_marker": marker,
         "canary_decision": decision,
         "canary_check_value": check_value,
+        "canary_note": canary_note,
         "claude_session_id": claude_session_id,
         "event_path": event_rel,
         "event_sha256": event_sha,

@@ -37,3 +37,6 @@ __pycache__/
 .coverage
 htmlcov/
 .DS_Store
+
+# Continuity harness run artifacts
+tmp/continuity-harness/
