@@ -178,6 +178,27 @@ authority: "derived-session-memory-not-operational-truth"
             promote_knowledge_outbox(self.config, outbox_root=self.outbox_root)
         self.assertFalse((self.vault / "knowledge/concepts/bad.md").exists())
 
+    def test_promoter_rejects_concept_linking_to_uncreated_connection(self):
+        # The live graph carries this exact shape: concepts promoted with
+        # [[connections/a--b]] references to connection files that were never
+        # written, leaving dangling links behind.
+        self._create_event()
+        select_and_stage_batch(self.config, outbox_root=self.outbox_root, max_events=10)
+        bad_writes = [{
+            "path": "knowledge/concepts/alpha.md",
+            "content": (
+                "---\ntitle: Alpha\naliases: []\n---\n# Alpha\n"
+                "[[connections/alpha--beta]]\n"
+            ),
+        }]
+        result = load_knowledge_generator().generate_knowledge(
+            base_dir=str(self.outbox_root), llm_client=MockLlmSuccess(writes=bad_writes)
+        )
+        self.assertEqual("ok", result["status"])
+        with self.assertRaisesRegex(PolicyError, "candidate-broken-or-noncanonical-wikilink"):
+            promote_knowledge_outbox(self.config, outbox_root=self.outbox_root)
+        self.assertFalse((self.vault / "knowledge/concepts/alpha.md").exists())
+
     def test_compiler_snapshot_excludes_observed_conflicted_copy(self):
         self._create_event()
         conflict = self.knowledge / "index (Conflicted copy pz-hermes 202608301608).md"

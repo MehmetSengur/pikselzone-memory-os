@@ -214,6 +214,22 @@ def preflight(target: HarnessTarget) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def build_canary(marker: str, value: str) -> str:
+    """The fact the harness plants and later expects to read back.
+
+    It is labelled as harness test data on purpose. An earlier revision planted
+    an operational-sounding policy claim, and the capture summarizer correctly
+    filed it as an attempted prompt injection -- a memory system that accepted
+    an unsourced policy asserted in a prompt would be the real defect. The
+    marker and value carry the continuity signal; nothing here asks the system
+    to treat prompt text as authority.
+    """
+    return (
+        f"Continuity harness test data, not an operational policy: "
+        f"for marker {marker} the recorded check value is {value}."
+    )
+
+
 def run_claude_session(canary_marker: str, canary_decision: str) -> tuple[str, bytes, bytes]:
     """Run a real Claude Code session under a pre-assigned session id.
 
@@ -223,10 +239,14 @@ def run_claude_session(canary_marker: str, canary_decision: str) -> tuple[str, b
     including the session the harness itself may be running under.
     """
     session_id = str(uuid.uuid4())
+    # Deliberately free of the words this deployment's injection defense looks
+    # for.  An earlier revision asked the session not to call any tools, and the
+    # flush summarizer duly reported that no tool calls were made -- which the
+    # directive-shaped guard refused, blocking the drain the harness was waiting
+    # on.  The canary is a fact to acknowledge, not an instruction to follow.
     prompt_text = (
-        f"Record this durable operational decision into session context: "
-        f"Canary marker {canary_marker}: {canary_decision}. "
-        f"Confirm this decision with the canary marker. Do not call any tools."
+        f"{canary_decision} "
+        f"Acknowledge it by replying with the marker and the check value, and nothing else."
     )
     res = subprocess.run(
         ["claude", "-p", prompt_text, "--session-id", session_id],
@@ -250,6 +270,23 @@ def run_claude_session(canary_marker: str, canary_decision: str) -> tuple[str, b
     return session_id, res.stdout, res.stderr
 
 
+def _capture_blockers(config: MemoryConfig) -> list[str]:
+    """Report any capture component that has fail-closed since the run started."""
+    blockers = []
+    health_dir = config.state_path / "health"
+    for component in ("hook-claude", "capture-claude", "flush-claude", "drain"):
+        path = health_dir / f"{component}.json"
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("status") not in {"ok", None}:
+            blockers.append(f"{component}={data.get('status')}:{data.get('detail', '')}")
+    return blockers
+
+
 def wait_for_claude_daily_event(config: MemoryConfig, canary_marker: str, timeout: int = 120) -> tuple[Path, str]:
     today = dt.datetime.now().astimezone().date().isoformat()
     daily_dir = config.vault_path / "daily" / today
@@ -261,7 +298,13 @@ def wait_for_claude_daily_event(config: MemoryConfig, canary_marker: str, timeou
                 if canary_marker in text:
                     return f, sha256_file(f)
         time.sleep(2)
-    raise TimeoutError(f"Timed out waiting for Claude daily event with marker {canary_marker}")
+    # A bare timeout hides the usual cause, which is a capture component that
+    # refused the event rather than a pipeline that is merely slow.
+    blockers = _capture_blockers(config)
+    detail = f" Capture components reporting failure: {blockers}." if blockers else ""
+    raise TimeoutError(
+        f"Timed out waiting for Claude daily event with marker {canary_marker}.{detail}"
+    )
 
 
 def wait_for_vps_obsidian_sync(target: HarnessTarget, event_rel_path: str, expected_sha: str, timeout: int = 120) -> str:
@@ -301,7 +344,7 @@ def run_codex_retrieval(config: MemoryConfig, canary_marker: str, repo_path: Pat
         codex_bin,
         "exec",
         "--json",
-        f"What is the decision recorded in memory for marker {canary_marker}?",
+        f"What check value is recorded in memory for continuity harness marker {canary_marker}?",
         "-C", str(repo_path),
         "-s", "workspace-write",
     ]
@@ -407,8 +450,8 @@ def run_hermes_retrieval(target: HarnessTarget, canary_marker: str) -> tuple[str
     before = _hermes_session_ids(target)
 
     prompt = (
-        f"What is the decision recorded in memory for marker {canary_marker}? "
-        f"Answer with the recorded decision sentence. "
+        f"What check value is recorded in memory for continuity harness marker {canary_marker}? "
+        f"Answer with that check value. "
         f"Then, as the final line of your reply, print exactly "
         f"{_HERMES_SESSION_MARK} followed by your own session id."
     )
@@ -480,9 +523,13 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
 
     token = secrets.token_hex(4)
     marker = f"PZ-M4-CANARY-{token}"
-    decision = "All production deployments require multi-runtime verification."
-    clean_dec = re.sub(r"[*_`\"'“”]", "", decision).strip().lower()
-    clean_dec_core = clean_dec.rstrip(".")
+    check_value = f"PZV-{secrets.token_hex(6)}"
+    decision = build_canary(marker, check_value)
+    # Continuity is proven by a value that could only have come from memory.
+    # Matching on a whole sentence instead would accept a retrieval that merely
+    # quoted the canary back while describing it as something the system had
+    # rejected.
+    expected_token = check_value.casefold()
     harness_run_id = f"harness-{secrets.token_hex(8)}"
     print(f"[*] Generated Random Canary: {marker}")
     print(f"[*] Decision: {decision}")
@@ -517,27 +564,27 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
     print("[5/6] Launching fresh normal trusted Codex session...")
     codex_session_id, codex_stdout_bytes, codex_stderr_bytes, codex_mapping = run_codex_retrieval(config, marker, repo_root)
     codex_stdout_str = codex_stdout_bytes.decode("utf-8", errors="replace")
-    clean_codex = re.sub(r"[*_`\"'“”]", "", codex_stdout_str).strip().lower()
-    codex_matched = (clean_dec in clean_codex or clean_dec_core in clean_codex)
+    clean_codex = re.sub(r"[*_`\"'“”]", "", codex_stdout_str).strip().casefold()
+    codex_matched = expected_token in clean_codex
     codex_stdout_sha = sha256_bytes(codex_stdout_bytes)
     print(f"      Codex Session ID: {codex_session_id}")
     print(f"      Codex Output SHA256: {codex_stdout_sha}")
-    print(f"      Codex Decision Match: {codex_matched}")
+    print(f"      Codex Check-Value Match: {codex_matched}")
     if not codex_matched:
-        raise RuntimeError(f"Codex failed to retrieve decision: {codex_stdout_str}")
+        raise RuntimeError(f"Codex did not return check value {check_value}: {codex_stdout_str}")
 
     # Step 6: Fresh native Hermes retrieval
     print(f"[6/6] Launching fresh Hermes session ({target.hermes_profile} on {target.name})...")
     hermes_session_id, hermes_stdout_bytes, hermes_stderr_bytes, hermes_obs = run_hermes_retrieval(target, marker)
     hermes_stdout_str = hermes_stdout_bytes.decode("utf-8", errors="replace")
-    clean_hermes = re.sub(r"[*_`\"'“”]", "", hermes_stdout_str).strip().lower()
-    hermes_matched = (clean_dec in clean_hermes or clean_dec_core in clean_hermes)
+    clean_hermes = re.sub(r"[*_`\"'“”]", "", hermes_stdout_str).strip().casefold()
+    hermes_matched = expected_token in clean_hermes
     hermes_stdout_sha = sha256_bytes(hermes_stdout_bytes)
     print(f"      Hermes Session ID: {hermes_session_id} ({hermes_obs['identification_basis']})")
     print(f"      Hermes Output SHA256: {hermes_stdout_sha}")
-    print(f"      Hermes Decision Match: {hermes_matched}")
+    print(f"      Hermes Check-Value Match: {hermes_matched}")
     if not hermes_matched:
-        raise RuntimeError(f"Hermes failed to retrieve decision: {hermes_stdout_str}")
+        raise RuntimeError(f"Hermes did not return check value {check_value}: {hermes_stdout_str}")
 
     print("[*] Waiting for the publisher timer to promote recall-hermes.json...")
     recall_hermes_remote = f"{target.evidence_dir.rstrip('/')}/recall-hermes.json"
@@ -720,6 +767,7 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
         "harness_run_id": harness_run_id,
         "canary_marker": marker,
         "canary_decision": decision,
+        "canary_check_value": check_value,
         "claude_session_id": claude_session_id,
         "event_path": event_rel,
         "event_sha256": event_sha,
