@@ -22,6 +22,9 @@ from .graph_engine import slugify
 
 logger = logging.getLogger("memory_v1.skill_engine")
 
+# A workflow becomes a skill only when this many separate sessions repeat it.
+SKILL_MIN_DISTINCT_SESSIONS = 2
+
 
 @dataclasses.dataclass
 class WorkflowObservation:
@@ -51,6 +54,7 @@ class SkillSpec:
     updated_at: str = ""
     execution_count: int = 2
     changelog: list[str] = dataclasses.field(default_factory=list)
+    sources: list[str] = dataclasses.field(default_factory=list)
 
 
 class SkillEngine:
@@ -165,6 +169,10 @@ class SkillEngine:
             "edge_cases": obs.edge_cases,
         })
 
+        if candidate.get("status") == "retired":
+            # Retired by maintenance: keep the record, never re-synthesize it.
+            return None
+
         candidate["count"] += 1
         candidate["observations"].append({
             "session_id": obs.session_id,
@@ -187,8 +195,13 @@ class SkillEngine:
         state["updated_at"] = iso_now()
         atomic_json(self.candidates_file, state)
 
-        # If observed 2 or more times, auto-materialize into a standard skill!
-        if candidate["count"] >= 2:
+        # Repetition has to mean separate sessions. Counting calls let one pasted
+        # task prompt, observed twice inside the same session, become a "skill";
+        # every synthesized skill in the live vault had one distinct session.
+        distinct_sessions = sorted({
+            str(o.get("session_id")) for o in candidate["observations"] if o.get("session_id")
+        })
+        if len(distinct_sessions) >= SKILL_MIN_DISTINCT_SESSIONS:
             spec = SkillSpec(
                 slug=slug,
                 name=obs.workflow_name,
@@ -199,8 +212,9 @@ class SkillEngine:
                 tools_or_scripts=candidate["tools"],
                 expected_output=f"{obs.workflow_name} başarıyla tamamlanmış olmalı.",
                 recovery_steps=["Hata durumunda logları incele ve oturum sürekliliğine not düş."],
-                execution_count=candidate["count"],
-                changelog=[f"v1.0.0 ({dt.date.today().isoformat()}): {candidate['count']} oturum tekrarından otomatik sentezlendi."],
+                execution_count=len(distinct_sessions),
+                changelog=[f"v1.0.0 ({dt.date.today().isoformat()}): {len(distinct_sessions)} ayrı oturumda tekrarlandığı için otomatik sentezlendi."],
+                sources=distinct_sessions,
             )
             return self.materialize_skill(spec)
 
@@ -225,6 +239,9 @@ class SkillEngine:
         tools_lines = "\n".join(f"- `{t}`" for t in spec.tools_or_scripts)
         recovery_lines = "\n".join(f"- {r}" for r in spec.recovery_steps)
         changelog_lines = "\n".join(f"- {c}" for c in (spec.changelog or [f"v{spec.version} ({today_str}): Başlangıç sürümü."]))
+        sources_line = (
+            f"sources: {json.dumps(spec.sources, ensure_ascii=False)}\n" if spec.sources else ""
+        )
 
         content = (
             f"---\n"
@@ -235,6 +252,7 @@ class SkillEngine:
             f'created_at: "{created}"\n'
             f'updated_at: "{updated}"\n'
             f"execution_count: {spec.execution_count}\n"
+            f"{sources_line}"
             f"---\n\n"
             f"# Skill: {spec.name}\n\n"
             f"## 1. Ne Zaman Tetiklenir (Triggers)\n"
