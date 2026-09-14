@@ -154,6 +154,10 @@ class RuleLearner:
     def apply_rule(self, item: ExtractedRule, source: str) -> str:
         """Write one rule or candidate into Kurallar.md and say what happened."""
         existing = self.companion.read_rules()
+        if any(r.text == item.rule_text for r in existing):
+            # Checked first: replaying an applied replacement must not go on to
+            # replace a second rule that happens to conflict with the new one.
+            return "duplicate-active"
         if item.is_explicit and any(s in item.rule_text.lower() for s in REPLACEMENT_SIGNALS):
             # "X yerine Y" shares most of its words with the rule it replaces;
             # checking duplicates first would discard exactly those updates.

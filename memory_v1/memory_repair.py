@@ -478,7 +478,21 @@ def _summary(rules: list[dict[str, Any]], skills: list[dict[str, Any]]) -> dict[
     return counts
 
 
+def _require_shared_writer(config: MemoryConfig) -> None:
+    if config.role != "memory-engine":
+        raise PolicyError("repair-refused:only-the-memory-engine-writes-Kurallar.md")
+
+
 def apply_repair_plan(config: MemoryConfig, plan: dict[str, Any]) -> dict[str, Any]:
+    """Apply a reviewed plan on the single Kurallar.md writer, under its merge lock."""
+    from .learning_inbox import merge_lock
+
+    _require_shared_writer(config)
+    with merge_lock(config):
+        return _apply_repair_plan_locked(config, plan)
+
+
+def _apply_repair_plan_locked(config: MemoryConfig, plan: dict[str, Any]) -> dict[str, Any]:
     if plan.get("schema") != PLAN_SCHEMA:
         raise PolicyError("repair-plan-schema-invalid")
     vault = config.vault_path
@@ -606,12 +620,20 @@ def retire_rule_candidate(
     that turned out to be test data or a one-off request had no audited way out.
     Only the memory-engine host writes Kurallar.md, so only it may run this.
     """
-    from .companion import _CANDIDATE_PREFIX, parse_rule_candidates
+    from .learning_inbox import merge_lock
 
-    if config.role != "memory-engine":
-        raise PolicyError("repair-refused:only-the-memory-engine-writes-Kurallar.md")
+    _require_shared_writer(config)
     if not classification.strip() or not evidence.strip():
         raise PolicyError("repair-refused:classification-and-evidence-required")
+    with merge_lock(config):
+        return _retire_rule_candidate_locked(config, text, classification=classification, evidence=evidence)
+
+
+def _retire_rule_candidate_locked(
+    config: MemoryConfig, text: str, *, classification: str, evidence: str,
+) -> dict[str, Any]:
+    from .companion import _CANDIDATE_PREFIX, parse_rule_candidates
+
     vault = config.vault_path
     companion = CompanionManager(vault)
     rules_path = companion.companion_dir / "Kurallar.md"
@@ -668,6 +690,14 @@ def retire_rule_candidate(
 
 
 def revert_repair(config: MemoryConfig, repair_id: str, *, force: bool = False) -> dict[str, Any]:
+    from .learning_inbox import merge_lock
+
+    _require_shared_writer(config)
+    with merge_lock(config):
+        return _revert_repair_locked(config, repair_id, force=force)
+
+
+def _revert_repair_locked(config: MemoryConfig, repair_id: str, *, force: bool = False) -> dict[str, Any]:
     backup = config.state_path / "backups" / repair_id
     ledger_path = backup / "ledger.json"
     if not ledger_path.is_file():

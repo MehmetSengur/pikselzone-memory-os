@@ -13,8 +13,13 @@ id and is created exactly once, so two hosts never write the same path. The
 files travel with normal Obsidian Sync (markdown, because the sync carries no
 JSON), survive a disconnected host, and are merged by the publisher cycle:
 
-- the id is recorded in a merge ledger before the file is removed, so a
-  redelivered observation is a duplicate, never a second session;
+- each merge is a two-phase ledger record under one lock: ``intent`` before
+  anything is written, ``committed`` after. Every effect is idempotent for its
+  observation (journal entries carry the id; rules and candidates are keyed by
+  text and source session; a promotion is a single write), so a merge that
+  stopped at any point is completed by re-running it, never applied twice;
+- the id is recorded before the inbox file is removed, so a redelivered
+  observation is a duplicate, never a second session;
 - the merger re-checks provenance and intent on the sentence itself and keeps
   the weaker of the two classifications, so a forged or quoted record cannot
   become an active rule;
@@ -28,6 +33,8 @@ import fcntl
 import hashlib
 import json
 import logging
+import contextlib
+import os
 import re
 import socket
 import subprocess
@@ -38,7 +45,7 @@ from typing import Any, Callable
 from . import provenance as pv
 from .companion import CompanionManager
 from .core import (
-    MemoryConfig, atomic_write, ensure_safe_directory, iso_now, redact_sensitive_text, safe_unlink,
+    MemoryConfig, PolicyError, atomic_write, ensure_safe_directory, iso_now, redact_sensitive_text, safe_unlink,
 )
 from .rule_learner import ExtractedRule, RuleLearner
 
@@ -229,33 +236,59 @@ def record_journal(
 
 # --- merge --------------------------------------------------------------------
 
-def _read_ledger_ids(config: MemoryConfig) -> set[str]:
+def _ledger_state(config: MemoryConfig) -> tuple[set[str], set[str]]:
+    """(committed ids, ids with an intent but no commit). Entries from before the
+    two-phase format have no ``phase`` and count as committed."""
     path = ledger_path(config)
-    ids: set[str] = set()
+    committed: set[str] = set()
+    intents: set[str] = set()
     if not path.is_file():
-        return ids
+        return committed, intents
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
+            continue  # a torn last line from an interrupted append
+        if not (isinstance(entry, dict) and entry.get("schema") == LEDGER_SCHEMA and entry.get("obs_id")):
             continue
-        if isinstance(entry, dict) and entry.get("schema") == LEDGER_SCHEMA and entry.get("obs_id"):
-            ids.add(str(entry["obs_id"]))
-    return ids
+        if entry.get("phase") == "intent":
+            intents.add(str(entry["obs_id"]))
+        else:
+            committed.add(str(entry["obs_id"]))
+    return committed, intents - committed
 
 
-def _append_ledger(config: MemoryConfig, obs: Observation, outcome: str) -> None:
+def _read_ledger_ids(config: MemoryConfig) -> set[str]:
+    return _ledger_state(config)[0]
+
+
+def _append_ledger(config: MemoryConfig, obs: Observation, outcome: str, *, phase: str = "committed") -> None:
     path = ledger_path(config)
     ensure_safe_directory(path.parent, create=True)
     entry = {
-        "schema": LEDGER_SCHEMA, "obs_id": obs.obs_id, "kind": obs.kind, "origin_host": obs.origin_host,
-        "runtime": obs.runtime, "source_session": obs.source_session, "observed_at": obs.observed_at,
-        "claimed_intent": obs.intent, "merged_at": iso_now(), "outcome": outcome,
-        "excerpt": obs.text[:160],
+        "schema": LEDGER_SCHEMA, "obs_id": obs.obs_id, "phase": phase, "kind": obs.kind,
+        "origin_host": obs.origin_host, "runtime": obs.runtime, "source_session": obs.source_session,
+        "observed_at": obs.observed_at, "claimed_intent": obs.intent, "merged_at": iso_now(),
+        "outcome": outcome, "excerpt": obs.text[:160],
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     path.chmod(0o640)
+
+
+@contextlib.contextmanager
+def merge_lock(config: MemoryConfig):
+    """The one lock every writer of the shared companion files takes on the engine."""
+    lock_path = config.state_path / "learning" / "merge.lock"
+    ensure_safe_directory(lock_path.parent, create=True)
+    with lock_path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _effective_rule_intent(obs: Observation) -> tuple[str, str]:
@@ -280,8 +313,10 @@ def _effective_rule_intent(obs: Observation) -> tuple[str, str]:
 
 def _apply(config: MemoryConfig, obs: Observation, companion: CompanionManager) -> str:
     if obs.kind == "journal":
-        companion.append_journal_entry(title=obs.reason or "Oturum Özeti", narrative=obs.text, runtime=obs.runtime)
-        return "journal-appended"
+        appended = companion.append_journal_entry(
+            title=obs.reason or "Oturum Özeti", narrative=obs.text, runtime=obs.runtime, marker=obs.obs_id,
+        )
+        return "journal-appended" if appended else "journal-already-present"
     intent, rejection = _effective_rule_intent(obs)
     if rejection:
         return rejection
@@ -297,21 +332,30 @@ def _apply(config: MemoryConfig, obs: Observation, companion: CompanionManager) 
 
 def merge_observation(
     config: MemoryConfig, obs: Observation, *, companion: CompanionManager | None = None,
-    known_ids: set[str] | None = None,
 ) -> str:
-    """Apply one observation exactly once. Only the merger host may call this."""
+    """Apply one observation exactly once. Only the merger host may call this.
+
+    Recovery by stopping point:
+    - before the intent record: nothing happened; the next run applies it;
+    - after the intent, before or during the effect write: the next run finds
+      the intent and applies again; effects are idempotent, and the commit is
+      recorded as ``recovered:<outcome>``;
+    - after the commit, before the inbox file is removed: the next run sees a
+      committed id and only removes the file (``duplicate-delivery``).
+    The ledger is read under the lock on every call, so a merge running in
+    another process is never missed.
+    """
     if not is_merger(config):
         raise RuntimeError("learning-merge-refused:not-the-merger-host")
-    lock_path = config.state_path / "learning" / "merge.lock"
-    ensure_safe_directory(lock_path.parent, create=True)
-    with lock_path.open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        ids = known_ids if known_ids is not None else _read_ledger_ids(config)
-        if obs.obs_id in ids:
+    with merge_lock(config):
+        committed, intents = _ledger_state(config)
+        if obs.obs_id in committed:
             return "duplicate-delivery"
+        recovering = obs.obs_id in intents
+        if not recovering:
+            _append_ledger(config, obs, "applying", phase="intent")
         outcome = _apply(config, obs, companion or CompanionManager(config.vault_path))
-        _append_ledger(config, obs, outcome)
-        ids.add(obs.obs_id)
+        _append_ledger(config, obs, f"recovered:{outcome}" if recovering else outcome)
         return outcome
 
 
@@ -336,23 +380,33 @@ def merge_learning_inbox(config: MemoryConfig) -> dict[str, Any]:
     if not is_merger(config):
         return {"status": "skipped", "reason": "not-the-merger-host", "pending": len(_pending_files(root))}
     counts: dict[str, int] = {}
-    known = _read_ledger_ids(config)
     companion = CompanionManager(config.vault_path)
     for path in _pending_files(root):
         try:
-            obs = parse_observation(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue  # another merge already took and removed this file
+        try:
+            obs = parse_observation(text)
+        except (ValueError, json.JSONDecodeError) as exc:
             rejected = root / REJECTED_DIRNAME
             ensure_safe_directory(rejected, create=True)
-            target = rejected / f"{path.parent.name}-{path.name}"
-            path.replace(target)
+            try:
+                path.replace(rejected / f"{path.parent.name}-{path.name}")
+            except FileNotFoundError:
+                continue
             logger.warning("Rejected malformed learning observation %s: %s", path.name, exc)
             counts["rejected-malformed"] = counts.get("rejected-malformed", 0) + 1
             continue
-        outcome = merge_observation(config, obs, companion=companion, known_ids=known)
+        outcome = merge_observation(config, obs, companion=companion)
         key = outcome.split(":", 1)[0] if outcome.startswith("rejected") else outcome
         counts[key] = counts.get(key, 0) + 1
-        safe_unlink(path, root=root)
+        if path.exists():  # a concurrent merge may have removed it after committing
+            try:
+                safe_unlink(path, root=root)
+            except PolicyError:
+                if path.exists():
+                    raise
     return {"status": "ok", "merged_at": iso_now(), "counts": counts}
 
 

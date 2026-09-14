@@ -497,13 +497,15 @@ class CompanionManager:
         own_prefix = f"{_CANDIDATE_PREFIX} {match.text} |"
         lines = [line for line in lines if not line.strip().startswith(own_prefix)]
         if len(match.sources) >= CANDIDATE_PROMOTION_SESSIONS:
-            atomic_write(rules_path, "\n".join(lines) + "\n", mode=0o660)
-            self.add_or_update_rule(
-                rule_text=match.text,
-                reason=f"{match.reason} ({len(match.sources)} ayrı oturumda tekrarlandı)",
-                source=", ".join(match.sources),
-                is_direct_command=True,
+            # Remove the candidate and add the active rule in ONE write: two
+            # writes could leave neither if the process stopped in between.
+            rule_line = (
+                f"- **kural:** {match.text} | "
+                f"**neden:** {match.reason} ({len(match.sources)} ayrı oturumda tekrarlandı) | "
+                f"**kaynak:** {', '.join(match.sources)} | **durum:** aktif"
             )
+            lines = insert_under_header(lines, ACTIVE_RULES_HEADER, rule_line, before=CANDIDATE_RULES_HEADER)
+            atomic_write(rules_path, "\n".join(lines) + "\n", mode=0o660)
             return "promoted"
         lines = insert_under_header(
             lines, CANDIDATE_RULES_HEADER, render_candidate_line(match), before=ARCHIVED_RULES_HEADER,
@@ -651,19 +653,32 @@ updated_at: {now_str}
     # -------------------------------------------------------------------------
     # Journal (Narrative Reflections)
     # -------------------------------------------------------------------------
-    def append_journal_entry(self, title: str, narrative: str, runtime: str = "system") -> None:
+    def append_journal_entry(
+        self, title: str, narrative: str, runtime: str = "system", *, marker: str | None = None,
+    ) -> bool:
+        """Append one entry. With ``marker`` the append happens at most once.
+
+        The marker (an observation id) is written inside the entry, so a merge
+        that is re-run after a crash can see that its append already landed.
+        """
         p = self.companion_dir / "Journal.md"
         if not p.is_file():
             self.ensure_companion_files()
         text, _ = secure_read_text(p, root=self.vault_path, max_bytes=512 * 1024)
+        marker_line = f"<!-- pz-obs:{marker} -->" if marker else ""
+        if marker_line and marker_line in text:
+            return False
 
         now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
         clean_narrative, _ = redact_sensitive_text(narrative.strip())
         clean_title, _ = redact_sensitive_text(title.strip())
 
         entry = f"\n\n## {now_str} — [{runtime}] {clean_title}\n{clean_narrative}\n"
+        if marker_line:
+            entry += f"{marker_line}\n"
         updated = text.rstrip() + entry
         atomic_write(p, updated, mode=0o660)
+        return True
 
     def read_latest_journal_entry(self, max_lines: int = 15) -> str:
         p = self.companion_dir / "Journal.md"
