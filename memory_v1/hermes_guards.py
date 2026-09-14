@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import functools
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -115,15 +114,18 @@ def install_update_guard() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    # Hermes applies ``-p <profile>`` from sys.argv while hermes_cli.main is
+    # imported, so the argv it expects must be in place before any Hermes import.
+    sys.argv = ["hermes", *args]
+    from hermes_cli.main import main as hermes_main
     from hermes_cli import profiles
+    from hermes_constants import get_hermes_home
 
-    home = os.environ.get("HERMES_HOME", "").strip()
-    install_profile_guards(profiles, process_home=Path(home) if home else None)
+    # The process home after the profile override: a service profile may run
+    # its own process, and only other service profiles are refused.
+    install_profile_guards(profiles, process_home=Path(get_hermes_home()))
     if "dashboard" in args:
         install_update_guard()
-    from hermes_cli.main import main as hermes_main
-
-    sys.argv = ["hermes", *args]
     return hermes_main()
 
 

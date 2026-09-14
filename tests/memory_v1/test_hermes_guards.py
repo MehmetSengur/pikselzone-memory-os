@@ -90,5 +90,29 @@ class ServiceProfileGuardTests(unittest.TestCase):
         self.assertTrue(issubclass(guards.ServiceProfileRefused, FileNotFoundError))
 
 
+class LauncherOrderTests(unittest.TestCase):
+    def test_hermes_sees_its_own_argv_before_any_hermes_import(self):
+        # The Telegram unit runs `pz-hermes -p pz-orchestrator gateway run`; Hermes
+        # strips -p while hermes_cli.main is imported, so argv must already be set.
+        import builtins
+        import sys
+        from unittest import mock
+
+        seen = {}
+        real_import = builtins.__import__
+
+        def recording_import(name, *args, **kwargs):
+            if name.startswith("hermes_cli") and "argv" not in seen:
+                seen["argv"] = list(sys.argv)
+            if name in {"hermes_cli.main", "hermes_cli", "hermes_constants"}:
+                raise ImportError("stop before running Hermes")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch.object(sys, "argv", ["guards.py"]), mock.patch("builtins.__import__", side_effect=recording_import):
+            with self.assertRaises(ImportError):
+                guards.main(["-p", "pz-orchestrator", "gateway", "run"])
+        self.assertEqual(["hermes", "-p", "pz-orchestrator", "gateway", "run"], seen["argv"])
+
+
 if __name__ == "__main__":
     unittest.main()
