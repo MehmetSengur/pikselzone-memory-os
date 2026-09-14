@@ -56,6 +56,15 @@ CROSS_RUNTIME_CONTINUITY_PROVENANCE_MANUAL = "manual-diagnostic"
 
 TARGET_BUDGET_CHARS = 16000
 HARD_MAX_CHARS = 20000
+# Startup bundle layout. Tier A (identity, active rules) is bounded but never
+# dropped; the other categories share what remains so no single large
+# category can push the rest out of the bundle.
+TIER_A_IDENTITY_CAP = 2400
+TIER_A_RULES_CAP = 3200
+STARTUP_CATEGORY_SHARES = (
+    ("continuity", 0.34), ("daily_event", 0.26), ("knowledge_index", 0.20), ("skill", 0.20),
+)
+CROSS_PROJECT_CONTINUITY_MAX = 4
 TARGETED_RECALL_DEFAULT_BUDGET = 8000
 
 # High-risk directive patterns to sanitize from recalled memory
@@ -190,6 +199,7 @@ class RecallBundle:
     source_shas: dict[str, str]
     text: str
     selected_item_ids: list[str] = dataclasses.field(default_factory=list)
+    selection_audit: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -203,6 +213,7 @@ class RecallBundle:
             "source_shas": self.source_shas,
             "items_count": len(self.items),
             "selected_item_ids": self.selected_item_ids,
+            "selection_audit": self.selection_audit,
             "text": self.text,
         }
 
@@ -412,9 +423,9 @@ def _load_identity_and_rules(config: MemoryConfig) -> list[RecallItem]:
         try:
             reject_symlink_chain(full_path)
             content, digest = secure_read_text(full_path, root=config.vault_path, max_bytes=1024 * 1024)
-            sanitized, _ = sanitize_untrusted_memory(content)
-            lines = [l for l in sanitized.splitlines() if l.strip()]
-            extract = "\n".join(lines[:35]) if len(lines) > 35 else sanitized
+            extract = _render_active_rules(content)
+            if not extract:
+                return items
             items.append(RecallItem(
                 item_id=f"tier-a-{rel_path}",
                 item_type="rule",
@@ -428,6 +439,90 @@ def _load_identity_and_rules(config: MemoryConfig) -> list[RecallItem]:
         except Exception as exc:
             logger.warning("Error reading rules file %s: %s", rel_path, exc)
 
+    return items
+
+
+def _render_active_rules(content: str) -> str:
+    """Active rules only, one per line.
+
+    Kurallar.md also holds candidates, the archive and maintenance records;
+    those are bookkeeping, not instructions. Loading its first N raw lines put
+    whatever was written most recently -- mislearned pasted text included --
+    ahead of the rules that actually apply.
+    """
+    rules: list[str] = []
+    candidates = 0
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- **kural:**"):
+            text = stripped[len("- **kural:**"):].split("|", 1)[0].strip()
+            if text:
+                rules.append(f"- {text}")
+        elif stripped.startswith("- **aday:**"):
+            candidates += 1
+    if not rules:
+        return ""
+    rendered, _ = sanitize_untrusted_memory("\n".join(rules))
+    if candidates:
+        rendered += (
+            f"\n({candidates} aday tercih ayrı oturumlarda doğrulanmayı bekliyor; aktif kural değil.)"
+        )
+    return rendered
+
+
+def _markdown_bullets_by_section(text: str) -> dict[str, list[str]]:
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        heading = re.match(r"^##\s+(.+?)\s*$", line)
+        if heading:
+            current = heading.group(1).strip()
+            sections[current] = []
+        elif current and line.strip().startswith("- "):
+            sections[current].append(line.strip()[2:].strip())
+    return sections
+
+
+def _recent_project_continuity(config: MemoryConfig) -> list[RecallItem]:
+    """A short digest of what is in flight per project, newest first.
+
+    Used when a session is not tied to one project, such as a general
+    orchestrator conversation: it should know what is under way without
+    loading every project's full continuity.
+    """
+    root = config.vault_path / "continuity"
+    if not root.is_dir() or root.is_symlink():
+        return []
+    files = [p for p in root.glob("*.md") if p.is_file() and not p.is_symlink()]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    items: list[RecallItem] = []
+    for rank, path in enumerate(files[:CROSS_PROJECT_CONTINUITY_MAX]):
+        try:
+            reject_symlink_chain(path)
+            content, digest = secure_read_text(path, root=config.vault_path, max_bytes=256 * 1024)
+        except Exception as exc:
+            logger.warning("Error reading continuity file %s: %s", path, exc)
+            continue
+        sanitized, _ = sanitize_untrusted_memory(content)
+        sections = _markdown_bullets_by_section(sanitized)
+        empty = {"yok", "yok.", "unknown"}
+        done = [b for b in sections.get("Ne Yapıldı", []) if b.lower() not in empty][:2]
+        pending = [b for b in sections.get("Yarım Kalanlar & Açık Noktalar", []) if b.lower() not in empty][:1]
+        if not done and not pending:
+            continue
+        updated = re.search(r"^updated_at:\s*(\S+)", sanitized, re.M)
+        lines = [f"- Yapılan: {b[:220]}" for b in done] + [f"- Açık: {b[:220]}" for b in pending]
+        items.append(RecallItem(
+            item_id=f"tier-b-project-{path.stem}",
+            item_type="continuity",
+            title=f"Proje sürekliliği: {path.stem}" + (f" ({updated.group(1)[:10]})" if updated else ""),
+            content="\n".join(lines),
+            source_file=f"continuity/{path.name}",
+            source_sha256=digest,
+            relevance_score=7.8 - rank * 0.1,
+            derived=True,
+            created_at=updated.group(1) if updated else None,
+        ))
     return items
 
 
@@ -525,7 +620,11 @@ def _load_continuity(
         except Exception as exc:
             logger.warning("Error reading Journal file %s: %s", rel_path, exc)
 
-    # 4. Knowledge log fallback
+    # 4. Recent work across projects, for sessions not scoped to one project.
+    if not continuity_scope:
+        items.extend(_recent_project_continuity(config))
+
+    # 5. Knowledge log fallback
     if not items:
         klog = config.vault_path / "knowledge/log.md"
         if klog.is_file():
@@ -675,19 +774,16 @@ def _load_skills_summary(config: MemoryConfig) -> list[RecallItem]:
             content, digest = secure_read_text(s_file, root=config.vault_path, max_bytes=128 * 1024)
             sanitized, _ = sanitize_untrusted_memory(content)
             name = s_file.parent.name
-            lines = [l.strip() for l in sanitized.splitlines() if l.strip()]
-            summary_lines = []
-            capture = False
-            for line in lines:
-                if any(hdr in line for hdr in ("## 3. Adım Adım", "## Adım Adım", "## Execution Workflow")):
-                    capture = True
-                    summary_lines.append(line)
-                    continue
-                if capture:
-                    if line.startswith("## ") and not line.startswith("### "):
-                        break
-                    summary_lines.append(line)
-            workflow_snippet = "\n".join(summary_lines[:8]) if summary_lines else "\n".join(lines[:10])
+            description = ""
+            described = re.search(r'^description:\s*"?(.*?)"?\s*$', sanitized, re.M)
+            if described:
+                description = described.group(1).strip()
+            if not description:
+                heading = re.search(r"^#\s+(.+)$", sanitized, re.M)
+                description = heading.group(1).strip() if heading else ""
+            # One line per skill: the startup bundle points at what exists; the
+            # steps are fetched when a task actually needs them.
+            workflow_snippet = f"- {name}: {description[:160]}" if description else f"- {name}"
             items.append(RecallItem(
                 item_id=f"skill-{name}",
                 item_type="skill",
@@ -737,16 +833,13 @@ def build_startup_recall_bundle(
     raw_items = tier_a + tier_b + tier_c + tier_d + tier_e
     deduped = deduplicate_memory_items(raw_items)
 
-    # Sort items deterministically: Tier A first, then by relevance descending
-    def sort_key(it: RecallItem) -> tuple[int, float, str]:
-        is_tier_a = 0 if it.item_type in {"identity", "rule"} else 1
-        return (is_tier_a, -it.relevance_score, it.item_id)
+    # Group by category, strongest first; the allocator below decides what fits.
+    by_type: dict[str, list[RecallItem]] = {}
+    for it in deduped:
+        by_type.setdefault(it.item_type, []).append(it)
+    for bucket in by_type.values():
+        bucket.sort(key=lambda it: (-it.relevance_score, it.item_id))
 
-    sorted_items = sorted(deduped, key=sort_key)
-
-    # Assembly loop with progressive shedding to stay within budget
-    active_items = list(sorted_items)
-    
     def render(items: list[RecallItem]) -> str:
         sections = [
             f"=== PIKSELZONE MEMORY V1 — STARTUP RECALL BUNDLE ===",
@@ -788,6 +881,7 @@ def build_startup_recall_bundle(
 
         if k_indices:
             sections.append("## 4. Knowledge Index Entries [DERIVED MEMORY — verify against operational truth]")
+            sections.append("- Tam dizin: knowledge/index.md; bir kavramın ayrıntısı için recall --query kullan.")
             for it in k_indices:
                 sections.append(f"- {it.content}")
             sections.append("")
@@ -802,10 +896,10 @@ def build_startup_recall_bundle(
         skills = [it for it in items if it.item_type == "skill"]
         if skills:
             sections.append("### Synthesized Skills (Reusable Operational Procedures)")
+            sections.append("- Adımlar için ilgili skills/<ad>/SKILL.md dosyasını aç veya recall --query ile ara.")
             for it in skills:
-                sections.append(f"#### {it.title} (Source: {it.source_file})")
                 sections.append(it.content)
-                sections.append("")
+            sections.append("")
 
         sections.append("## 6. Targeted Deep Recall Guidance")
         sections.append("To retrieve deeper context, query the memory recall tool or CLI:")
@@ -813,51 +907,120 @@ def build_startup_recall_bundle(
         sections.append("====================================================")
         return "\n".join(sections)
 
+    trunc_label = "[TRUNCATED_DUE_TO_HARD_BUDGET_LIMIT]" if limit >= HARD_MAX_CHARS else "[TRUNCATED_TO_BUDGET]"
+    audit: dict[str, Any] = {
+        "target_chars": limit,
+        "hard_max_chars": HARD_MAX_CHARS,
+        "envelope_chars": len(render([])),
+        "physically_insufficient": False,
+        "categories": {},
+        "notes": [],
+    }
+
+    def truncated(item: RecallItem, max_chars: int) -> RecallItem:
+        if len(item.content) <= max_chars:
+            return item
+        lines = item.content.splitlines()
+        kept: list[str] = []
+        size = 0
+        for line in lines:
+            if size + len(line) + 1 > max(0, max_chars - 90):
+                break
+            kept.append(line)
+            size += len(line) + 1
+        omitted = len(lines) - len(kept)
+        if item.item_type == "rule" and omitted:
+            marker = f"[… {omitted} satır daha: {item.source_file}] {trunc_label}"
+        else:
+            marker = trunc_label
+        body = "\n".join(kept) if kept else item.content[: max(0, max_chars - len(marker) - 1)]
+        return dataclasses.replace(item, content=body.rstrip() + "\n" + marker)
+
+    # 1. Tier A: identity and active rules are bounded but never dropped.
+    active_items: list[RecallItem] = []
+    for kind, cap in (("identity", TIER_A_IDENTITY_CAP), ("rule", TIER_A_RULES_CAP)):
+        selected_ids = []
+        for item in by_type.get(kind, []):
+            bounded = truncated(item, cap)
+            if bounded is not item:
+                audit["notes"].append(f"{item.item_id}:truncated-to-{cap}")
+            active_items.append(bounded)
+            selected_ids.append(bounded.item_id)
+        audit["categories"][kind] = {
+            "cap": cap, "candidates": len(by_type.get(kind, [])),
+            "selected": selected_ids, "empty": not by_type.get(kind),
+        }
+
     bundle_text = render(active_items)
+    if len(bundle_text) > limit:
+        # The envelope and Tier A alone do not fit this budget. Record that
+        # plainly, then trim Tier A rather than silently breach the limit.
+        audit["physically_insufficient"] = True
+        audit["notes"].append(f"tier-a-exceeds-budget:{len(bundle_text)}>{limit}")
+        while len(bundle_text) > limit and active_items:
+            largest = max(range(len(active_items)), key=lambda i: len(active_items[i].content))
+            if len(active_items[largest].content) <= 300:
+                break
+            excess = len(bundle_text) - limit
+            target = max(150, len(active_items[largest].content) - excess - 60)
+            active_items[largest] = truncated(active_items[largest], target)
+            bundle_text = render(active_items)
 
-    # Shed lower-tier items if budget exceeded
-    while len(bundle_text) > limit and active_items:
-        # Shed daily events first
-        tail_daily = [i for i in active_items if i.item_type == "daily_event"]
-        if tail_daily:
-            active_items.remove(tail_daily[-1])
-            bundle_text = render(active_items)
-            continue
-        # Shed knowledge index entries next
-        tail_idx = [i for i in active_items if i.item_type == "knowledge_index"]
-        if tail_idx:
-            active_items.remove(tail_idx[-1])
-            bundle_text = render(active_items)
-            continue
-        # Shed continuity notes next
-        tail_cont = [i for i in active_items if i.item_type == "continuity"]
-        if tail_cont:
-            active_items.remove(tail_cont[-1])
-            bundle_text = render(active_items)
-            continue
-        # Shed skills next
-        tail_skill = [i for i in active_items if i.item_type == "skill"]
-        if tail_skill:
-            active_items.remove(tail_skill[-1])
-            bundle_text = render(active_items)
-            continue
+    # 2. The other categories each get a share of what is left, so a large
+    #    one (a hundred index rows, a dozen skills) cannot crowd out the rest.
+    remaining = max(0, limit - len(bundle_text))
+    order = [kind for kind, _ in STARTUP_CATEGORY_SHARES]
+    caps = {kind: int(remaining * share) for kind, share in STARTUP_CATEGORY_SHARES}
+    chosen: dict[str, list[RecallItem]] = {kind: [] for kind in order}
+    used = {kind: 0 for kind in order}
+    dropped: dict[str, list[dict[str, str]]] = {kind: [] for kind in order}
 
-        trunc_label = "[TRUNCATED_DUE_TO_HARD_BUDGET_LIMIT]" if limit >= HARD_MAX_CHARS else "[TRUNCATED_TO_BUDGET]"
-        # If only Tier-A remains and still over budget, boundedly truncate Tier-A content
-        truncated_any = False
-        for idx, it in enumerate(active_items):
-            if it.item_type in {"identity", "rule"} and len(it.content) > 300:
-                excess = len(bundle_text) - limit
-                if excess > 0:
-                    cut = min(excess + 40, len(it.content) - 150)
-                    if cut > 0:
-                        new_content = it.content[:-cut].rstrip() + f"\n{trunc_label}\n"
-                        active_items[idx] = dataclasses.replace(it, content=new_content)
-                        truncated_any = True
-                        bundle_text = render(active_items)
-                        break
-        if not truncated_any:
-            break
+    def assembled() -> list[RecallItem]:
+        return active_items + [it for kind in order for it in chosen[kind]]
+
+    def admit(kind: str, item: RecallItem, cap: int) -> bool:
+        current = assembled()
+        before = len(render(current))
+        after = len(render(current + [item]))
+        if used[kind] + (after - before) <= cap and after <= limit:
+            chosen[kind].append(item)
+            used[kind] += after - before
+            return True
+        return False
+
+    for kind in order:
+        for item in by_type.get(kind, []):
+            if admit(kind, item, caps[kind]):
+                continue
+            if not chosen[kind] and caps[kind] > 400:
+                # A single oversized item: keep a shortened copy rather than
+                # lose the whole category.
+                if admit(kind, truncated(item, caps[kind] - 200), caps[kind]):
+                    audit["notes"].append(f"{item.item_id}:truncated-to-category-cap")
+                    continue
+            dropped[kind].append({"id": item.item_id, "reason": "category-cap"})
+
+    # 3. Space a category did not need goes to the others, in priority order.
+    for kind in order:
+        lookup = {it.item_id: it for it in by_type.get(kind, [])}
+        still_dropped = []
+        for entry in dropped[kind]:
+            if not admit(kind, lookup[entry["id"]], limit):
+                still_dropped.append({"id": entry["id"], "reason": "total-budget"})
+        dropped[kind] = still_dropped
+
+    for kind in order:
+        audit["categories"][kind] = {
+            "cap": caps[kind],
+            "used_chars": used[kind],
+            "candidates": len(by_type.get(kind, [])),
+            "selected": [it.item_id for it in chosen[kind]],
+            "dropped_count": len(dropped[kind]),
+            "dropped_sample": dropped[kind][:10],
+            "empty": not by_type.get(kind),
+        }
+    active_items = assembled()
+    bundle_text = render(active_items)
 
     # If still over limit, clamp to limit
     if len(bundle_text) > limit:
@@ -885,6 +1048,7 @@ def build_startup_recall_bundle(
         source_shas=source_shas,
         text=bundle_text,
         selected_item_ids=selected_item_ids,
+        selection_audit=audit,
     )
 
 
@@ -1576,7 +1740,11 @@ def verify_recall_evidence(config: MemoryConfig, runtime: str) -> tuple[bool, st
             if full_path.exists():
                 actual_sha = sha256_file(full_path)
                 if actual_sha != expected_sha:
+                    # Living continuity changes between sessions by design;
+                    # a later update there does not invalidate what was injected.
                     if full_path.name in {"Journal.md", "Last-Session.md", "index.md", "log.md"}:
+                        continue
+                    if rel_path.startswith("continuity/"):
                         continue
                     return False, f"source-file-sha-mismatch:{rel_path}"
 
@@ -1620,6 +1788,7 @@ def update_hermes_startup_snapshot(config: MemoryConfig, inbox_root: Path | None
             "source_files": bundle.source_files,
             "source_shas": bundle.source_shas,
             "selected_item_ids": bundle.selected_item_ids,
+            "selection_audit": bundle.selection_audit,
             "lifecycle_receipt": rcpt,
         }
         target_path = inbox_dir / "hermes-startup-bundle.json"
