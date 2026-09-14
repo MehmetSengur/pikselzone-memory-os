@@ -75,6 +75,18 @@ def _parser() -> argparse.ArgumentParser:
     register_cmd.add_argument("--project", required=True)
     unregister_cmd = commands.add_parser("unregister")
     unregister_cmd.add_argument("root", type=Path)
+    repair_cmd = commands.add_parser(
+        "repair-memory",
+        help="Source-verified maintenance of learned rules and skills (plan, apply, revert).",
+    )
+    repair_cmd.add_argument("--plan-out", type=Path, help="Write a reviewable plan here; changes nothing.")
+    repair_cmd.add_argument("--apply", type=Path, help="Apply a previously reviewed plan file.")
+    repair_cmd.add_argument("--revert", help="Restore the backup of this repair id.")
+    repair_cmd.add_argument("--force", action="store_true", help="With --revert: allow even if files changed.")
+    repair_cmd.add_argument("--history", type=Path, action="append", default=[],
+                            help="Earlier Kurallar.md snapshot(s) to search for lost entries.")
+    repair_cmd.add_argument("--claude-root", type=Path, default=Path.home() / ".claude" / "projects")
+    repair_cmd.add_argument("--codex-root", type=Path, default=Path.home() / ".codex" / "sessions")
     return parser
 
 
@@ -211,6 +223,23 @@ def main(argv: list[str] | None = None) -> int:
             mgr = SharedBrainParityManager(config.vault_path)
             report = mgr.align_shared_brain()
             print(json.dumps(dataclasses.asdict(report), ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "repair-memory":
+            from .memory_repair import apply_repair_plan, build_repair_plan, revert_repair
+            if args.revert:
+                result = revert_repair(config, args.revert, force=args.force)
+            elif args.apply:
+                plan = json.loads(args.apply.read_text(encoding="utf-8"))
+                result = apply_repair_plan(config, plan)
+            else:
+                result = build_repair_plan(
+                    config, claude_root=args.claude_root, codex_root=args.codex_root,
+                    history_files=args.history,
+                )
+                if args.plan_out:
+                    args.plan_out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                    result = {"status": "planned", "plan": str(args.plan_out), "summary": result["summary"]}
+            print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
         if args.command == "register":
             from .hook_install import gitignore_unignored, install as hook_install
