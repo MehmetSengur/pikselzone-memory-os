@@ -1026,6 +1026,78 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             plugin.on_session_start(session_id="retry-discovery")
             self.assertEqual(1, len(plugin._checkpoint_paths("retry-discovery")))
 
+    def _fake_root_home_with_profile_session(self, session):
+        """Gateway root home whose named profile owns ``session`` (Desktop layout)."""
+        root_home = self.root / "hermes-root"
+        profile_home = root_home / "profiles" / "pz-orchestrator"
+        profile_home.mkdir(parents=True)
+        (root_home / "state.db").touch()
+        (profile_home / "state.db").touch()
+        tables = {str((root_home / "state.db").resolve()): [], str((profile_home / "state.db").resolve()): [session]}
+        overrides = []
+
+        class FakeSessionDB:
+            def __init__(inner_self, db_path=None, read_only=False):
+                inner_self.sessions = tables[str(Path(db_path).resolve())]
+
+            def get_session(inner_self, session_id):
+                return next((dict(i) for i in inner_self.sessions if i["id"] == session_id), None)
+
+            def export_session(inner_self, session_id):
+                return next((dict(i) for i in inner_self.sessions if i["id"] == session_id), None)
+
+            def close(inner_self):
+                return None
+
+        state_module = types.ModuleType("hermes_state")
+        state_module.SessionDB = FakeSessionDB
+        constants_module = types.ModuleType("hermes_constants")
+        constants_module.get_hermes_home = lambda: Path(overrides[-1]) if overrides else root_home
+        constants_module.set_hermes_home_override = lambda path: overrides.append(path) or len(overrides)
+        constants_module.reset_hermes_home_override = lambda token: overrides.pop()
+        patches = mock.patch.dict(sys.modules, {"hermes_state": state_module, "hermes_constants": constants_module})
+        return patches, profile_home, constants_module
+
+    def test_root_gateway_finalize_finds_the_profile_session(self):
+        # Desktop chats finalize from the dashboard's root home; the lookup only
+        # knew the legacy /opt/data/profiles layout and found no conversation.
+        plugin = load_hermes_plugin()
+        session = self._fake_session("desktop-1", [
+            {"role": "user", "content": "merhaba"}, {"role": "assistant", "content": "selam"},
+        ])
+        patches, _, _ = self._fake_root_home_with_profile_session(session)
+        with patches:
+            transcript, _, _, _ = plugin._get_session_transcript("desktop-1")
+        self.assertEqual("USER: merhaba\nASSISTANT: selam", transcript)
+
+    def test_finalize_summarizes_inside_the_owning_profile_home(self):
+        plugin = load_hermes_plugin()
+        session = self._fake_session("desktop-2", [
+            {"role": "user", "content": "u"}, {"role": "assistant", "content": "a"},
+        ])
+        patches, profile_home, constants = self._fake_root_home_with_profile_session(session)
+        seen_homes = []
+
+        def fake_summarize(transcript):
+            seen_homes.append(constants.get_hermes_home())
+            return None, "", ""
+
+        with patches, mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(self.outbox_root)}), \
+                mock.patch.object(plugin, "_summarize_with_hermes", side_effect=fake_summarize):
+            plugin.on_session_finalize(session_id="desktop-2")
+            home_after = constants.get_hermes_home()
+        self.assertEqual([profile_home], seen_homes)
+        self.assertEqual(self.root / "hermes-root", home_after)
+
+    def test_session_in_the_current_home_is_summarized_without_override(self):
+        plugin = load_hermes_plugin()
+        session = self._fake_session("cli-1", [{"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}])
+        patches, profile_home, constants = self._fake_root_home_with_profile_session(session)
+        with patches:
+            constants.set_hermes_home_override(str(profile_home))
+            plugin._get_session_transcript("cli-1")
+            self.assertIsNone(plugin._session_profile_home("cli-1"))
+
     def test_discovery_handoff_recovers_one_memory_event_without_replay(self):
         plugin = load_hermes_plugin()
         session = self._fake_session("discovery-memory", [{"role": "user", "content": "u"}])

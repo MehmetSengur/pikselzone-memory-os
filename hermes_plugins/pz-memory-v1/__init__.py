@@ -369,6 +369,27 @@ def _normalize_session_export(
     return "\n".join(lines), model, task_id, total_redactions
 
 
+def _session_profile_home(session_id: str) -> Optional[Path]:
+    """Profile home whose state.db holds ``session_id``, when it is not the current home."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        current = Path(get_hermes_home()).resolve()
+    except Exception:
+        return None
+    db_path = _SESSION_DB_PATHS.get(session_id)
+    if db_path is None or db_path.parent.parent.name != "profiles":
+        return None
+    home = db_path.parent.resolve()
+    return None if home == current else home
+
+
+# Where each session's transcript was last found, so finalize can summarize
+# inside the owning profile's home (its provider config and credentials)
+# rather than the gateway's root home.
+_SESSION_DB_PATHS: dict[str, Path] = {}
+
+
 def _get_session_transcript(session_id: str) -> tuple[Optional[str], Optional[str], Optional[str], int]:
     """Retrieve session messages from Hermes SessionDB, return (normalized_text, model, task_id, redactions)."""
     session_data = None
@@ -376,15 +397,16 @@ def _get_session_transcript(session_id: str) -> tuple[Optional[str], Optional[st
         import hermes_state
         from hermes_constants import get_hermes_home
 
-        candidate_dbs: list[Path] = [
-            Path(get_hermes_home()) / "state.db",
-            Path("/opt/data/state.db"),
-        ]
-        profiles_dir = Path("/opt/data/profiles")
-        if profiles_dir.exists():
-            for p in profiles_dir.glob("*/state.db"):
-                if p not in candidate_dbs:
-                    candidate_dbs.append(p)
+        hermes_home = Path(get_hermes_home())
+        candidate_dbs: list[Path] = [hermes_home / "state.db", Path("/opt/data/state.db")]
+        # Dashboard (Desktop) and TUI gateways finalize from the root home while
+        # the session lives in its profile's state.db. Looking only under the
+        # legacy /opt/data layout made every such finalize find no conversation.
+        for profiles_dir in (hermes_home / "profiles", Path("/opt/data/profiles")):
+            if profiles_dir.is_dir():
+                for p in sorted(profiles_dir.glob("*/state.db")):
+                    if p not in candidate_dbs:
+                        candidate_dbs.append(p)
 
         for db_path in candidate_dbs:
             if not db_path.exists():
@@ -395,6 +417,7 @@ def _get_session_transcript(session_id: str) -> tuple[Optional[str], Optional[st
                 if sess:
                     session_data = db.export_session(session_id)
                     db.close()
+                    _SESSION_DB_PATHS[session_id] = db_path
                     break
                 db.close()
             except Exception as db_exc:
@@ -880,6 +903,20 @@ def _recover_pending_turn_checkpoints() -> None:
             _clear_turn_checkpoints(session_id)
 
 
+def _summarize_in_session_profile(session_id: str, transcript: str) -> tuple[Optional[dict[str, Any]], str, str]:
+    """Summarize under the home of the profile that owns the session."""
+    profile_home = _session_profile_home(session_id)
+    if profile_home is None:
+        return _summarize_with_hermes(transcript)
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        return _summarize_with_hermes(transcript)
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _summarize_with_hermes(transcript: str) -> tuple[Optional[dict[str, Any]], str, str]:
     """Invoke Hermes PluginLlm facade with recursion guard."""
     from agent.plugin_llm import PluginLlm, PluginLlmTextInput
@@ -1145,7 +1182,7 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
         logger.debug("pz-memory-v1: session %s already executing in another task/thread", session_id)
         return
     try:
-        summary, provider, model = _summarize_with_hermes(transcript)
+        summary, provider, model = _summarize_in_session_profile(session_id, transcript)
         if summary is None:
             logger.warning("pz-memory-v1: summarizer failed for session %s; source remains retryable", session_id)
             _record_flush_health("blocked", "summarizer-failed")
