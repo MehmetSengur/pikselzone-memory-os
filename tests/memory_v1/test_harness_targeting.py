@@ -198,35 +198,6 @@ class NegativeResultRejectionTests(unittest.TestCase):
     def _target(self):
         return CONTABO_TARGET
 
-    def test_unchanged_bundle_is_not_read_as_rebuilt(self):
-        # The old check tested `"FOUND" in stdout` against "NOT_FOUND" and so
-        # passed instantly, every time, whatever the publisher had done.
-        from memory_v1.harness import wait_for_vps_publisher_refresh
-
-        baseline = "a" * 64
-
-        def fake_ssh(target, command, check=False):
-            return mock.Mock(returncode=0, stdout=f"{baseline}  bundle\n", stderr="")
-
-        with mock.patch("memory_v1.harness.ssh", side_effect=fake_ssh):
-            with self.assertRaises(TimeoutError):
-                wait_for_vps_publisher_refresh(self._target(), baseline, timeout=1)
-
-    def test_rebuilt_bundle_is_accepted(self):
-        from memory_v1.harness import wait_for_vps_publisher_refresh
-
-        baseline, rebuilt = "a" * 64, "b" * 64
-
-        def fake_ssh(target, command, check=False):
-            if command.startswith("sha256sum"):
-                return mock.Mock(returncode=0, stdout=f"{rebuilt}  bundle\n", stderr="")
-            return mock.Mock(returncode=0, stdout="publisher journal\n", stderr="")
-
-        with mock.patch("memory_v1.harness.ssh", side_effect=fake_ssh):
-            sha, journal = wait_for_vps_publisher_refresh(self._target(), baseline, timeout=5)
-        self.assertEqual(rebuilt, sha)
-        self.assertIn("publisher journal", journal)
-
     def test_failed_probe_is_not_read_as_all_paths_present(self):
         # An SSH hiccup returns empty stdout; with no MISS line the old check
         # concluded every required path existed.
@@ -350,3 +321,151 @@ class CaptureDiagnosticsTests(unittest.TestCase):
             blockers = _capture_blockers(cfg, "2026-09-10T15:00:00+03:00")
             self.assertEqual(1, len(blockers))
             self.assertIn("drain=blocked", blockers[0])
+
+
+def _bundle(text, *, items, source_shas, generated_at="2026-09-14T17:00:00+03:00", audit=None):
+    import hashlib
+    return {
+        "text": text,
+        "bundle_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "selected_item_ids": items,
+        "source_shas": source_shas,
+        "generated_at": generated_at,
+        "selection_audit": audit or {},
+    }
+
+
+EXPECTED = {
+    "item_id": "tier-d-claude-abc",
+    "event_rel": "daily/2026-09-14/claude-abc.md",
+    "source_line": "(Source: daily/2026-09-14/claude-abc.md)",
+    "content_lines": ["- Harness artifact verified for marker PZ-M4-CANARY-1"],
+}
+EVENT_SHA = "e" * 64
+EVENT_TEXT = "### Session claude (Source: daily/2026-09-14/claude-abc.md)\n- Harness artifact verified for marker PZ-M4-CANARY-1\n"
+
+
+class StartupInjectionCheckTests(unittest.TestCase):
+    """B must be proven from content, not from a hash that changed."""
+
+    def test_bundle_with_event_content_passes(self):
+        from memory_v1.harness import check_bundle_injection
+        bundle = _bundle("head\n" + EVENT_TEXT, items=[EXPECTED["item_id"]], source_shas={EXPECTED["event_rel"]: EVENT_SHA})
+        self.assertEqual((True, "event-content-in-startup-bundle"),
+                         check_bundle_injection(bundle, EXPECTED, EVENT_SHA, not_before_iso="2026-09-14T16:59:00+03:00"))
+
+    def test_metadata_only_rebuild_is_rejected(self):
+        # Same memory, new timestamp: the hash changes but the event is absent.
+        from memory_v1.harness import check_bundle_injection
+        bundle = _bundle("Observed At: 2026-09-14T17:05:00+03:00\nsame memory", items=["tier-a-companion/Core.md"],
+                         source_shas={}, generated_at="2026-09-14T17:05:00+03:00")
+        ok, detail = check_bundle_injection(bundle, EXPECTED, EVENT_SHA, not_before_iso="2026-09-14T16:59:00+03:00")
+        self.assertFalse(ok)
+        self.assertTrue(detail.startswith("event-not-selected"))
+
+    def test_selected_but_content_missing_is_rejected(self):
+        from memory_v1.harness import check_bundle_injection
+        bundle = _bundle("no content here", items=[EXPECTED["item_id"]], source_shas={EXPECTED["event_rel"]: EVENT_SHA})
+        ok, _ = check_bundle_injection(bundle, EXPECTED, EVENT_SHA, not_before_iso="2026-09-14T16:59:00+03:00")
+        self.assertFalse(ok)
+
+    def test_other_version_of_the_event_is_rejected(self):
+        from memory_v1.harness import check_bundle_injection
+        bundle = _bundle(EVENT_TEXT, items=[EXPECTED["item_id"]], source_shas={EXPECTED["event_rel"]: "f" * 64})
+        self.assertEqual((False, "event-source-sha-mismatch"),
+                         check_bundle_injection(bundle, EXPECTED, EVENT_SHA, not_before_iso="2026-09-14T16:59:00+03:00"))
+
+    def test_bundle_built_before_arrival_is_rejected(self):
+        from memory_v1.harness import check_bundle_injection
+        bundle = _bundle(EVENT_TEXT, items=[EXPECTED["item_id"]], source_shas={EXPECTED["event_rel"]: EVENT_SHA},
+                         generated_at="2026-09-14T16:00:00+03:00")
+        self.assertEqual((False, "bundle-built-before-event-arrived"),
+                         check_bundle_injection(bundle, EXPECTED, EVENT_SHA, not_before_iso="2026-09-14T16:59:00+03:00"))
+
+    def _evidence(self, session_key="20260914_170100_aaaaaa", snapshot=EVENT_TEXT, items=None, observed="2026-09-14T17:01:05+03:00"):
+        import hashlib
+        from memory_v1.recall import compute_lifecycle_receipt
+        sha = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+        items = items if items is not None else [EXPECTED["item_id"]]
+        receipt = compute_lifecycle_receipt(
+            runtime="hermes", lifecycle_event="pre_llm_call", session_key=session_key,
+            bundle_generated_at=observed, bundle_sha256=sha, bundle_chars=len(snapshot),
+            selected_item_ids=items, provenance="native-lifecycle-startup", session_artifact_sha256="a" * 64,
+        )
+        return {
+            "schema": "pikselzone-memory-recall-evidence-v1", "runtime": "hermes", "session_key": session_key,
+            "bundle_snapshot": snapshot, "bundle_sha256": sha, "selected_item_ids": items,
+            "lifecycle_receipt": receipt, "observed_at": observed,
+        }
+
+    def test_session_evidence_bound_to_this_session_passes(self):
+        from memory_v1.harness import check_session_injection
+        ok, detail = check_session_injection(self._evidence(), "20260914_170100_aaaaaa", EXPECTED,
+                                             not_before_iso="2026-09-14T17:01:00+03:00")
+        self.assertTrue(ok, detail)
+
+    def test_another_sessions_receipt_is_rejected(self):
+        from memory_v1.harness import check_session_injection
+        ok, detail = check_session_injection(self._evidence(session_key="20260914_165900_bbbbbb"),
+                                             "20260914_170100_aaaaaa", EXPECTED, not_before_iso="2026-09-14T17:01:00+03:00")
+        self.assertFalse(ok)
+        self.assertTrue(detail.startswith("evidence-for-another-session"))
+
+    def test_injected_context_without_the_event_is_rejected(self):
+        from memory_v1.harness import check_session_injection
+        ok, _ = check_session_injection(self._evidence(snapshot="unrelated context", items=["tier-a-companion/Core.md"]),
+                                        "20260914_170100_aaaaaa", EXPECTED, not_before_iso="2026-09-14T17:01:00+03:00")
+        self.assertFalse(ok)
+
+    def test_tampered_receipt_is_rejected(self):
+        from memory_v1.harness import check_session_injection
+        evidence = self._evidence()
+        evidence["lifecycle_receipt"]["receipt_digest"] = "0" * 64
+        self.assertEqual((False, "lifecycle-receipt-digest-mismatch"),
+                         check_session_injection(evidence, "20260914_170100_aaaaaa", EXPECTED,
+                                                 not_before_iso="2026-09-14T17:01:00+03:00"))
+
+    def test_stale_evidence_from_before_the_run_is_rejected(self):
+        from memory_v1.harness import check_session_injection
+        ok, detail = check_session_injection(self._evidence(observed="2026-09-14T16:00:00+03:00"),
+                                             "20260914_170100_aaaaaa", EXPECTED, not_before_iso="2026-09-14T17:01:00+03:00")
+        self.assertEqual((False, "evidence-older-than-this-run"), (ok, detail))
+
+
+class PublisherCycleCheckTests(unittest.TestCase):
+    """C needs a complete successful run that started after the event arrived."""
+
+    def _records(self, invocation, start, ok=True, result="done"):
+        payload = '{"status": "ok", "results": []}' if ok else '{"status": "error"}'
+        return [
+            {"__REALTIME_TIMESTAMP": str(int(start * 1e6)), "INVOCATION_ID": invocation, "JOB_TYPE": "start",
+             "MESSAGE": "Starting pz-memory-publisher.service - Publish"},
+            {"__REALTIME_TIMESTAMP": str(int((start + 1) * 1e6)), "_SYSTEMD_INVOCATION_ID": invocation, "MESSAGE": payload},
+            {"__REALTIME_TIMESTAMP": str(int((start + 2) * 1e6)), "INVOCATION_ID": invocation, "JOB_TYPE": "start",
+             "JOB_RESULT": result, "MESSAGE": "Finished pz-memory-publisher.service"},
+        ]
+
+    def test_run_started_after_arrival_is_selected(self):
+        from memory_v1.harness import parse_publisher_runs, select_publisher_run_after
+        runs = parse_publisher_runs(self._records("old", 900) + self._records("new", 1010))
+        self.assertEqual("new", select_publisher_run_after(runs, 1000)["invocation_id"])
+
+    def test_run_that_started_before_arrival_is_not_accepted(self):
+        from memory_v1.harness import parse_publisher_runs, select_publisher_run_after
+        self.assertIsNone(select_publisher_run_after(parse_publisher_runs(self._records("old", 990)), 1000))
+
+    def test_failed_run_is_not_accepted(self):
+        from memory_v1.harness import parse_publisher_runs, select_publisher_run_after
+        runs = parse_publisher_runs(self._records("bad", 1010, ok=False) + self._records("crash", 1020, result="failed"))
+        self.assertIsNone(select_publisher_run_after(runs, 1000))
+
+    def test_journal_saved_without_a_matching_run_is_not_evidence(self):
+        from memory_v1.harness import parse_publisher_runs, select_publisher_run_after
+        orphan_payload = [{"__REALTIME_TIMESTAMP": "1010000000", "_SYSTEMD_INVOCATION_ID": "x",
+                           "MESSAGE": '{"status": "ok"}'}]
+        self.assertIsNone(select_publisher_run_after(parse_publisher_runs(orphan_payload), 1000))
+
+
+if __name__ == "__main__":
+    unittest.main()
+

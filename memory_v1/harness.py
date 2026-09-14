@@ -30,18 +30,24 @@ if str(REPO_ROOT) not in sys.path:
 
 try:
     from .core import MemoryConfig, codex_final_agent_message, iso_now, sha256_bytes, sha256_file
+    from .events import parse_event_artifact
     from .recall import (
         CROSS_RUNTIME_CONTINUITY_PROVENANCE_MACHINE,
         HarnessExecutionRun,
         _write_machine_cross_runtime_receipt,
+        compute_lifecycle_receipt,
+        sanitize_untrusted_memory,
         verify_cross_runtime_continuity_evidence,
     )
 except ImportError:
     from memory_v1.core import MemoryConfig, codex_final_agent_message, iso_now, sha256_bytes, sha256_file
+    from memory_v1.events import parse_event_artifact
     from memory_v1.recall import (
         CROSS_RUNTIME_CONTINUITY_PROVENANCE_MACHINE,
         HarnessExecutionRun,
         _write_machine_cross_runtime_receipt,
+        compute_lifecycle_receipt,
+        sanitize_untrusted_memory,
         verify_cross_runtime_continuity_evidence,
     )
 
@@ -423,40 +429,235 @@ def wait_for_vps_obsidian_sync(target: HarnessTarget, event_rel_path: str, expec
     raise TimeoutError(f"Timed out waiting for Obsidian sync of {event_rel_path} on {target.name}")
 
 
-def read_startup_bundle_sha(target: HarnessTarget) -> str:
-    res = ssh(target, f"sha256sum {shlex.quote(target.startup_bundle_path)}")
+def remote_file_mtime(target: HarnessTarget, path: str) -> float:
+    res = ssh(target, f"stat -c %Y {shlex.quote(path)}")
+    if res.returncode != 0 or not res.stdout.strip().isdigit():
+        raise RuntimeError(f"Cannot stat {path} on {target.name}: {res.stderr.strip()}")
+    return float(res.stdout.strip())
+
+
+def read_remote_json(target: HarnessTarget, path: str) -> dict[str, Any] | None:
+    res = ssh(target, f"cat {shlex.quote(path)} 2>/dev/null")
     if res.returncode != 0 or not res.stdout.strip():
-        raise RuntimeError(f"Cannot read the Hermes startup bundle on {target.name}: {res.stderr.strip()}")
-    return res.stdout.split()[0]
+        return None
+    try:
+        value = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return None  # mid-write; the caller polls again
+    return value if isinstance(value, dict) else None
 
 
-def wait_for_vps_publisher_refresh(
-    target: HarnessTarget, baseline_sha: str, timeout: int = 180,
-) -> tuple[str, str]:
-    """Wait for the publisher to rebuild the Hermes startup bundle on its own.
+def _parse_iso(value: str) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.astimezone()
 
-    This step used to require the run's canary marker to appear inside the
-    bundle, and passed instantly because it tested `"FOUND" in stdout` against
-    an answer of "NOT_FOUND". With that fixed the requirement turns out to be
-    wrong for this deployment as well: the bundle is Tier A companion context
-    plus synthesized skills, and the recall budget is exhausted before any
-    daily-event tail is included -- no canary has ever been in it.
 
-    So the check is what the publisher can actually be held to: that it rebuilt
-    the bundle by itself after the event landed, evidenced by the content hash
-    moving off the pre-event baseline, with its journal captured alongside.
+# --- C. publisher service cycle ----------------------------------------------
+
+def parse_publisher_runs(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group systemd journal records into publisher invocations.
+
+    A run counts only with all three pieces from the same invocation: the
+    manager's "Starting" record, the service's own JSON payload, and the
+    manager's job result.
     """
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        current = read_startup_bundle_sha(target)
-        if current != baseline_sha:
-            j_res = ssh(target, f"journalctl -u {shlex.quote(target.publisher_service)} -n 15 --no-pager")
-            return current, j_res.stdout
+    runs: dict[str, dict[str, Any]] = {}
+    for record in records:
+        invocation = record.get("INVOCATION_ID") or record.get("_SYSTEMD_INVOCATION_ID")
+        if not invocation:
+            continue
+        try:
+            stamp = int(record.get("__REALTIME_TIMESTAMP", "0")) / 1_000_000
+        except (TypeError, ValueError):
+            continue
+        run = runs.setdefault(invocation, {
+            "invocation_id": invocation, "started_epoch": None, "finished_epoch": None,
+            "job_result": None, "payload": None,
+        })
+        message = str(record.get("MESSAGE") or "")
+        if record.get("JOB_TYPE") == "start" and not record.get("JOB_RESULT") and message.startswith("Starting "):
+            run["started_epoch"] = stamp
+        if record.get("JOB_RESULT"):
+            run["finished_epoch"] = stamp
+            run["job_result"] = record["JOB_RESULT"]
+        if record.get("_SYSTEMD_INVOCATION_ID") and message.lstrip().startswith("{"):
+            try:
+                run["payload"] = json.loads(message)
+            except json.JSONDecodeError:
+                pass
+    return sorted(runs.values(), key=lambda r: r["started_epoch"] or 0)
+
+
+def select_publisher_run_after(runs: list[dict[str, Any]], since_epoch: float) -> dict[str, Any] | None:
+    """The first complete, successful run that *started* after ``since_epoch``."""
+    for run in runs:
+        if (
+            run["started_epoch"] is not None
+            and run["started_epoch"] >= since_epoch
+            and run["job_result"] == "done"
+            and isinstance(run["payload"], dict)
+            and run["payload"].get("status") == "ok"
+        ):
+            return run
+    return None
+
+
+def wait_for_publisher_run_after(target: HarnessTarget, since_epoch: float, timeout: int = 240) -> dict[str, Any]:
+    """Wait for the timer-driven publisher to complete a run that began after the event arrived."""
+    start = time.time()
+    since = int(since_epoch) - 2
+    while time.time() - start < timeout:
+        res = ssh(target, f"journalctl -u {shlex.quote(target.publisher_service)} -o json --since @{since} --no-pager")
+        records = []
+        for line in res.stdout.splitlines():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        run = select_publisher_run_after(parse_publisher_runs(records), since_epoch)
+        if run:
+            text = ssh(target, f"journalctl -u {shlex.quote(target.publisher_service)} _SYSTEMD_INVOCATION_ID={run['invocation_id']} --no-pager -o short-iso")
+            manager = ssh(target, f"journalctl -u {shlex.quote(target.publisher_service)} INVOCATION_ID={run['invocation_id']} --no-pager -o short-iso")
+            return {**run, "journal_text": (manager.stdout + text.stdout).strip()}
         time.sleep(5)
-    raise TimeoutError(
-        f"Publisher did not rebuild the Hermes startup bundle within {timeout}s "
-        f"(hash still {baseline_sha[:16]})."
+    raise TimeoutError(f"No successful publisher run started after the event arrived ({timeout}s)")
+
+
+# --- B. startup injection ----------------------------------------------------
+
+def expected_daily_rendering(event_path: Path, event_rel: str) -> dict[str, Any]:
+    """What the startup bundle shows for this event, derived from the event file itself."""
+    event = parse_event_artifact(event_path.read_text(encoding="utf-8"))
+    sections = event["sections"]
+    context = sections.get("context") or sections.get("Bağlam") or []
+    decisions = sections.get("decisions") or sections.get("Alınan Kararlar") or []
+    rendered, _ = sanitize_untrusted_memory("\n".join(f"- {b}" for b in (context[:2] + decisions[:2])))
+    return {
+        "item_id": f"tier-d-{event_path.stem}",
+        "event_rel": event_rel,
+        "source_line": f"(Source: {event_rel})",
+        "content_lines": [line for line in rendered.splitlines() if line.strip()],
+    }
+
+
+def _content_present(text: str, expected: dict[str, Any]) -> str:
+    if expected["source_line"] not in text:
+        return "event-source-line-missing"
+    for line in expected["content_lines"]:
+        if line not in text:
+            return f"event-content-missing:{line[:60]}"
+    return ""
+
+
+def check_bundle_injection(
+    bundle: dict[str, Any], expected: dict[str, Any], event_sha: str, *, not_before_iso: str,
+) -> tuple[bool, str]:
+    """Does the real startup bundle carry this event's content?
+
+    A changed hash is not evidence: the bundle stamps its own build time, so
+    rebuilding identical memory changes the hash too. What counts is the event
+    selected as an item, its rendered content in the text, and the source hash
+    the bundle recorded for it.
+    """
+    text = bundle.get("text") or ""
+    if sha256_bytes(text.encode("utf-8")) != bundle.get("bundle_sha256"):
+        return False, "bundle-sha-does-not-match-text"
+    if expected["item_id"] not in (bundle.get("selected_item_ids") or []):
+        audit = (bundle.get("selection_audit") or {}).get("categories", {}).get("daily_event", {})
+        dropped = [d for d in audit.get("dropped_sample", []) if d.get("id") == expected["item_id"]]
+        reason = dropped[0]["reason"] if dropped else "not-a-candidate"
+        return False, f"event-not-selected:{reason}"
+    missing = _content_present(text, expected)
+    if missing:
+        return False, missing
+    if (bundle.get("source_shas") or {}).get(expected["event_rel"]) != event_sha:
+        return False, "event-source-sha-mismatch"
+    generated = _parse_iso(bundle.get("generated_at", ""))
+    not_before = _parse_iso(not_before_iso)
+    if generated is None or not_before is None or generated < not_before:
+        return False, "bundle-built-before-event-arrived"
+    return True, "event-content-in-startup-bundle"
+
+
+def wait_for_bundle_with_event(
+    target: HarnessTarget, expected: dict[str, Any], event_sha: str, not_before_iso: str, timeout: int = 240,
+) -> dict[str, Any]:
+    start = time.time()
+    last = "bundle-unreadable"
+    while time.time() - start < timeout:
+        bundle = read_remote_json(target, target.startup_bundle_path)
+        if bundle is not None:
+            ok, last = check_bundle_injection(bundle, expected, event_sha, not_before_iso=not_before_iso)
+            if ok:
+                return bundle
+        time.sleep(5)
+    raise TimeoutError(f"Startup bundle never carried the event: {last}")
+
+
+def check_session_injection(
+    evidence: dict[str, Any], session_id: str, expected: dict[str, Any], *, not_before_iso: str,
+) -> tuple[bool, str]:
+    """Did *this* Hermes session start with the event in its injected context?
+
+    The plugin records the exact injected text (``bundle_snapshot``) with a
+    lifecycle receipt bound to the session. The receipt digest is recomputed
+    here rather than trusted.
+    """
+    if evidence.get("schema") != "pikselzone-memory-recall-evidence-v1" or evidence.get("runtime") != "hermes":
+        return False, "evidence-schema-invalid"
+    if evidence.get("session_key") != session_id:
+        return False, f"evidence-for-another-session:{evidence.get('session_key')}"
+    snapshot = evidence.get("bundle_snapshot") or ""
+    if not snapshot or sha256_bytes(snapshot.encode("utf-8")) != evidence.get("bundle_sha256"):
+        return False, "snapshot-does-not-match-recorded-sha"
+    receipt = evidence.get("lifecycle_receipt") or {}
+    if receipt.get("session_key") != session_id or receipt.get("bundle_sha256") != evidence.get("bundle_sha256"):
+        return False, "lifecycle-receipt-not-bound-to-this-session-and-bundle"
+    recomputed = compute_lifecycle_receipt(
+        runtime=receipt.get("runtime", ""),
+        lifecycle_event=receipt.get("lifecycle_event", ""),
+        session_key=receipt.get("session_key", ""),
+        bundle_generated_at=receipt.get("bundle_generated_at", ""),
+        bundle_sha256=receipt.get("bundle_sha256", ""),
+        bundle_chars=receipt.get("bundle_chars", 0),
+        selected_item_ids=receipt.get("selected_item_ids", []),
+        provenance=receipt.get("provenance", ""),
+        session_artifact_sha256=receipt.get("session_artifact_sha256"),
     )
+    if recomputed.get("receipt_digest") != receipt.get("receipt_digest"):
+        return False, "lifecycle-receipt-digest-mismatch"
+    if expected["item_id"] not in (evidence.get("selected_item_ids") or []):
+        return False, "event-not-in-injected-items"
+    missing = _content_present(snapshot, expected)
+    if missing:
+        return False, f"injected-{missing}"
+    observed = _parse_iso(evidence.get("observed_at", ""))
+    not_before = _parse_iso(not_before_iso)
+    if observed is None or not_before is None or observed < not_before:
+        return False, "evidence-older-than-this-run"
+    return True, "session-started-with-event-in-context"
+
+
+def fetch_recall_evidence_for_session(
+    target: HarnessTarget, session_id: str, timeout: int = 240,
+) -> tuple[dict[str, Any] | None, str]:
+    """Recall evidence for one session: promoted copy first, outbox while pending."""
+    promoted = f"{target.evidence_dir.rstrip('/')}/recall-hermes.json"
+    outbox = f"{target.hermes_home.rstrip('/')}/memory-v1/outbox/evidence/recall-hermes.json"
+    start = time.time()
+    pending: dict[str, Any] | None = None
+    while time.time() - start < timeout:
+        value = read_remote_json(target, promoted)
+        if value and value.get("session_key") == session_id:
+            return value, "promoted"
+        staged = read_remote_json(target, outbox)
+        if staged and staged.get("session_key") == session_id:
+            pending = staged
+        time.sleep(5)
+    return (pending, "outbox-not-promoted") if pending else (None, "not-found")
 
 
 def run_codex_retrieval(config: MemoryConfig, canary_marker: str, repo_path: Path) -> tuple[str, bytes, bytes, dict[str, Any]]:
@@ -640,104 +841,129 @@ def run_hermes_retrieval(target: HarnessTarget, canary_marker: str) -> tuple[str
 # ---------------------------------------------------------------------------
 
 
+def _write_artifact(directory: Path, name: str, payload: dict[str, Any]) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    try:
+        os.chmod(path, 0o640)
+    except OSError:
+        pass
+    return path
+
+
 def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: HarnessTarget | None = None) -> dict[str, Any]:
+    """Run the three acceptance questions and report each on its own.
+
+    A. Capture chain: a real session -> capture -> daily event -> sync ->
+       fresh Codex and Hermes sessions retrieve the value (targeted recall).
+    B. Startup injection: the event's content is in the real startup bundle,
+       and a new Hermes session's recorded injected context contains it.
+    C. Publisher cycle: the timer-driven publisher completed a run that
+       started after the event reached the host.
+    """
     target = target or DEFAULT_TARGET
-    print("=== PIKSELZONE MEMORY V1 — M4.2C AUTONOMOUS ACCEPTANCE HARNESS ===")
+    print("=== PIKSELZONE MEMORY V1 — CROSS-RUNTIME ACCEPTANCE HARNESS ===")
     preflight_info = preflight(target)
 
-    token = secrets.token_hex(4)
-    marker = f"PZ-M4-CANARY-{token}"
-    # The value names itself as harness test data, so the string that ends up in
-    # memory and in the receipt is self-labelling. Independent verification
-    # re-derives the match from raw captured stdout against the recorded canary,
-    # so the recorded canary has to be exactly the token a retrieval returns --
-    # a longer descriptive sentence would never appear verbatim, and relaxing
-    # that check would remove the receipt's only guard against a harness that
-    # simply asserts its own success.
+    marker = f"PZ-M4-CANARY-{secrets.token_hex(4)}"
     check_value = f"PZ-HARNESS-TESTVALUE-{secrets.token_hex(6)}"
     canary_note = build_canary(marker, check_value)
-    decision = check_value
     expected_token = check_value.casefold()
     harness_run_id = f"harness-{secrets.token_hex(8)}"
-    print(f"[*] Generated Random Canary: {marker}")
-    print(f"[*] Canary: {canary_note}")
+    print(f"[*] Canary (test data): {canary_note}")
     print(f"[*] Harness Run ID: {harness_run_id}")
+    results: dict[str, dict[str, Any]] = {
+        "A_capture_to_targeted_recall": {"status": "not-run"},
+        "B_startup_injection": {"status": "not-run"},
+        "C_publisher_cycle": {"status": "not-run"},
+    }
+    artifacts_dir = config.state_path / "evidence" / "m4.2c"
 
-    # Step 1: Real Claude session under a pre-assigned id
-    print("[1/6] Launching real Claude Code session...")
+    print("[A1] Real Claude Code session reads the canary artifact...")
     artifact_path = stage_canary_artifact(repo_root, marker, check_value, harness_run_id)
-    print(f"[*] Canary artifact: {artifact_path}")
-    claude_session_id, claude_stdout, claude_stderr = run_claude_session(marker, artifact_path)
+    claude_session_id, _claude_stdout, _claude_stderr = run_claude_session(marker, artifact_path)
     print(f"      Claude Session ID: {claude_session_id}")
 
-    # Step 2: Automatic background drain & event creation
-    print("[2/6] Waiting for automatic background drain to create Claude daily event...")
+    print("[A2] Waiting for automatic capture to write the daily event...")
     event_path, event_sha = wait_for_claude_daily_event(config, marker)
     event_rel = str(event_path.relative_to(config.vault_path))
-    print(f"      Created Event: {event_rel}")
-    print(f"      Event SHA256: {event_sha}")
+    print(f"      Event: {event_rel} ({event_sha[:16]})")
 
-    # Step 3: Obsidian Sync propagation
-    bundle_baseline_sha = read_startup_bundle_sha(target)
-    print(f"[3/6] Waiting for Obsidian Sync to propagate to {target.name}...")
-    vps_sha = wait_for_vps_obsidian_sync(target, event_rel, event_sha)
-    print(f"      Remote Event SHA256: {vps_sha} (matches workstation)")
+    print(f"[A3] Waiting for Obsidian Sync to deliver the event to {target.name}...")
+    wait_for_vps_obsidian_sync(target, event_rel, event_sha)
+    arrival_epoch = remote_file_mtime(target, f"{target.vault_path.rstrip('/')}/{event_rel}")
+    arrival_iso = dt.datetime.fromtimestamp(arrival_epoch).astimezone().isoformat(timespec="seconds")
+    expected = expected_daily_rendering(event_path, event_rel)
+    print(f"      Arrived on host at {arrival_iso}; same SHA256")
 
-    # Step 4: Zero operator pre-staging verification
-    print("[4/6] Waiting for the publisher timer to rebuild the Hermes startup bundle...")
-    bundle_sha, journal_evidence = wait_for_vps_publisher_refresh(target, bundle_baseline_sha)
-    print(f"      Hermes Startup Bundle Rebuilt: {bundle_baseline_sha[:16]} -> {bundle_sha[:16]}")
-    print("      Publisher Journal Evidence:")
-    for line in journal_evidence.strip().splitlines()[-4:]:
-        print(f"        {line}")
+    print("[C]  Waiting for a successful publisher run that started after arrival...")
+    journal_evidence = ""
+    try:
+        run = wait_for_publisher_run_after(target, arrival_epoch)
+        journal_evidence = run.pop("journal_text", "")
+        results["C_publisher_cycle"] = {"status": "pass", **run}
+        print(f"      Invocation {run['invocation_id']} result={run['job_result']} payload={run['payload']}")
+    except TimeoutError as exc:
+        results["C_publisher_cycle"] = {"status": "fail", "detail": str(exc)}
+        print(f"      FAIL: {exc}")
 
-    # Step 5: Fresh Codex retrieval
-    print("[5/6] Launching fresh normal trusted Codex session...")
+    print("[B1] Checking the real startup bundle for the event's content...")
+    try:
+        bundle = wait_for_bundle_with_event(target, expected, event_sha, arrival_iso)
+        results["B_startup_injection"] = {
+            "status": "bundle-ok", "bundle_sha256": bundle.get("bundle_sha256"),
+            "bundle_generated_at": bundle.get("generated_at"), "event_item_id": expected["item_id"],
+        }
+        print(f"      Event {expected['item_id']} selected and rendered in bundle {bundle.get('bundle_sha256', '')[:16]}")
+    except TimeoutError as exc:
+        results["B_startup_injection"] = {"status": "fail", "stage": "bundle", "detail": str(exc)}
+        print(f"      FAIL: {exc}")
+
+    print("[A4] Fresh Codex session: targeted recall...")
     codex_session_id, codex_stdout_bytes, codex_stderr_bytes, codex_mapping = run_codex_retrieval(config, marker, repo_root)
-    codex_stdout_str = codex_stdout_bytes.decode("utf-8", errors="replace")
-    codex_answer = codex_final_agent_message(codex_stdout_str)
+    codex_answer = codex_final_agent_message(codex_stdout_bytes.decode("utf-8", errors="replace"))
     if not codex_answer:
         raise RuntimeError("Codex run produced no final agent message to judge.")
-    clean_codex = re.sub(r"[*_`\"'“”]", "", codex_answer).strip().casefold()
-    codex_matched = expected_token in clean_codex
-    codex_stdout_sha = sha256_bytes(codex_stdout_bytes)
-    print(f"      Codex Session ID: {codex_session_id}")
-    print(f"      Codex Output SHA256: {codex_stdout_sha}")
-    print(f"      Codex Check-Value Match: {codex_matched}")
-    if not codex_matched:
-        raise RuntimeError(f"Codex did not return check value {check_value}: {codex_stdout_str}")
+    codex_matched = expected_token in re.sub(r"[*_`\"'\u201c\u201d]", "", codex_answer).casefold()
+    print(f"      Codex {codex_session_id}: final answer has value = {codex_matched}")
 
-    # Step 6: Fresh native Hermes retrieval
-    print(f"[6/6] Launching fresh Hermes session ({target.hermes_profile} on {target.name})...")
+    print(f"[A5] Fresh native Hermes session ({target.hermes_profile}): targeted recall...")
+    hermes_launch_iso = iso_now()
     hermes_session_id, hermes_stdout_bytes, hermes_stderr_bytes, hermes_obs = run_hermes_retrieval(target, marker)
-    hermes_stdout_str = hermes_stdout_bytes.decode("utf-8", errors="replace")
-    clean_hermes = re.sub(r"[*_`\"'“”]", "", hermes_stdout_str).strip().casefold()
-    hermes_matched = expected_token in clean_hermes
-    hermes_stdout_sha = sha256_bytes(hermes_stdout_bytes)
-    print(f"      Hermes Session ID: {hermes_session_id} ({hermes_obs['identification_basis']})")
-    print(f"      Hermes Output SHA256: {hermes_stdout_sha}")
-    print(f"      Hermes Check-Value Match: {hermes_matched}")
-    if not hermes_matched:
-        raise RuntimeError(f"Hermes did not return check value {check_value}: {hermes_stdout_str}")
+    hermes_reply = hermes_stdout_bytes.decode("utf-8", errors="replace")
+    hermes_matched = expected_token in re.sub(r"[*_`\"'\u201c\u201d]", "", hermes_reply).casefold()
+    print(f"      Hermes {hermes_session_id} ({hermes_obs['identification_basis']}): reply has value = {hermes_matched}")
 
-    print("[*] Waiting for the publisher timer to promote recall-hermes.json...")
-    recall_hermes_remote = f"{target.evidence_dir.rstrip('/')}/recall-hermes.json"
-    promoted = False
-    start_p = time.time()
-    while time.time() - start_p < 180:
-        p_res = ssh(
-            target,
-            f"grep -q {shlex.quote(hermes_session_id)} {shlex.quote(recall_hermes_remote)} 2>/dev/null "
-            f"&& echo PROMOTED || echo WAITING",
-        )
-        if "PROMOTED" in p_res.stdout:
-            promoted = True
-            break
-        time.sleep(5)
-    print(f"      Hermes Recall Evidence Promotion: {promoted} (session {hermes_session_id})")
+    a_ok = codex_matched and hermes_matched
+    results["A_capture_to_targeted_recall"] = {
+        "status": "pass" if a_ok else "fail",
+        "claude_session_id": claude_session_id, "event_path": event_rel, "event_sha256": event_sha,
+        "codex_session_id": codex_session_id, "codex_final_answer_has_value": codex_matched,
+        "hermes_session_id": hermes_session_id, "hermes_reply_has_value": hermes_matched,
+    }
 
-    # Step 7: Build execution run object and write the machine receipt
-    print("[*] Assembling authentic HarnessExecutionRun and writing machine receipt...")
+    print("[B2] Checking what this Hermes session was given at startup...")
+    evidence, evidence_location = fetch_recall_evidence_for_session(target, hermes_session_id)
+    if results["B_startup_injection"]["status"] == "bundle-ok":
+        if evidence is None:
+            results["B_startup_injection"].update(status="fail", stage="session", detail="no-recall-evidence-for-session")
+        else:
+            ok, detail = check_session_injection(evidence, hermes_session_id, expected, not_before_iso=hermes_launch_iso)
+            results["B_startup_injection"].update(
+                status="pass" if ok else "fail", stage="session", detail=detail,
+                evidence_location=evidence_location, injected_bundle_sha256=evidence.get("bundle_sha256"),
+            )
+    print(f"      {results['B_startup_injection']}")
+
+    _write_artifact(artifacts_dir, "startup-injection.json", results["B_startup_injection"])
+    _write_artifact(artifacts_dir, "publisher-cycle.json", results["C_publisher_cycle"])
+
+    if not a_ok:
+        _write_artifact(artifacts_dir, "harness-results.json", results)
+        raise RuntimeError(f"Capture-to-recall chain failed: {results['A_capture_to_targeted_recall']}")
+
+    print("[*] Writing and verifying the machine receipt for chain A...")
     run_obj = HarnessExecutionRun(
         harness_run_id=harness_run_id,
         source_runtime="claude",
@@ -745,7 +971,7 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
         source_event_path=event_rel,
         source_event_sha256=event_sha,
         canary_marker=marker,
-        canary_decision=decision,
+        canary_decision=check_value,
         codex_session_id=codex_session_id,
         codex_stdout_bytes=codex_stdout_bytes,
         codex_stderr_bytes=codex_stderr_bytes,
@@ -757,69 +983,38 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
         hermes_decision_matched=hermes_matched,
         hermes_session_observation=hermes_obs,
         claude_observation={
-            "session_id": claude_session_id,
-            "event_path": event_rel,
-            "event_sha256": event_sha,
-            "observed_at": iso_now(),
+            "session_id": claude_session_id, "event_path": event_rel,
+            "event_sha256": event_sha, "observed_at": iso_now(),
         },
         publisher_journal_text=journal_evidence,
     )
-
     evidence_path = _write_machine_cross_runtime_receipt(config, run_obj)
-    print(f"      Machine Evidence Written: {evidence_path}")
-
-    # Local receipt verification
-    print("[*] Verifying local machine receipt...")
     ok_local, msg_local = verify_cross_runtime_continuity_evidence(config)
-    print(f"      Local Evidence Verification: {ok_local} ({msg_local})")
+    print(f"      Local receipt verification: {ok_local} ({msg_local})")
     if not ok_local:
         raise RuntimeError(f"Local cross-runtime verification failed: {msg_local}")
+    _write_artifact(artifacts_dir, "local-verification.json", {
+        "status": "pass", "verified_at": iso_now(), "receipt_sha256": sha256_file(evidence_path),
+        "detail": msg_local, "target": preflight_info,
+    })
+    _write_artifact(artifacts_dir, "harness-results.json", results)
 
-    local_ver_data = {
-        "status": "pass" if ok_local else "fail",
-        "verified_at": iso_now(),
-        "receipt_sha256": sha256_file(evidence_path),
-        "detail": msg_local,
-        "target": preflight_info,
-    }
-    local_ver_file = config.state_path / "evidence" / "m4.2c" / "local-verification.json"
-    local_ver_file.write_text(json.dumps(local_ver_data, indent=2), encoding="utf-8")
-    try:
-        os.chmod(local_ver_file, 0o640)
-    except OSError:
-        pass
-
-    # Copy raw artifacts and receipt to the target
-    print(f"[*] Synchronizing raw artifacts and machine receipt to {target.name}:{target.evidence_dir}...")
     ev_dir = target.evidence_dir.rstrip("/")
-    local_m42c = config.state_path / "evidence" / "m4.2c"
     ssh(target, f"mkdir -p {shlex.quote(ev_dir + '/m4.2c')}", check=True)
-    scp_to(target, [str(p) for p in local_m42c.glob("*")], f"{ev_dir}/m4.2c/", recursive=True)
+    scp_to(target, [str(p) for p in artifacts_dir.glob("*")], f"{ev_dir}/m4.2c/", recursive=True)
     scp_to(target, [str(evidence_path)], f"{ev_dir}/cross-runtime-continuity.json")
     scp_to(target, [str(config.state_path / "evidence" / "codex-session-mapping.json")], f"{ev_dir}/codex-session-mapping.json")
     scp_to(target, [str(config.state_path / "evidence" / "recall-codex.json")], f"{ev_dir}/recall-codex.json")
-
-    owned = [
-        f"{ev_dir}/m4.2c",
-        f"{ev_dir}/cross-runtime-continuity.json",
-        f"{ev_dir}/codex-session-mapping.json",
-        f"{ev_dir}/recall-codex.json",
-    ]
-    chown_cmd = (
+    owned = [f"{ev_dir}/m4.2c", f"{ev_dir}/cross-runtime-continuity.json",
+             f"{ev_dir}/codex-session-mapping.json", f"{ev_dir}/recall-codex.json"]
+    ssh(target, (
         f"chown -R {shlex.quote(target.evidence_owner)} " + " ".join(shlex.quote(p) for p in owned)
-        + " && chmod 0640 "
-        + " ".join(shlex.quote(p) for p in owned[1:])
+        + " && chmod 0640 " + " ".join(shlex.quote(p) for p in owned[1:])
         + f" {shlex.quote(ev_dir + '/m4.2c')}/*"
-    )
-    ssh(target, chown_cmd, check=True)
+    ), check=True)
+    if evidence_location == "promoted":
+        scp_from(target, f"{ev_dir}/recall-hermes.json", str(config.state_path / "evidence" / "recall-hermes.json"))
 
-    # Bring the promoted Hermes recall evidence back to the workstation
-    print("[*] Syncing promoted recall-hermes.json to workstation...")
-    mac_ev_hermes = config.state_path / "evidence" / "recall-hermes.json"
-    scp_from(target, recall_hermes_remote, str(mac_ev_hermes))
-
-    # Remote receipt verification, using the target's own interpreter and config
-    print(f"[*] Verifying machine receipt on {target.name}...")
     verify_script = (
         "from pathlib import Path\n"
         "import json, os\n"
@@ -828,90 +1023,48 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
         f"cfg = MemoryConfig.load(Path({target.memory_config_path!r}))\n"
         "ok, msg = verify_cross_runtime_continuity_evidence(cfg)\n"
         "rec_p = cfg.state_path / 'evidence' / 'cross-runtime-continuity.json'\n"
-        "res = {\n"
-        "    'status': 'pass' if ok else 'fail',\n"
-        "    'detail': msg,\n"
-        "    'verified_at': iso_now(),\n"
-        "    'receipt_sha256': sha256_file(rec_p) if rec_p.is_file() else '',\n"
-        "}\n"
+        "res = {'status': 'pass' if ok else 'fail', 'detail': msg, 'verified_at': iso_now(),\n"
+        "       'receipt_sha256': sha256_file(rec_p) if rec_p.is_file() else ''}\n"
         "out_f = cfg.state_path / 'evidence' / 'm4.2c' / 'vps-verification.json'\n"
         "out_f.write_text(json.dumps(res, indent=2), encoding='utf-8')\n"
-        "try:\n"
-        "    os.chmod(out_f, 0o640)\n"
-        "except OSError:\n"
-        "    pass\n"
         "print('remote verification: %s (%s)' % (ok, msg))\n"
         "raise SystemExit(0 if ok else 1)\n"
     )
-    remote_verify = (
+    res_vps = ssh(target, (
         f"PYTHONPATH={shlex.quote(target.memory_pythonpath)} "
         f"{shlex.quote(target.memory_python)} -c {shlex.quote(verify_script)}"
-    )
-    res_vps = ssh(target, remote_verify)
-    print(f"      Remote Evidence Verification: {res_vps.stdout.strip()}")
+    ))
+    print(f"      Remote receipt verification: {res_vps.stdout.strip()}")
     if res_vps.returncode != 0:
         raise RuntimeError(f"Remote cross-runtime verification failed: {res_vps.stderr.strip()}")
 
-    scp_from(
-        target,
-        f"{ev_dir}/m4.2c/vps-verification.json",
-        str(config.state_path / "evidence" / "m4.2c" / "vps-verification.json"),
-    )
-
-    # Doctors
-    print("[*] Running workstation doctor...")
     doc_local = subprocess.run(
         ["python3", "scripts/pz-memory", "--config", "config-examples/memory-v1-workstation.json", "doctor"],
         capture_output=True, text=True, cwd=str(repo_root),
     )
-    print(f"      Workstation Doctor rc: {doc_local.returncode}")
-    print(f"      Workstation Doctor status: {doc_local.stdout.strip()[:200]}")
-    if doc_local.returncode != 0:
-        raise RuntimeError(f"Workstation doctor failed:\n{doc_local.stdout}\n{doc_local.stderr}")
-
-    print(f"[*] Running doctor on {target.name}...")
     doc_vps = ssh(target, f"{shlex.quote(target.memory_cli)} doctor")
-    print(f"      Remote Doctor rc: {doc_vps.returncode}")
-    print(f"      Remote Doctor status: {doc_vps.stdout.strip()[:200]}")
-    if doc_vps.returncode != 0:
-        raise RuntimeError(f"Remote doctor failed:\n{doc_vps.stdout}\n{doc_vps.stderr}")
-
-    # Policy guard is optional infrastructure.  When the target does not carry
-    # it, the step is recorded as skipped -- never quietly counted as a pass.
+    policy_guard_status = "skipped-not-installed"
     if preflight_info["policy_guard_available"]:
-        print(f"[*] Running policy guard on {target.name}...")
         pg_res = ssh(target, shlex.quote(target.policy_guard))
-        print(f"      Policy Guard rc: {pg_res.returncode}")
-        if pg_res.returncode != 0:
-            raise RuntimeError(f"Policy guard failed: {pg_res.stderr.strip()}")
-        policy_guard_status = "pass"
-    else:
-        policy_guard_status = "skipped-not-installed"
-        print(f"[*] Policy guard not installed on {target.name}; recorded as {policy_guard_status}.")
+        policy_guard_status = "pass" if pg_res.returncode == 0 else "fail"
 
-    print("=== ACCEPTANCE HARNESS COMPLETE ===")
-    print(f"    local receipt verification : {'pass' if ok_local else 'fail'}")
-    print(f"    remote receipt verification: pass")
-    print(f"    hermes recall promotion    : {promoted}")
-    print(f"    policy guard               : {policy_guard_status}")
-
+    overall = all(r.get("status") == "pass" for r in results.values())
+    print("=== ACCEPTANCE HARNESS RESULTS ===")
+    for name, value in results.items():
+        print(f"    {name:30} {value.get('status')}  {value.get('detail', '')}")
+    print(f"    workstation doctor rc       {doc_local.returncode}")
+    print(f"    remote doctor rc            {doc_vps.returncode}")
+    print(f"    policy guard                {policy_guard_status}")
     return {
-        "status": "pass",
-        "target": preflight_info,
+        "status": "pass" if overall else "partial",
         "harness_run_id": harness_run_id,
         "canary_marker": marker,
-        "canary_decision": decision,
         "canary_check_value": check_value,
         "canary_note": canary_note,
-        "claude_session_id": claude_session_id,
-        "event_path": event_rel,
-        "event_sha256": event_sha,
-        "codex_session_id": codex_session_id,
-        "codex_stdout_sha256": codex_stdout_sha,
-        "hermes_session_id": hermes_session_id,
-        "hermes_session_identification": hermes_obs["identification_basis"],
-        "hermes_stdout_sha256": hermes_stdout_sha,
-        "hermes_recall_promoted": promoted,
+        "target": preflight_info,
+        "results": results,
+        "workstation_doctor_rc": doc_local.returncode,
+        "remote_doctor_rc": doc_vps.returncode,
         "policy_guard": policy_guard_status,
     }
 
@@ -934,8 +1087,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     cfg = MemoryConfig.load(Path(args.config))
-    execute_acceptance_harness(cfg, Path.cwd(), target)
-    return 0
+    result = execute_acceptance_harness(cfg, Path.cwd(), target)
+    print(json.dumps({k: result[k] for k in ('status', 'harness_run_id')}, indent=2))
+    return 0 if result["status"] == "pass" else 1
 
 
 if __name__ == "__main__":
