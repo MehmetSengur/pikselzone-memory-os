@@ -414,26 +414,54 @@ def wait_for_claude_daily_event(config: MemoryConfig, canary_marker: str, timeou
     )
 
 
-def wait_for_vps_obsidian_sync(target: HarnessTarget, event_rel_path: str, expected_sha: str, timeout: int = 120) -> str:
+def parse_remote_sha_observation(stdout: str) -> dict[str, Any] | None:
+    """``<sha256> <server epoch>`` from one remote command, or None when incomplete."""
+    parts = stdout.strip().split()
+    if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+        return None
+    try:
+        epoch = float(parts[1])
+    except ValueError:
+        return None
+    return {"sha256": parts[0], "observed_epoch": epoch}
+
+
+def observe_remote_file_sha(target: HarnessTarget, path: str) -> dict[str, Any] | None:
+    """Hash the file and read the server clock in the same remote command.
+
+    The file's mtime is not arrival evidence: Obsidian Sync keeps the source
+    mtime, so a synced file can carry a time from before it reached the host.
+    """
+    quoted = shlex.quote(path)
+    res = ssh(target, f"h=$(sha256sum {quoted} 2>/dev/null | cut -d' ' -f1) && [ -n \"$h\" ] && echo \"$h $(date +%s.%N)\"")
+    if res.returncode != 0:
+        return None
+    return parse_remote_sha_observation(res.stdout)
+
+
+def remote_clock_epoch(target: HarnessTarget) -> float:
+    """The target's own clock, so later remote timestamps are compared on one clock."""
+    res = ssh(target, "date +%s.%N")
+    try:
+        if res.returncode != 0:
+            raise ValueError
+        return float(res.stdout.strip())
+    except ValueError:
+        raise RuntimeError(f"Cannot read the clock on {target.name}: {res.stderr.strip()}") from None
+
+
+def wait_for_vps_obsidian_sync(
+    target: HarnessTarget, event_rel_path: str, expected_sha: str, timeout: int = 120,
+) -> dict[str, Any]:
+    """Wait until the host holds the expected content; return when that was first observed (host clock)."""
     start_time = time.time()
     remote_file = f"{target.vault_path.rstrip('/')}/{event_rel_path}"
-    cmd = f"sha256sum {shlex.quote(remote_file)} 2>/dev/null || true"
     while time.time() - start_time < timeout:
-        res = ssh(target, cmd)
-        out = res.stdout.strip()
-        if out:
-            parts = out.split()
-            if parts and parts[0] == expected_sha:
-                return parts[0]
+        observation = observe_remote_file_sha(target, remote_file)
+        if observation and observation["sha256"] == expected_sha:
+            return {**observation, "path": remote_file, "method": "sha256-and-host-clock-in-one-command"}
         time.sleep(3)
     raise TimeoutError(f"Timed out waiting for Obsidian sync of {event_rel_path} on {target.name}")
-
-
-def remote_file_mtime(target: HarnessTarget, path: str) -> float:
-    res = ssh(target, f"stat -c %Y {shlex.quote(path)}")
-    if res.returncode != 0 or not res.stdout.strip().isdigit():
-        raise RuntimeError(f"Cannot stat {path} on {target.name}: {res.stderr.strip()}")
-    return float(res.stdout.strip())
 
 
 def read_remote_json(target: HarnessTarget, path: str) -> dict[str, Any] | None:
@@ -506,11 +534,15 @@ def select_publisher_run_after(runs: list[dict[str, Any]], since_epoch: float) -
 
 
 def wait_for_publisher_run_after(target: HarnessTarget, since_epoch: float, timeout: int = 240) -> dict[str, Any]:
-    """Wait for the timer-driven publisher to complete a run that began after the event arrived."""
+    """Wait for the timer-driven publisher to complete a run that began after ``since_epoch`` (host clock)."""
     start = time.time()
     since = int(since_epoch) - 2
+    unit = shlex.quote(target.publisher_service)
     while time.time() - start < timeout:
-        res = ssh(target, f"journalctl -u {shlex.quote(target.publisher_service)} -o json --since @{since} --no-pager")
+        res = ssh(target, f"journalctl -u {unit} -o json --since @{since} --no-pager")
+        if res.returncode != 0:
+            time.sleep(5)
+            continue
         records = []
         for line in res.stdout.splitlines():
             try:
@@ -519,11 +551,15 @@ def wait_for_publisher_run_after(target: HarnessTarget, since_epoch: float, time
                 continue
         run = select_publisher_run_after(parse_publisher_runs(records), since_epoch)
         if run:
-            text = ssh(target, f"journalctl -u {shlex.quote(target.publisher_service)} _SYSTEMD_INVOCATION_ID={run['invocation_id']} --no-pager -o short-iso")
-            manager = ssh(target, f"journalctl -u {shlex.quote(target.publisher_service)} INVOCATION_ID={run['invocation_id']} --no-pager -o short-iso")
+            text = ssh(target, f"journalctl -u {unit} _SYSTEMD_INVOCATION_ID={run['invocation_id']} --no-pager -o short-iso")
+            manager = ssh(target, f"journalctl -u {unit} INVOCATION_ID={run['invocation_id']} --no-pager -o short-iso")
+            if text.returncode != 0 or manager.returncode != 0 or not text.stdout.strip() or not manager.stdout.strip():
+                # A run whose own journal cannot be read back is not evidence yet.
+                time.sleep(5)
+                continue
             return {**run, "journal_text": (manager.stdout + text.stdout).strip()}
         time.sleep(5)
-    raise TimeoutError(f"No successful publisher run started after the event arrived ({timeout}s)")
+    raise TimeoutError(f"No successful publisher run started after the observation ({timeout}s)")
 
 
 # --- B. startup injection ----------------------------------------------------
@@ -891,21 +927,21 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
     print(f"      Event: {event_rel} ({event_sha[:16]})")
 
     print(f"[A3] Waiting for Obsidian Sync to deliver the event to {target.name}...")
-    wait_for_vps_obsidian_sync(target, event_rel, event_sha)
-    arrival_epoch = remote_file_mtime(target, f"{target.vault_path.rstrip('/')}/{event_rel}")
+    arrival = wait_for_vps_obsidian_sync(target, event_rel, event_sha)
+    arrival_epoch = arrival["observed_epoch"]
     arrival_iso = dt.datetime.fromtimestamp(arrival_epoch).astimezone().isoformat(timespec="seconds")
     expected = expected_daily_rendering(event_path, event_rel)
-    print(f"      Arrived on host at {arrival_iso}; same SHA256")
+    print(f"      Content confirmed on host at {arrival_iso} (host clock, same SHA256)")
 
-    print("[C]  Waiting for a successful publisher run that started after arrival...")
+    print("[C]  Waiting for a successful publisher run that started after that observation...")
     journal_evidence = ""
     try:
         run = wait_for_publisher_run_after(target, arrival_epoch)
         journal_evidence = run.pop("journal_text", "")
-        results["C_publisher_cycle"] = {"status": "pass", **run}
+        results["C_publisher_cycle"] = {"status": "pass", **run, "host_observation": arrival}
         print(f"      Invocation {run['invocation_id']} result={run['job_result']} payload={run['payload']}")
     except TimeoutError as exc:
-        results["C_publisher_cycle"] = {"status": "fail", "detail": str(exc)}
+        results["C_publisher_cycle"] = {"status": "fail", "detail": str(exc), "host_observation": arrival}
         print(f"      FAIL: {exc}")
 
     print("[B1] Checking the real startup bundle for the event's content...")
@@ -929,7 +965,9 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
     print(f"      Codex {codex_session_id}: final answer has value = {codex_matched}")
 
     print(f"[A5] Fresh native Hermes session ({target.hermes_profile}): targeted recall...")
-    hermes_launch_iso = iso_now()
+    # Evidence observed_at is stamped by the host, so the launch bound must be too.
+    hermes_launch_epoch = remote_clock_epoch(target)
+    hermes_launch_iso = dt.datetime.fromtimestamp(hermes_launch_epoch).astimezone().isoformat(timespec="seconds")
     hermes_session_id, hermes_stdout_bytes, hermes_stderr_bytes, hermes_obs = run_hermes_retrieval(target, marker)
     hermes_reply = hermes_stdout_bytes.decode("utf-8", errors="replace")
     hermes_matched = expected_token in re.sub(r"[*_`\"'\u201c\u201d]", "", hermes_reply).casefold()
@@ -956,11 +994,14 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
             )
     print(f"      {results['B_startup_injection']}")
 
-    _write_artifact(artifacts_dir, "startup-injection.json", results["B_startup_injection"])
-    _write_artifact(artifacts_dir, "publisher-cycle.json", results["C_publisher_cycle"])
+    # Each run keeps its own record: a later run must not relabel an earlier one.
+    run_artifacts_dir = artifacts_dir / "runs" / harness_run_id
+    results["evidence_version"] = 2
+    _write_artifact(run_artifacts_dir, "startup-injection.json", results["B_startup_injection"])
+    _write_artifact(run_artifacts_dir, "publisher-cycle.json", results["C_publisher_cycle"])
 
     if not a_ok:
-        _write_artifact(artifacts_dir, "harness-results.json", results)
+        _write_artifact(run_artifacts_dir, "harness-results.json", results)
         raise RuntimeError(f"Capture-to-recall chain failed: {results['A_capture_to_targeted_recall']}")
 
     print("[*] Writing and verifying the machine receipt for chain A...")
@@ -997,7 +1038,7 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
         "status": "pass", "verified_at": iso_now(), "receipt_sha256": sha256_file(evidence_path),
         "detail": msg_local, "target": preflight_info,
     })
-    _write_artifact(artifacts_dir, "harness-results.json", results)
+    _write_artifact(run_artifacts_dir, "harness-results.json", results)
 
     ev_dir = target.evidence_dir.rstrip("/")
     ssh(target, f"mkdir -p {shlex.quote(ev_dir + '/m4.2c')}", check=True)

@@ -469,3 +469,85 @@ class PublisherCycleCheckTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class HostClockObservationTests(unittest.TestCase):
+    """Arrival is when the host was seen holding the content, on the host's clock."""
+
+    def test_stale_mtime_does_not_move_the_observation_back(self):
+        # Obsidian Sync keeps the source mtime: a file synced now can carry an
+        # mtime from hours ago. The observation must come from the host clock
+        # read together with the hash, never from stat.
+        from memory_v1.harness import wait_for_vps_obsidian_sync
+        sha = "a" * 64
+        commands = []
+
+        def fake_ssh(target, command, check=False):
+            commands.append(command)
+            if command.startswith("stat"):
+                return mock.Mock(returncode=0, stdout="1000\n", stderr="")
+            return mock.Mock(returncode=0, stdout=f"{sha} 5000.25\n", stderr="")
+
+        with mock.patch("memory_v1.harness.ssh", side_effect=fake_ssh), mock.patch("memory_v1.harness.time.sleep"):
+            observation = wait_for_vps_obsidian_sync(CONTABO_TARGET, "daily/x.md", sha, timeout=5)
+        self.assertEqual(5000.25, observation["observed_epoch"])
+        self.assertFalse(any(c.startswith("stat") for c in commands))
+        self.assertTrue(all("sha256sum" in c and "date +%s.%N" in c for c in commands))
+
+    def test_other_content_is_not_an_arrival(self):
+        from memory_v1.harness import wait_for_vps_obsidian_sync
+        fake = mock.Mock(returncode=0, stdout=f"{'b' * 64} 5000.0\n", stderr="")
+        with mock.patch("memory_v1.harness.ssh", return_value=fake), mock.patch("memory_v1.harness.time.sleep"), \
+                mock.patch("memory_v1.harness.time.time", side_effect=[0, 0, 10]):
+            with self.assertRaises(TimeoutError):
+                wait_for_vps_obsidian_sync(CONTABO_TARGET, "daily/x.md", "a" * 64, timeout=5)
+
+    def test_failed_or_partial_remote_output_is_not_an_observation(self):
+        from memory_v1.harness import observe_remote_file_sha, parse_remote_sha_observation
+        self.assertIsNone(parse_remote_sha_observation(""))
+        self.assertIsNone(parse_remote_sha_observation("a" * 64))  # hash without a clock reading
+        self.assertIsNone(parse_remote_sha_observation("nothex 5000"))
+        with mock.patch("memory_v1.harness.ssh", return_value=mock.Mock(returncode=255, stdout=f"{'a' * 64} 1.0", stderr="reset")):
+            self.assertIsNone(observe_remote_file_sha(CONTABO_TARGET, "/x"))
+
+    def test_unreadable_host_clock_aborts(self):
+        from memory_v1.harness import remote_clock_epoch
+        with mock.patch("memory_v1.harness.ssh", return_value=mock.Mock(returncode=255, stdout="", stderr="reset")):
+            with self.assertRaises(RuntimeError):
+                remote_clock_epoch(CONTABO_TARGET)
+
+
+class PublisherJournalReadbackTests(unittest.TestCase):
+    def _records(self, invocation, start):
+        return [
+            {"__REALTIME_TIMESTAMP": str(int(start * 1e6)), "INVOCATION_ID": invocation, "JOB_TYPE": "start",
+             "MESSAGE": "Starting pz-memory-publisher.service - Publish"},
+            {"__REALTIME_TIMESTAMP": str(int((start + 1) * 1e6)), "_SYSTEMD_INVOCATION_ID": invocation,
+             "MESSAGE": '{"status": "ok", "results": []}'},
+            {"__REALTIME_TIMESTAMP": str(int((start + 2) * 1e6)), "INVOCATION_ID": invocation, "JOB_TYPE": "start",
+             "JOB_RESULT": "done", "MESSAGE": "Finished pz-memory-publisher.service"},
+        ]
+
+    def _run(self, readback_code, listing_code=0):
+        from memory_v1.harness import wait_for_publisher_run_after
+        listing = "\n".join(json.dumps(r) for r in self._records("inv1", 1010))
+
+        def fake_ssh(target, command, check=False):
+            if "-o json" in command:
+                return mock.Mock(returncode=listing_code, stdout=listing if listing_code == 0 else "", stderr="")
+            return mock.Mock(returncode=readback_code, stdout="journal line\n" if readback_code == 0 else "", stderr="")
+
+        with mock.patch("memory_v1.harness.ssh", side_effect=fake_ssh), mock.patch("memory_v1.harness.time.sleep"), \
+                mock.patch("memory_v1.harness.time.time", side_effect=[0, 0, 1, 1, 99, 99]):
+            return wait_for_publisher_run_after(CONTABO_TARGET, 1000, timeout=5)
+
+    def test_run_with_readable_journal_is_evidence(self):
+        self.assertEqual("inv1", self._run(0)["invocation_id"])
+
+    def test_run_whose_journal_cannot_be_read_back_is_not_evidence(self):
+        with self.assertRaises(TimeoutError):
+            self._run(255)
+
+    def test_failed_journal_listing_is_not_evidence(self):
+        with self.assertRaises(TimeoutError):
+            self._run(0, listing_code=255)
