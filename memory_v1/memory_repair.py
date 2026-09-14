@@ -597,6 +597,76 @@ def apply_repair_plan(config: MemoryConfig, plan: dict[str, Any]) -> dict[str, A
     return ledger
 
 
+def retire_rule_candidate(
+    config: MemoryConfig, text: str, *, classification: str, evidence: str,
+) -> dict[str, Any]:
+    """Retire one rule candidate by its exact text, with backup, ledger and journal.
+
+    Plans retire or demote active rules only; a candidate recorded from content
+    that turned out to be test data or a one-off request had no audited way out.
+    Only the memory-engine host writes Kurallar.md, so only it may run this.
+    """
+    from .companion import _CANDIDATE_PREFIX, parse_rule_candidates
+
+    if config.role != "memory-engine":
+        raise PolicyError("repair-refused:only-the-memory-engine-writes-Kurallar.md")
+    if not classification.strip() or not evidence.strip():
+        raise PolicyError("repair-refused:classification-and-evidence-required")
+    vault = config.vault_path
+    companion = CompanionManager(vault)
+    rules_path = companion.companion_dir / "Kurallar.md"
+    content = rules_path.read_text(encoding="utf-8")
+    match = next((c for c in parse_rule_candidates(content) if c.text == text.strip()), None)
+    if match is None:
+        raise PolicyError("repair-refused:candidate-not-found")
+
+    repair_id = f"repair-{iso_now()[:19].replace(':', '').replace('-', '')}-{secrets.token_hex(3)}"
+    backup = config.state_path / "backups" / repair_id
+    backup.mkdir(parents=True, exist_ok=False)
+    os.chmod(backup, 0o700)
+    shutil.copy2(rules_path, backup / "Kurallar.md")
+    before = sha256_file(rules_path)
+
+    own_prefix = f"{_CANDIDATE_PREFIX} {match.text} |"
+    lines = [line for line in content.splitlines() if not line.strip().startswith(own_prefix)]
+    clean_evidence = evidence.replace("|", "/")[:160]
+    lines = insert_under_header(
+        lines, RETIRED_RULES_HEADER,
+        f"{RETIRED_PREFIX} {match.text} | **sınıf:** {classification} | **kanıt:** {clean_evidence} | "
+        f"**kaynak:** {', '.join(match.sources)} | **bakım:** {repair_id}",
+    )
+    atomic_write(rules_path, "\n".join(lines) + "\n", mode=0o660)
+
+    ledger = {
+        "schema": LEDGER_SCHEMA,
+        "repair_id": repair_id,
+        "applied_at": iso_now(),
+        "backup_dir": str(backup),
+        "kurallar_sha256_before": before,
+        "kurallar_sha256_after": sha256_file(rules_path),
+        "rules_retired": [],
+        "candidates_retired": [{
+            "text": match.text, "classification": classification, "evidence": evidence,
+            "sources": match.sources,
+        }],
+        "skills_retired": [],
+    }
+    evidence_dir = config.state_path / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    atomic_json(evidence_dir / f"memory-repair-{repair_id}.json", ledger)
+    atomic_json(backup / "ledger.json", ledger)
+    companion.append_journal_entry(
+        title="Hafıza bakımı (aday kural)",
+        narrative=(
+            f"{repair_id}: 1 aday kural devre dışı bırakıldı ({classification}). "
+            f"Kanıt defteri state/evidence/memory-repair-{repair_id}.json; "
+            f"geri alma: pz-memory repair-memory --revert {repair_id}."
+        ),
+        runtime="system",
+    )
+    return ledger
+
+
 def revert_repair(config: MemoryConfig, repair_id: str, *, force: bool = False) -> dict[str, Any]:
     backup = config.state_path / "backups" / repair_id
     ledger_path = backup / "ledger.json"

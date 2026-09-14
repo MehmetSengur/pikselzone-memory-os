@@ -82,6 +82,10 @@ def _parser() -> argparse.ArgumentParser:
     repair_cmd.add_argument("--plan-out", type=Path, help="Write a reviewable plan here; changes nothing.")
     repair_cmd.add_argument("--apply", type=Path, help="Apply a previously reviewed plan file.")
     repair_cmd.add_argument("--revert", help="Restore the backup of this repair id.")
+    repair_cmd.add_argument("--retire-candidate", dest="retire_candidate",
+                            help="Retire the rule candidate with exactly this text (memory-engine host only).")
+    repair_cmd.add_argument("--classification", default="", help="With --retire-candidate: why it is not a preference.")
+    repair_cmd.add_argument("--evidence", default="", help="With --retire-candidate: where that was established.")
     repair_cmd.add_argument("--force", action="store_true", help="With --revert: allow even if files changed.")
     repair_cmd.add_argument("--history", type=Path, action="append", default=[],
                             help="Earlier Kurallar.md snapshot(s) to search for lost entries.")
@@ -235,8 +239,12 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(dataclasses.asdict(report), ensure_ascii=False, indent=2))
             return 0
         if args.command == "repair-memory":
-            from .memory_repair import apply_repair_plan, build_repair_plan, revert_repair
-            if args.revert:
+            from .memory_repair import apply_repair_plan, build_repair_plan, retire_rule_candidate, revert_repair
+            if args.retire_candidate:
+                result = retire_rule_candidate(
+                    config, args.retire_candidate, classification=args.classification, evidence=args.evidence,
+                )
+            elif args.revert:
                 result = revert_repair(config, args.revert, force=args.force)
             elif args.apply:
                 plan = json.loads(args.apply.read_text(encoding="utf-8"))
