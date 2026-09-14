@@ -532,13 +532,19 @@ def _hermes_plugin_drift_rows(config: MemoryConfig) -> list[dict[str, str]]:
         return [_row("hermes_plugin_drift", "fail", f"read-error:{exc}")]
 
     profiles_dir = data_root / "profiles"
-    if not profiles_dir.is_dir():
+    # Service homes (e.g. the knowledge compiler) live outside the profiles
+    # root so user surfaces never list them; their plugin copy must still match.
+    service_homes_dir = data_root.parent / "service-homes"
+    homes = sorted(profiles_dir.iterdir()) if profiles_dir.is_dir() else []
+    if service_homes_dir.is_dir():
+        homes += sorted(service_homes_dir.iterdir())
+    if not homes:
         return [_row("hermes_plugin_drift", "pass", "global-only")]
 
     drift_errors: list[str] = []
     checked_profiles = 0
 
-    for prof in sorted(profiles_dir.iterdir()):
+    for prof in homes:
         if not prof.is_dir():
             continue
         prof_plugin = prof / "plugins" / "pz-memory-v1"
