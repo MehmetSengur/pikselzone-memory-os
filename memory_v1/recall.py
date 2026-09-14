@@ -68,13 +68,15 @@ CROSS_PROJECT_CONTINUITY_MAX = 4
 TARGETED_RECALL_DEFAULT_BUDGET = 8000
 
 # High-risk directive patterns to sanitize from recalled memory
+# Command words need a leading word boundary: without it "rsync" matched
+# `nc` and "retrieval" matched `eval`, quarantining a genuine user rule.
 DIRECTIVE_PATTERNS = (
     re.compile(r"(?i)ignore\s+(?:(?:all|any|the|previous|prior)\s+)*(?:instructions|directives|prompts|rules)"),
     re.compile(r"(?i)(system\s+prompt|developer\s+message|developer\s+mode|jailbreak)"),
-    re.compile(r"(?i)(run\s+this\s+command|execute\s+this|exec\s+this|eval\b|shell_exec)"),
+    re.compile(r"(?i)(run\s+this\s+command|execute\s+this|exec\s+this|\beval\b|shell_exec)"),
     re.compile(r"(?i)(disable|bypass|deactivate)\s+(policy|guard|safety|security|overnight)"),
-    re.compile(r"(?i)(send|exfiltrate|leak|post|upload)\s+(secret|key|token|password|credential)"),
-    re.compile(r"(?i)(curl|wget|nc|bash\s+-i|rm\s+-rf)\b"),
+    re.compile(r"(?i)\b(send|exfiltrate|leak|post|upload)\s+(secret|key|token|password|credential)"),
+    re.compile(r"(?i)\b(curl|wget|nc|bash\s+-i|rm\s+-rf)\b"),
     re.compile(r"(?i)you\s+must\s+(now\s+)?(act\s+as|obey|follow|execute)"),
     re.compile(r"(?i)<script\b"),
 )
