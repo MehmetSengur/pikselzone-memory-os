@@ -198,6 +198,11 @@ def main(argv: list[str] | None = None) -> int:
                 learning = merge_learning_inbox(config)
             except Exception as exc:  # a merge problem must not stop event publication
                 learning = {"status": "error", "error": str(exc)[:300]}
+            try:
+                from .sync_heartbeat import acknowledge_heartbeats
+                learning["sync_ack"] = acknowledge_heartbeats(config)
+            except Exception as exc:
+                learning["sync_ack"] = {"status": "error", "error": str(exc)[:300]}
             print(json.dumps({"status": "ok", "results": results, "learning_merge": learning}, ensure_ascii=False))
             return 0
         if args.command == "promote-knowledge":

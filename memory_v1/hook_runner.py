@@ -167,6 +167,13 @@ def main(argv: list[str] | None = None) -> int:
                 SharedBrainParityManager(config.vault_path).align_shared_brain()
             except Exception:
                 pass
+            try:
+                # Lets both hosts see whether this workstation's vault changes reach
+                # the engine; rate-limited, and never blocks the session.
+                from .sync_heartbeat import write_heartbeat
+                write_heartbeat(config)
+            except Exception:
+                pass
             from .recall import (
                 build_startup_recall_bundle,
                 find_runtime_session_artifact,

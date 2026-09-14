@@ -118,6 +118,12 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
     vault = config.vault_path
     checks.append(_row("vault_path", "pass" if vault.is_dir() else "fail", str(vault)))
+    try:
+        from .sync_heartbeat import learning_inbox_row, sync_roundtrip_row
+        checks.append(sync_roundtrip_row(config))
+        checks.append(learning_inbox_row(config))
+    except Exception as exc:  # visibility rows never break the doctor
+        checks.append(_row("sync_roundtrip", "unknown", f"error:{str(exc)[:120]}"))
     checks.append(_row(
         "state_outside_vault", "pass" if not path_within(config.state_path, vault) else "fail"
     ))
