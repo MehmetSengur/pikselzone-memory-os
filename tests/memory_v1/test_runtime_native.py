@@ -737,6 +737,40 @@ class RuntimeNativeTests(unittest.TestCase):
         # Doctor activation evidence check must PASS
         self.assertTrue(_activation_evidence_valid(cfg, "codex", evidence_path, hooks_path))
 
+    def test_worker_receipt_binds_the_session_model_not_the_flush_model(self):
+        # A gpt-6-astra Codex session flushed by luna: the event records the
+        # session model, so a receipt carrying the flush model never verified.
+        from memory_v1.doctor import _activation_evidence_valid
+
+        mock_codex_out = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(SAMPLE_SUMMARY)}}) + "\n"
+        evidence_path = self.state / "evidence" / "codex-smoke.json"
+        hooks_path = self.root / "hooks.json"
+        hooks_path.write_text(json.dumps({"hooks": {}}))
+        cfg = MemoryConfig.from_dict({
+            "role": "workstation", "vault_path": str(self.vault), "state_path": str(self.state),
+            "runtimes": ["codex", "claude"],
+            "transcript_roots": {"codex": [str(self.root)], "claude": [str(self.root)]},
+            "can_write_event_memory": True, "can_run_compiler": False,
+            "models": {"flush": "gpt-5.6-luna", "compiler": "gpt-5.6-terra"}, "provider": {},
+            "activation": {"codex_hooks_path": str(hooks_path), "codex_smoke_evidence_path": str(evidence_path)},
+        })
+        provider = RuntimeNativeProvider(
+            cfg, codex_runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=mock_codex_out, stderr=""),
+        )
+        transcript_file = self.root / "codex-astra-session.jsonl"
+        transcript_file.write_text(json.dumps({"role": "user", "content": "Model ayrımı testi."}) + "\n")
+        qpath = checkpoint_hook(cfg, runtime="codex", payload={
+            "session_id": "sess-astra-1", "transcript_path": str(transcript_file),
+            "event": "session_end", "model": "gpt-6-astra",
+        })
+        event_path = drain_checkpoint(cfg, qpath, provider=provider)
+
+        receipt = json.loads(evidence_path.read_text(encoding="utf-8"))["worker_receipt"]
+        self.assertIn('source_model: "gpt-6-astra"', event_path.read_text(encoding="utf-8"))
+        self.assertEqual("gpt-6-astra", receipt["source_model"])
+        self.assertTrue(receipt["flush_model"])
+        self.assertTrue(_activation_evidence_valid(cfg, "codex", evidence_path, hooks_path))
+
     # 34. Fabricated smoke evidence rejected by doctor
     def test_fabricated_smoke_evidence_rejected(self):
         from memory_v1.doctor import _activation_evidence_valid

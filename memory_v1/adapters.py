@@ -520,11 +520,16 @@ def _drain_validated_checkpoint(
         or event_artifact.get("source_provider")
         or ("chatgpt-subscription" if runtime == "codex" else ("claude-subscription" if runtime == "claude" else "unknown"))
     )
-    model_name = (
+    # The receipt attests the event it points at, so it carries the event's
+    # source_model (the session's model when the hook payload names one). The
+    # summarizer's own model is recorded separately: when the two differ, as
+    # with a gpt-6-astra Codex session flushed by luna, binding the receipt to
+    # the flush model made every valid drain fail activation verification.
+    flush_model = (
         getattr(active_provider, "last_source_model", None)
-        or event_artifact.get("source_model")
         or ("gpt-5.6-luna" if runtime == "codex" else ("haiku" if runtime == "claude" else "unknown"))
     )
+    model_name = event_artifact.get("source_model") or flush_model
 
     evidence_path = (
         config.codex_smoke_evidence_path if runtime == "codex"
@@ -569,6 +574,7 @@ def _drain_validated_checkpoint(
             "event_sha256": event_digest,
             "source_provider": provider_name,
             "source_model": model_name,
+            "flush_model": flush_model,
             "worker_pid": os.getpid(),
         }
         evidence_payload = {
