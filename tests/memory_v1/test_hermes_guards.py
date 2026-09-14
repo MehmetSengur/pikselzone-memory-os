@@ -114,5 +114,69 @@ class LauncherOrderTests(unittest.TestCase):
         self.assertEqual(["hermes", "-p", "pz-orchestrator", "gateway", "run"], seen["argv"])
 
 
+WORKER_PROTOCOL = "# Kanban task execution protocol\nYou have been assigned ONE task. 1. **Orient.** Call `kanban_show()` first (no args)."
+
+
+def _fake_system_prompt():
+    module = types.ModuleType("agent.system_prompt")
+
+    def _tool_guidance_block(agent):
+        return " ".join(g for g in ("MEMORY GUIDANCE", agent.kanban) if g) or None
+
+    module._tool_guidance_block = _tool_guidance_block
+    return module
+
+
+class KanbanGuidanceGuardTests(unittest.TestCase):
+    """Only a dispatched Kanban worker gets the no-arguments kanban_show protocol."""
+
+    def setUp(self):
+        from unittest import mock
+        self.mock = mock
+        self.module = _fake_system_prompt()
+        self.assertTrue(guards.install_kanban_guidance_guard(self.module, WORKER_PROTOCOL))
+
+    def _agent(self, kanban=WORKER_PROTOCOL):
+        return types.SimpleNamespace(kanban=kanban)
+
+    def _env(self, task=None, dispatcher_owned=True):
+        env = {"HERMES_KANBAN_TASK": task} if task else {}
+        ctx = types.ModuleType("agent.delegation_context")
+        ctx.is_dispatcher_owned_worker_context = lambda: dispatcher_owned
+        agent_pkg = types.ModuleType("agent")
+        agent_pkg.delegation_context = ctx
+        return (self.mock.patch.dict("os.environ", env, clear=False),
+                self.mock.patch.dict("sys.modules", {"agent": agent_pkg, "agent.delegation_context": ctx}))
+
+    def test_conversation_without_task_gets_conversation_guidance(self):
+        env, mods = self._env()
+        with env, mods, self.mock.patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("HERMES_KANBAN_TASK", None)
+            text = self.module._tool_guidance_block(self._agent())
+        self.assertNotIn("(no args)", text)
+        self.assertIn("explicit `task_id`", text)
+        self.assertIn("MEMORY GUIDANCE", text)  # the rest of the block is untouched
+
+    def test_dispatched_worker_keeps_the_worker_protocol(self):
+        env, mods = self._env(task="t_1234", dispatcher_owned=True)
+        with env, mods:
+            self.assertIn("(no args)", self.module._tool_guidance_block(self._agent()))
+
+    def test_delegated_child_of_a_worker_is_not_treated_as_the_worker(self):
+        env, mods = self._env(task="t_1234", dispatcher_owned=False)
+        with env, mods:
+            self.assertNotIn("(no args)", self.module._tool_guidance_block(self._agent()))
+
+    def test_agent_without_kanban_tools_is_unchanged(self):
+        self.assertEqual("MEMORY GUIDANCE", self.module._tool_guidance_block(self._agent(kanban="")))
+
+    def test_install_is_idempotent_and_reports_a_missing_seam(self):
+        wrapped = self.module._tool_guidance_block
+        self.assertTrue(guards.install_kanban_guidance_guard(self.module, WORKER_PROTOCOL))
+        self.assertIs(wrapped, self.module._tool_guidance_block)
+        self.assertFalse(guards.install_kanban_guidance_guard(types.ModuleType("empty"), WORKER_PROTOCOL))
+
+
 if __name__ == "__main__":
     unittest.main()
