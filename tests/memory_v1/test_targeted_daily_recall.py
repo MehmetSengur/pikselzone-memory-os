@@ -1,0 +1,60 @@
+"""Targeted recall reaches every section of a daily event; startup stays condensed."""
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from memory_v1.core import MemoryConfig
+from memory_v1.events import EventWriter
+from memory_v1.recall import build_startup_recall_bundle, targeted_recall
+
+
+class TargetedDailyRecallTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name).resolve()
+        self.vault = root / "vault"
+        (self.vault / "companion").mkdir(parents=True)
+        (self.vault / "companion" / "Core.md").write_text("# Core\n- Kullanıcı\n", encoding="utf-8")
+        self.config = MemoryConfig.from_dict({
+            "role": "workstation", "vault_path": str(self.vault), "state_path": str(root / "state"),
+            "runtimes": ["claude", "codex"], "transcript_roots": {"claude": [str(root)], "codex": [str(root)]},
+            "can_write_event_memory": True, "can_run_compiler": False,
+            "models": {"flush": "gpt-5.6-luna", "compiler": "gpt-5.6-terra"}, "provider": {"mode": "runtime-native"},
+        })
+        day = self.vault / "daily" / "2026-09-14"
+        day.mkdir(parents=True)
+        (day / f"hermes-{'a' * 32}.md").write_text(EventWriter._render(
+            runtime="hermes", agent_id="hermes-main", session_id="20260914_desktop", event="session_finalize",
+            events_seen=["session_finalize"], created_at="2026-09-14T21:14:30+03:00",
+            source_model="gpt-5.6-luna", source_provider="openai-codex", root_task_id="t", kanban_ids=[],
+            source_digest="b" * 64, redaction_count=0,
+            summary={
+                "context": ["Örnek bakım planı üç kontrol içeriyor: disk sağlık taraması ve yedek geri okuma."],
+                "important_conversations": ["Bakım penceresi Gece-Kuşu-7c485f ve iş emri WO-8820-7c485f aktarıldı."],
+                "decisions": [], "learnings": ["Yedek geri okuma süresi ölçülmedi."],
+                "open_items": ["Süre ölçülmeli."], "evidence": ["bakim-plani-test-7c485f.md satır 3-9"],
+            },
+        ), encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_identifier_outside_context_is_found_by_targeted_recall(self):
+        result = targeted_recall(self.config, "bakım penceresi iş emri")
+        self.assertIn("Gece-Kuşu-7c485f", result["markdown"])
+        self.assertIn("WO-8820-7c485f", result["markdown"])
+        self.assertIn("bakim-plani-test-7c485f.md", result["markdown"])
+
+    def test_startup_bundle_keeps_the_condensed_form(self):
+        bundle = build_startup_recall_bundle(self.config, runtime="hermes")
+        self.assertIn("disk sağlık taraması", bundle.text)
+        self.assertNotIn("WO-8820-7c485f", bundle.text)
+
+    def test_unknown_placeholders_are_not_rendered(self):
+        self.assertNotIn("- unknown", targeted_recall(self.config, "bakım planı")["markdown"])
+
+
+if __name__ == "__main__":
+    unittest.main()

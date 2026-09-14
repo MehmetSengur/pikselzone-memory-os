@@ -732,11 +732,22 @@ def _load_recent_daily_tail(
                 continue
             rel_path = str(path.relative_to(config.vault_path))
 
-            # Build condensed bullet representation
-            context_bullets = event["sections"].get("context") or event["sections"].get("Bağlam") or []
-            decisions_bullets = event["sections"].get("decisions") or event["sections"].get("Alınan Kararlar") or []
-            bullets = context_bullets[:2] + decisions_bullets[:2]
-            summary_text = "\n".join(f"- {b}" for b in bullets)
+            sections = event["sections"]
+            if query:
+                # A targeted lookup reads the whole summary: names and identifiers
+                # usually sit in "Önemli Konuşmalar" or "Kanıtlar", which the
+                # condensed startup form leaves out, so they were unreachable.
+                bullets = [
+                    b for field in DAILY_RECALL_FIELDS for b in (sections.get(field) or [])
+                    if b and b != "unknown"
+                ]
+                summary_text = "\n".join(f"- {b}" for b in bullets)[:TARGETED_DAILY_EVENT_CHARS]
+            else:
+                # Startup keeps the condensed form (the bundle budget depends on it).
+                context_bullets = sections.get("context") or sections.get("Bağlam") or []
+                decisions_bullets = sections.get("decisions") or sections.get("Alınan Kararlar") or []
+                bullets = context_bullets[:2] + decisions_bullets[:2]
+                summary_text = "\n".join(f"- {b}" for b in bullets)
             sanitized, _ = sanitize_untrusted_memory(summary_text)
 
             score = score_text_relevance(
@@ -762,6 +773,10 @@ def _load_recent_daily_tail(
             logger.warning("Error reading daily event %s: %s", path, exc)
 
     return items
+
+
+DAILY_RECALL_FIELDS = ("context", "important_conversations", "decisions", "learnings", "open_items", "evidence")
+TARGETED_DAILY_EVENT_CHARS = 2500
 
 
 def _load_skills_summary(config: MemoryConfig) -> list[RecallItem]:
