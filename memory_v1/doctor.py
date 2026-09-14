@@ -501,7 +501,38 @@ def _activation_rows(config: MemoryConfig) -> list[dict[str, str]]:
             "verified-evidence-valid" if evidence and _activation_evidence_valid(config, "hermes", evidence, None) else "unverified",
         ))
         rows.extend(_hermes_plugin_drift_rows(config))
+        rows.append(_user_surface_guard_row(config))
     return rows
+
+
+USER_SURFACE_UNITS = ("pz-hermes-dashboard", "pz-hermes-telegram")
+
+
+def _user_surface_guard_row(config: MemoryConfig, unit_dir: Path = Path("/etc/systemd/system")) -> dict[str, str]:
+    """Do the user-facing Hermes units run with the service-profile and update guards?"""
+    if config.role != "memory-engine":
+        return _row("user_surface_guards", "not-applicable", "workstation")
+    from .hermes_guards import is_service_profile_home
+    roots = config.transcript_roots.get("hermes", [])
+    profiles_dir = Path(roots[0]) / "profiles" if roots else None
+    services = sorted(
+        p.name for p in (profiles_dir.iterdir() if profiles_dir and profiles_dir.is_dir() else [])
+        if p.is_dir() and is_service_profile_home(p)
+    )
+    unguarded = []
+    for unit in USER_SURFACE_UNITS:
+        dropins = unit_dir / f"{unit}.service.d"
+        text = ""
+        if dropins.is_dir():
+            text = "".join(f.read_text(encoding="utf-8", errors="replace") for f in sorted(dropins.glob("*.conf")))
+        if "PZ_HERMES_USER_SURFACE=1" not in text:
+            unguarded.append(unit)
+    detail = f"service_profiles={','.join(services) or 'none'}"
+    if unguarded:
+        return _row("user_surface_guards", "warn", detail + f";unguarded={','.join(unguarded)}")
+    if not services:
+        return _row("user_surface_guards", "warn", detail + ";no-service-profile-marked")
+    return _row("user_surface_guards", "pass", detail + ";units-guarded")
 
 
 def _hermes_plugin_drift_rows(config: MemoryConfig) -> list[dict[str, str]]:
