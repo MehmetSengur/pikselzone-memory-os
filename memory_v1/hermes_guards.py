@@ -86,9 +86,11 @@ def install_profile_guards(profiles_mod: Any, *, process_home: Path | None) -> N
 
     @functools.wraps(original_exists)
     def profile_exists(name: Any, *args: Any, **kwargs: Any):
-        if not original_exists(name, *args, **kwargs):
-            return False
+        # Hermes' own profile_exists resolves through the module's get_profile_dir,
+        # so a refusal can surface from inside the original call as well.
         try:
+            if not original_exists(name, *args, **kwargs):
+                return False
             get_profile_dir(name)
         except ServiceProfileRefused:
             return False

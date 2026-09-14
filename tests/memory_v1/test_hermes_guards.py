@@ -22,7 +22,8 @@ def _fake_profiles(root: Path) -> types.ModuleType:
         return root if name == "default" else profiles_root / name
 
     def profile_exists(name):
-        return name == "default" or (profiles_root / name).is_dir()
+        # Like Hermes 0.21.1: resolves through the module-level get_profile_dir.
+        return Path(module.get_profile_dir(name)).is_dir()
 
     def list_profiles():  # resolves the helper through module globals, like Hermes does
         return ["default", *(p.name for p in module._iter_named_profile_dirs())]
