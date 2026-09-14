@@ -681,17 +681,22 @@ def fetch_recall_evidence_for_session(
     target: HarnessTarget, session_id: str, timeout: int = 240,
 ) -> tuple[dict[str, Any] | None, str]:
     """Recall evidence for one session: promoted copy first, outbox while pending."""
-    promoted = f"{target.evidence_dir.rstrip('/')}/recall-hermes.json"
-    outbox = f"{target.hermes_home.rstrip('/')}/memory-v1/outbox/evidence/recall-hermes.json"
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", session_id)
+    evidence_dir = target.evidence_dir.rstrip("/")
+    outbox_dir = f"{target.hermes_home.rstrip('/')}/memory-v1/outbox/evidence"
+    promoted_candidates = (f"{evidence_dir}/recall-hermes-sessions/{name}.json", f"{evidence_dir}/recall-hermes.json")
+    outbox_candidates = (f"{outbox_dir}/recall-hermes-sessions/{name}.json", f"{outbox_dir}/recall-hermes.json")
     start = time.time()
     pending: dict[str, Any] | None = None
     while time.time() - start < timeout:
-        value = read_remote_json(target, promoted)
-        if value and value.get("session_key") == session_id:
-            return value, "promoted"
-        staged = read_remote_json(target, outbox)
-        if staged and staged.get("session_key") == session_id:
-            pending = staged
+        for path in promoted_candidates:
+            value = read_remote_json(target, path)
+            if value and value.get("session_key") == session_id:
+                return value, "promoted"
+        for path in outbox_candidates:
+            staged = read_remote_json(target, path)
+            if staged and staged.get("session_key") == session_id:
+                pending = staged
         time.sleep(5)
     return (pending, "outbox-not-promoted") if pending else (None, "not-found")
 

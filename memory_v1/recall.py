@@ -1613,6 +1613,26 @@ def write_recall_evidence(
     return evidence_path
 
 
+def _hermes_recall_receipt_problem(artifact_path: str, session_key: str) -> str:
+    """Hermes startup evidence must point at the injection's own native receipt."""
+    path = Path(artifact_path)
+    if path.parent.name != "pre_llm_call" or path.parent.parent.name != "receipts":
+        return "not-a-pre_llm_call-receipt"
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "unreadable"
+    if not isinstance(receipt, dict) or receipt.get("schema") != "pikselzone-memory-lifecycle-receipt-v1":
+        return "schema"
+    if receipt.get("session_id") != session_key:
+        return "other-session"
+    if receipt.get("hook_name") != "pre_llm_call":
+        return "other-hook"
+    if receipt.get("native_invoke") is not True:
+        return "not-invoked-by-hermes"
+    return ""
+
+
 def verify_recall_evidence(config: MemoryConfig, runtime: str) -> tuple[bool, str]:
     """Verify machine-generated recall evidence; reject forged or invalid evidence."""
     evidence_path = config.state_path / "evidence" / f"recall-{runtime}.json"
@@ -1649,6 +1669,11 @@ def verify_recall_evidence(config: MemoryConfig, runtime: str) -> tuple[bool, st
                     claimed_p = host_p
             if not claimed_p.exists():
                 return False, f"claimed-session-artifact-missing:{claimed_art_path}"
+
+        if runtime == "hermes":
+            receipt_problem = _hermes_recall_receipt_problem(claimed_art_path or "", session_key)
+            if receipt_problem:
+                return False, f"lifecycle-receipt-artifact-invalid:{receipt_problem}"
 
         claimed_art_sha = data.get("session_artifact_sha256")
         if claimed_art_sha and claimed_art_path:
@@ -1748,7 +1773,10 @@ def verify_recall_evidence(config: MemoryConfig, runtime: str) -> tuple[bool, st
                         continue
                     if rel_path.startswith("continuity/"):
                         continue
-                    return False, f"source-file-sha-mismatch:{rel_path}"
+                    # Everything above verified: the session was injected consistently
+                    # with the sources as they were. A source edited since makes the
+                    # evidence historical; only a new session can re-verify it.
+                    return False, f"source-file-sha-mismatch:evidence-historical:{rel_path}-changed-since-session-start"
 
         return True, "verified"
     except Exception as exc:

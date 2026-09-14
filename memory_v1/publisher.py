@@ -295,6 +295,30 @@ def publish_outbox(
         except Exception as r_exc:
             logger.warning("Failed to promote recall evidence: %s", r_exc)
 
+    # Per-session recall evidence: each file must name the session it is for.
+    session_evidence_dir = evidence_dir / "recall-hermes-sessions"
+    if session_evidence_dir.is_dir() and not session_evidence_dir.is_symlink():
+        dest_sessions = config.state_path / "evidence" / "recall-hermes-sessions"
+        for session_file in sorted(session_evidence_dir.glob("*.json")):
+            try:
+                reject_symlink_chain(session_file)
+                text, _ = secure_read_text(session_file, root=evidence_dir, max_bytes=512 * 1024)
+                data = json.loads(text)
+                key = str(data.get("session_key") or "")
+                if (
+                    isinstance(data, dict)
+                    and data.get("schema") == "pikselzone-memory-recall-evidence-v1"
+                    and data.get("runtime") == "hermes" and data.get("status") == "pass"
+                    and key and re.sub(r"[^A-Za-z0-9_.-]+", "-", key) == session_file.stem
+                ):
+                    dest_sessions.mkdir(parents=True, exist_ok=True)
+                    atomic_write(dest_sessions / session_file.name, text.encode("utf-8"), mode=0o600)
+                    safe_unlink(session_file, root=evidence_dir)
+                else:
+                    logger.warning("Rejecting per-session recall evidence %s", session_file.name)
+            except Exception as s_exc:
+                logger.warning("Failed to promote per-session recall evidence %s: %s", session_file.name, s_exc)
+
     # Promote the native flush health observation.  The Hermes plugin performs
     # the flush itself and cannot write engine state, so without this the
     # doctor's flush-hermes row stays "never-run" while the native path works.

@@ -592,32 +592,46 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
 
         self.assertFalse((base / "outbox" / "evidence" / "flush-hermes.json").exists())
 
-    def test_recall_receipt_lookup_respects_memory_base_override(self):
+    def test_recall_evidence_is_bound_to_its_own_pre_llm_call_receipt(self):
+        # Evidence used to point at receipts/<session>.json, which on_session_end
+        # and on_session_finalize rewrite, so a later hook made valid evidence
+        # fail verification. The injection now keeps its own receipt.
         plugin = load_hermes_plugin()
         session_id = "receipt-isolation"
         live_base = self.root / "live-memory-base"
         isolated_base = self.root / "isolated-memory-base"
-        live_receipt = live_base / "state" / "receipts" / f"{session_id}.json"
-        isolated_receipt = isolated_base / "state" / "receipts" / f"{session_id}.json"
-        live_receipt.parent.mkdir(parents=True)
-        isolated_receipt.parent.mkdir(parents=True)
-        live_receipt.write_text("live-receipt", encoding="utf-8")
-        isolated_receipt.write_text("isolated-receipt", encoding="utf-8")
-
         with mock.patch.object(plugin, "BASE_DIR", str(live_base)), \
-             mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(isolated_base)}), \
+             mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(isolated_base), "PZ_MEMORY_TEST_MODE": "1"}), \
              mock.patch.object(plugin, "_active_session_db_path", return_value=None):
             plugin._write_hermes_recall_evidence(session_id, "bundle", [])
             evidence_path = isolated_base / "outbox" / "evidence" / "recall-hermes.json"
             payload = json.loads(evidence_path.read_text(encoding="utf-8"))
-            self.assertEqual(str(isolated_receipt), payload["session_artifact_path"])
-            self.assertEqual(hashlib.sha256(b"isolated-receipt").hexdigest(), payload["session_artifact_sha256"])
+            receipt_path = isolated_base / "state" / "receipts" / "pre_llm_call" / f"{session_id}.json"
+            self.assertEqual(str(receipt_path), payload["session_artifact_path"])
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual((session_id, "pre_llm_call", True),
+                             (receipt["session_id"], receipt["hook_name"], receipt["native_invoke"]))
+            self.assertEqual(hashlib.sha256(receipt_path.read_bytes()).hexdigest(), payload["session_artifact_sha256"])
+            self.assertEqual(payload["session_artifact_sha256"], payload["lifecycle_receipt"]["session_artifact_sha256"])
 
-            isolated_receipt.unlink()
-            plugin._write_hermes_recall_evidence(session_id, "bundle-without-receipt", [])
-            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
-            self.assertIsNone(payload["session_artifact_path"])
-            self.assertEqual("", payload["session_artifact_sha256"])
+            plugin._record_lifecycle_receipt(session_id, "on_session_end")  # later hooks of the same session
+            plugin._record_lifecycle_receipt(session_id, "on_session_finalize")
+            self.assertEqual(payload["session_artifact_sha256"], hashlib.sha256(receipt_path.read_bytes()).hexdigest())
+
+            per_session = isolated_base / "outbox" / "evidence" / "recall-hermes-sessions" / f"{session_id}.json"
+            self.assertEqual(payload, json.loads(per_session.read_text(encoding="utf-8")))
+        self.assertFalse((live_base / "outbox").exists())
+
+    def test_concurrent_sessions_keep_their_own_recall_evidence(self):
+        plugin = load_hermes_plugin()
+        base = self.root / "concurrent-memory-base"
+        with mock.patch.dict(os.environ, {"PZ_MEMORY_BASE_DIR": str(base), "PZ_MEMORY_TEST_MODE": "1"}), \
+             mock.patch.object(plugin, "_active_session_db_path", return_value=None):
+            plugin._write_hermes_recall_evidence("desktop-session", "bundle A", [])
+            plugin._write_hermes_recall_evidence("cli-session", "bundle B", [])
+        sessions = base / "outbox" / "evidence" / "recall-hermes-sessions"
+        self.assertEqual("desktop-session", json.loads((sessions / "desktop-session.json").read_text())["session_key"])
+        self.assertEqual("cli-session", json.loads((sessions / "cli-session.json").read_text())["session_key"])
 
     def test_pre_llm_startup_bundle_respects_memory_base_override(self):
         plugin = load_hermes_plugin()

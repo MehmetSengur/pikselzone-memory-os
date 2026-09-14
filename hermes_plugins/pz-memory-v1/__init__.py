@@ -113,6 +113,11 @@ def _is_internal_call() -> bool:
     return os.environ.get("PZ_MEMORY_INTERNAL_CALL") == "1"
 
 
+_NATIVE_HOOK_FUNCTIONS = frozenset({"invoke_hook", "_invoke_hook_callback", "_run_hook_callback_bounded", "_plugin_hooks"})
+_NATIVE_HOOK_FILES = ("/hermes_cli/plugins.py", "/hermes_cli/plugins_dispatch.py", "/hermes_cli/lifecycle.py")
+_SESSION_FILE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
 def _record_lifecycle_receipt(
     session_id: str,
     hook_name: str,
@@ -131,8 +136,11 @@ def _record_lifecycle_receipt(
         stack = inspect.stack()
         for frame_info in stack[1:]:
             fn = frame_info.function
-            filename = frame_info.filename
-            if fn == "invoke_hook" and "plugins.py" in filename:
+            filename = frame_info.filename.replace("\\", "/")
+            # Hermes 0.21 dispatches hooks through hermes_cli.plugins.invoke_hook,
+            # the delivery manager in plugins_dispatch, and bounded callbacks that
+            # run on a worker thread (whose stack starts at _invoke_hook_callback).
+            if fn in _NATIVE_HOOK_FUNCTIONS and filename.endswith(_NATIVE_HOOK_FILES):
                 native_invoke = True
                 caller_fn = fn
                 caller_file = filename
@@ -1251,7 +1259,12 @@ def _write_hermes_recall_evidence(
 
         art_path = None
         art_sha = ""
-        rcpt_path = _memory_path("state", "receipts", f"{session_id}.json")
+        # The injection's own lifecycle receipt, kept in a directory the
+        # session_end/finalize receipts never write to: evidence bound to the
+        # shared receipts/<session>.json went stale when a later hook rewrote it.
+        recall_receipts = _memory_path("state", "receipts", "pre_llm_call")
+        _record_lifecycle_receipt(session_id, "pre_llm_call", target_dir=recall_receipts)
+        rcpt_path = posixpath.join(recall_receipts, f"{session_id}.json")
         if os.path.exists(rcpt_path):
             art_path = rcpt_path
             try:
@@ -1317,12 +1330,18 @@ def _write_hermes_recall_evidence(
             "lifecycle_receipt": rcpt,
             "status": "pass",
         }
-        tmp_file = f"{evidence_file}.tmp.{os.getpid()}"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.chmod(tmp_file, 0o640)
-        os.replace(tmp_file, evidence_file)
+        # One copy per session next to the latest: concurrent sessions and
+        # profiles each keep their own evidence instead of overwriting one file.
+        session_dir = posixpath.join(evidence_root, "recall-hermes-sessions")
+        os.makedirs(session_dir, exist_ok=True)
+        session_file = posixpath.join(session_dir, f"{_SESSION_FILE_RE.sub('-', session_id)}.json")
+        for target in (session_file, evidence_file):
+            tmp_file = f"{target}.tmp.{os.getpid()}"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.chmod(tmp_file, 0o640)
+            os.replace(tmp_file, target)
     except Exception as exc:
         logger.warning("Failed to write Hermes recall evidence: %s", exc)
 
