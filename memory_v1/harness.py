@@ -877,6 +877,16 @@ def run_hermes_retrieval(target: HarnessTarget, canary_marker: str) -> tuple[str
 # ---------------------------------------------------------------------------
 
 
+# 2: arrival and launch are timed on the host clock (earlier runs used the file mtime).
+EVIDENCE_VERSION = 2
+
+
+def overall_status(results: dict[str, Any]) -> bool:
+    """Pass only when every chain result passed; run metadata is not a chain."""
+    chains = [value for value in results.values() if isinstance(value, dict) and "status" in value]
+    return bool(chains) and all(chain["status"] == "pass" for chain in chains)
+
+
 def _write_artifact(directory: Path, name: str, payload: dict[str, Any]) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / name
@@ -996,12 +1006,11 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
 
     # Each run keeps its own record: a later run must not relabel an earlier one.
     run_artifacts_dir = artifacts_dir / "runs" / harness_run_id
-    results["evidence_version"] = 2
     _write_artifact(run_artifacts_dir, "startup-injection.json", results["B_startup_injection"])
     _write_artifact(run_artifacts_dir, "publisher-cycle.json", results["C_publisher_cycle"])
 
     if not a_ok:
-        _write_artifact(run_artifacts_dir, "harness-results.json", results)
+        _write_artifact(run_artifacts_dir, "harness-results.json", {**results, "evidence_version": EVIDENCE_VERSION})
         raise RuntimeError(f"Capture-to-recall chain failed: {results['A_capture_to_targeted_recall']}")
 
     print("[*] Writing and verifying the machine receipt for chain A...")
@@ -1038,7 +1047,7 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
         "status": "pass", "verified_at": iso_now(), "receipt_sha256": sha256_file(evidence_path),
         "detail": msg_local, "target": preflight_info,
     })
-    _write_artifact(run_artifacts_dir, "harness-results.json", results)
+    _write_artifact(run_artifacts_dir, "harness-results.json", {**results, "evidence_version": EVIDENCE_VERSION})
 
     ev_dir = target.evidence_dir.rstrip("/")
     ssh(target, f"mkdir -p {shlex.quote(ev_dir + '/m4.2c')}", check=True)
@@ -1089,7 +1098,7 @@ def execute_acceptance_harness(config: MemoryConfig, repo_root: Path, target: Ha
         pg_res = ssh(target, shlex.quote(target.policy_guard))
         policy_guard_status = "pass" if pg_res.returncode == 0 else "fail"
 
-    overall = all(r.get("status") == "pass" for r in results.values())
+    overall = overall_status(results)
     print("=== ACCEPTANCE HARNESS RESULTS ===")
     for name, value in results.items():
         print(f"    {name:30} {value.get('status')}  {value.get('detail', '')}")

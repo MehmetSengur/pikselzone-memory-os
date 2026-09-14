@@ -551,3 +551,13 @@ class PublisherJournalReadbackTests(unittest.TestCase):
     def test_failed_journal_listing_is_not_evidence(self):
         with self.assertRaises(TimeoutError):
             self._run(0, listing_code=255)
+
+
+class OverallStatusTests(unittest.TestCase):
+    def test_run_metadata_does_not_break_or_pass_the_summary(self):
+        # A metadata entry in the results crashed the summary after every chain passed.
+        from memory_v1.harness import overall_status
+        chains = {"A": {"status": "pass"}, "B": {"status": "pass"}, "C": {"status": "pass"}}
+        self.assertTrue(overall_status({**chains, "evidence_version": 2}))
+        self.assertFalse(overall_status({**chains, "C": {"status": "fail"}}))
+        self.assertFalse(overall_status({"evidence_version": 2}))
