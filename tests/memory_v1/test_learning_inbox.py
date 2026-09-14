@@ -168,6 +168,14 @@ class LearningInboxTests(unittest.TestCase):
         self.assertIn("**eski_kural:** Bundan sonra testleri unittest framework'ü ile yaz.", content)
         self.assertIn("**kaynak:** claude-b", content)
 
+    def test_host_label_is_chosen_once_per_host(self):
+        with mock.patch.object(li, "_default_host_label", return_value="Mac-Studio"):
+            first = li.host_label(self.mac)
+        with mock.patch.object(li, "_default_host_label", return_value="172-2-3-30.dhcp.example.net"):
+            second = li.host_label(self.mac)  # network changed; the host did not
+        self.assertEqual("Mac-Studio", first)
+        self.assertEqual(first, second)
+
     def test_journal_entries_from_the_workstation_are_appended_once(self):
         journal = self.vault / "companion" / "Journal.md"
         li.record_journal(self.mac, self.companion, title="Session End Özeti", narrative="Harness saat kanıtı düzeltildi.",

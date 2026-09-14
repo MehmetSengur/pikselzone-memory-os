@@ -38,7 +38,7 @@ class SyncHeartbeatTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def _host(self):
+    def _host(self, *_args):
         return self.current_host
 
     def _ack(self, now):

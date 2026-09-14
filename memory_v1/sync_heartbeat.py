@@ -40,9 +40,9 @@ HISTORY_KEEP = 50
 _HOST_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def _host() -> str:
+def _host(config: MemoryConfig) -> str:
     from .learning_inbox import host_label
-    return host_label()
+    return host_label(config)
 
 
 def _now(now: float | None) -> float:
@@ -102,7 +102,7 @@ def write_heartbeat(config: MemoryConfig, *, now: float | None = None) -> dict[s
     if last and moment - last < MIN_INTERVAL_SECONDS:
         return None
     seq = int(state.get("seq") or 0) + 1
-    host = _host()
+    host = _host(config)
     directory = heartbeat_dir(config)
     ensure_safe_directory(directory, create=True)
     meta = {"schema": SCHEMA, "host": host, "seq": seq, "written_at": _iso(moment)}
@@ -167,11 +167,11 @@ def acknowledge_heartbeats(config: MemoryConfig, *, now: float | None = None) ->
         ensure_safe_directory(observed_path.parent, create=True)
         atomic_json(observed_path, observed)
         ack = {
-            "schema": ACK_SCHEMA, "engine": _host(), "updated_at": _iso(moment),
+            "schema": ACK_SCHEMA, "engine": _host(config), "updated_at": _iso(moment),
             "hosts": {h: {"seq": v["seq"], "first_seen_at": _iso(v["first_seen_at_epoch"])} for h, v in observed.items()},
         }
         ensure_safe_directory(directory, create=True)
-        atomic_write(directory / f"{ACK_PREFIX}{_HOST_RE.sub('-', _host())}.md", _render(ack).encode("utf-8"), mode=0o660)
+        atomic_write(directory / f"{ACK_PREFIX}{_HOST_RE.sub('-', _host(config))}.md", _render(ack).encode("utf-8"), mode=0o660)
     return {"status": "ok", "new": changed}
 
 
@@ -197,7 +197,7 @@ def sync_roundtrip_row(config: MemoryConfig, *, now: float | None = None) -> dic
     seq = int(state.get("seq") or 0)
     if not seq:
         return {"check": "sync_roundtrip", "status": "unknown", "detail": "no-heartbeat-written-yet"}
-    acked, seen_at = _acked_seq(config, str(state.get("host") or _host()))
+    acked, seen_at = _acked_seq(config, str(state.get("host") or _host(config)))
     if acked >= seq:
         return {"check": "sync_roundtrip", "status": "pass", "detail": f"seq={seq} acknowledged by engine at {seen_at}"}
     history = state.get("history") or {}

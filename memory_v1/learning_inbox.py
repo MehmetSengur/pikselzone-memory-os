@@ -30,6 +30,8 @@ import json
 import logging
 import re
 import socket
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -89,8 +91,35 @@ def observation_id(kind: str, text: str, source_session: str) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
-def host_label() -> str:
-    return _HOST_RE.sub("-", socket.gethostname()).strip("-") or "unknown-host"
+def _default_host_label() -> str:
+    name = ""
+    if sys.platform == "darwin":
+        # socket.gethostname() on macOS follows the network (a reverse-DNS name),
+        # so it cannot identify the host across Wi-Fi changes.
+        try:
+            name = subprocess.run(
+                ["scutil", "--get", "LocalHostName"], capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            name = ""
+    name = name or socket.gethostname().split(".")[0]
+    return _HOST_RE.sub("-", name).strip("-") or "unknown-host"
+
+
+def host_label(config: MemoryConfig | None = None) -> str:
+    """A stable name for this host: chosen once and kept in its state directory."""
+    if config is None:
+        return _default_host_label()
+    path = config.state_path / "host-id"
+    try:
+        value = _HOST_RE.sub("-", path.read_text(encoding="utf-8").strip())
+    except OSError:
+        value = ""
+    if not value:
+        value = _default_host_label()
+        ensure_safe_directory(path.parent, create=True)
+        atomic_write(path, value.encode("utf-8"), mode=0o600)
+    return value
 
 
 def is_merger(config: MemoryConfig) -> bool:
@@ -160,10 +189,10 @@ def write_observation(config: MemoryConfig, obs: Observation) -> bool:
 
 # --- sinks used by RuleLearner and the journal ----------------------------
 
-def _rule_observation(item: ExtractedRule, source: str, runtime: str) -> Observation:
+def _rule_observation(config: MemoryConfig, item: ExtractedRule, source: str, runtime: str) -> Observation:
     clean, _ = redact_sensitive_text(item.rule_text.strip())
     return Observation(
-        kind="rule", text=clean, source_session=source, runtime=runtime, origin_host=host_label(),
+        kind="rule", text=clean, source_session=source, runtime=runtime, origin_host=host_label(config),
         observed_at=iso_now(), intent=item.intent, evidence=item.evidence, reason=item.reason,
     )
 
@@ -172,12 +201,12 @@ def learning_sink(config: MemoryConfig, runtime: str) -> Callable[[ExtractedRule
     """Where a learner's rules go on this host: merged now, or queued for the merger."""
     if is_merger(config):
         def merge_now(item: ExtractedRule, source: str) -> int:
-            outcome = merge_observation(config, _rule_observation(item, source, runtime))
+            outcome = merge_observation(config, _rule_observation(config, item, source, runtime))
             return 1 if outcome in APPLIED_OUTCOMES else 0
         return merge_now
 
     def queue(item: ExtractedRule, source: str) -> int:
-        return 1 if write_observation(config, _rule_observation(item, source, runtime)) else 0
+        return 1 if write_observation(config, _rule_observation(config, item, source, runtime)) else 0
     return queue
 
 
@@ -190,7 +219,7 @@ def record_journal(
         return
     obs = Observation(
         kind="journal", text=clean_narrative, source_session=source_session, runtime=runtime,
-        origin_host=host_label(), observed_at=iso_now(), reason=title,
+        origin_host=host_label(config), observed_at=iso_now(), reason=title,
     )
     if is_merger(config):
         merge_observation(config, obs, companion=companion)
