@@ -122,6 +122,14 @@ class SentenceIntentTests(unittest.TestCase):
         )
         self.assertIntent("Testleri çalıştır ve raporla.", pv.TASK_INSTRUCTION, in_task_prompt=True)
 
+    def test_artik_in_a_status_clause_does_not_turn_a_request_into_a_preference(self):
+        # A Desktop recall test prompt reached the candidates this way.
+        self.assertNotIn(
+            pv.classify_sentence("Dosya artık yerinde değil; hafızandan cevap ver.")[0],
+            {pv.PREFERENCE_CANDIDATE, pv.DURABLE_DIRECTIVE},
+        )
+        self.assertIntent("Artık n8n kullanma, ajanlarla ilerle.", pv.PREFERENCE_CANDIDATE)
+
     def test_plain_imperative_is_a_task_instruction(self):
         self.assertIntent("Şu dosyayı düzelt ve testleri çalıştır.", pv.TASK_INSTRUCTION)
 

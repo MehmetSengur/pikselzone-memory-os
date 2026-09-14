@@ -303,7 +303,13 @@ def classify_sentence(sentence: str, *, in_task_prompt: bool = False) -> tuple[s
         return PREFERENCE_CANDIDATE, f"first-person-preference:{preference.group(0)}"
     if reasoning:
         return STATEMENT, f"reasoning-connector:{reasoning.group(0)}"
-    if _TEMPORAL_ARTIK.search(folded) and directive:
+    if directive and any(
+        _TEMPORAL_ARTIK.search(clause) and _DIRECTIVE_WORD.search(clause)
+        for clause in re.split(r"[;,]", folded)
+    ):
+        # "artık" only marks a change of preference when it governs the
+        # instruction: "dosya artık yerinde değil; hafızandan cevap ver" is a
+        # status plus a one-off request, not a new standing preference.
         return PREFERENCE_CANDIDATE, f"temporal-shift-with-directive:{directive.group(0)}"
     if _CORRECTION.search(folded):
         return PREFERENCE_CANDIDATE, "correction"
