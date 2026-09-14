@@ -94,7 +94,16 @@ class TestIntegratedPipeline(unittest.TestCase):
         )
         self.assertTrue(event_path.is_file())
 
-        # 1. Rule Learner check
+        # 1. Rule Learner check. The workstation queues what it learned; the
+        #    memory-engine host is the only writer of Kurallar.md and Journal.md.
+        from memory_v1.learning_inbox import merge_learning_inbox, pending_observations
+        self.assertTrue(pending_observations(self.config))
+        engine = MemoryConfig.from_dict({
+            "role": "memory-engine", "vault_path": str(self.vault), "state_path": str(self.root / "engine-state"),
+            "runtimes": ["hermes"], "transcript_roots": {"hermes": [str(self.root)]},
+            "can_write_event_memory": True, "can_run_compiler": True, "provider": {"mode": "runtime-native"},
+        })
+        merge_learning_inbox(engine)
         rules_text = (self.vault / "companion" / "Kurallar.md").read_text(encoding="utf-8")
         self.assertIn("JSON yapısını zorunlu kıl", rules_text)
 

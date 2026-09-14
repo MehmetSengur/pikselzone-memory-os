@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from . import provenance as pv
 from .companion import CompanionManager, RuleItem, token_overlap
@@ -54,8 +54,13 @@ def calculate_overlap(text1: str, text2: str) -> float:
 class RuleLearner:
     """Evaluates user turns, identifies standing rules, deduplicates and reconciles."""
 
-    def __init__(self, companion_mgr: CompanionManager) -> None:
+    def __init__(
+        self, companion_mgr: CompanionManager, sink: Callable[["ExtractedRule", str], int] | None = None,
+    ) -> None:
         self.companion = companion_mgr
+        # Hosts that do not own companion/Kurallar.md hand each rule to a sink
+        # (memory_v1.learning_inbox) instead of rewriting the shared file.
+        self.sink = sink
         # Why each block or sentence was skipped in the most recent call.
         self.last_report: list[dict[str, Any]] = []
 
@@ -142,6 +147,12 @@ class RuleLearner:
         return [item.rule_text for item in rules if self._apply(item, source)]
 
     def _apply(self, item: ExtractedRule, source: str) -> int:
+        if self.sink is not None:
+            return self.sink(item, source)
+        return 1 if self.apply_rule(item, source) in {"added-active", "reconciled", "candidate-added", "candidate-promoted"} else 0
+
+    def apply_rule(self, item: ExtractedRule, source: str) -> str:
+        """Write one rule or candidate into Kurallar.md and say what happened."""
         existing = self.companion.read_rules()
         if item.is_explicit and any(s in item.rule_text.lower() for s in REPLACEMENT_SIGNALS):
             # "X yerine Y" shares most of its words with the rule it replaces;
@@ -152,20 +163,20 @@ class RuleLearner:
             )
             if replaced:
                 self._reconcile_and_replace_rule(replaced, item.rule_text, item.reason, source)
-                return 1
+                return "reconciled"
         if any(r.text == item.rule_text or calculate_overlap(item.rule_text, r.text) > 0.65 for r in existing):
-            return 0
+            return "duplicate-active"
         if not item.is_explicit:
             outcome = self.companion.record_rule_candidate(item.rule_text, item.reason, source)
-            return 1 if outcome in {"added", "promoted"} else 0
+            return f"candidate-{outcome}"
         conflicted = next((r for r in existing if self.check_conflict(item.rule_text, r.text)), None)
         if conflicted:
             self._reconcile_and_replace_rule(conflicted, item.rule_text, item.reason, source)
-            return 1
+            return "reconciled"
         added = self.companion.add_or_update_rule(
             rule_text=item.rule_text, reason=item.reason, source=source, is_direct_command=True,
         )
-        return 1 if added else 0
+        return "added-active" if added else "duplicate-active"
 
     def _reconcile_and_replace_rule(
         self,

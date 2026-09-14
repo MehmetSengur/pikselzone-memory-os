@@ -138,7 +138,8 @@ def publish_outbox(
                     from .skill_engine import SkillEngine, WorkflowObservation
 
                     companion_mgr = CompanionManager(config.vault_path)
-                    rule_learner = RuleLearner(companion_mgr)
+                    from .learning_inbox import learning_sink, record_journal
+                    rule_learner = RuleLearner(companion_mgr, sink=learning_sink(config, "hermes"))
                     skill_engine = SkillEngine(config.vault_path)
 
                     # 1. Learn rules from Hermes SessionDB turns or event context
@@ -200,10 +201,11 @@ def publish_outbox(
 
                     if decisions or learnings or context_items:
                         narrative = " ".join((decisions or context_items)[:2] + learnings[:2])
-                        companion_mgr.append_journal_entry(
+                        record_journal(
+                            config, companion_mgr,
                             title=f"{str(event.get('event', 'session_end')).replace('_', ' ').capitalize()} Özeti",
-                            narrative=narrative,
-                            runtime="hermes",
+                            narrative=narrative, runtime="hermes",
+                            source_session=f"hermes-{session_hash}",
                         )
 
                     # 3. The shared knowledge/ graph is intentionally NOT

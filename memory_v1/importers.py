@@ -80,7 +80,8 @@ class HistoryImportEngine:
         self.vault_path = config.vault_path
         self.state_path = config.state_path
         self.companion = CompanionManager(self.vault_path)
-        self.rules = RuleLearner(self.companion)
+        from .learning_inbox import learning_sink
+        self.rules = RuleLearner(self.companion, sink=learning_sink(config, "import"))
         self.skills = SkillEngine(self.vault_path)
 
     def import_file(

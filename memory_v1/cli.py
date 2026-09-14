@@ -193,7 +193,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "publish-outbox":
             from .publisher import publish_outbox
             results = publish_outbox(config, outbox_root=args.outbox)
-            print(json.dumps({"status": "ok", "results": results}, ensure_ascii=False))
+            from .learning_inbox import merge_learning_inbox
+            try:
+                learning = merge_learning_inbox(config)
+            except Exception as exc:  # a merge problem must not stop event publication
+                learning = {"status": "error", "error": str(exc)[:300]}
+            print(json.dumps({"status": "ok", "results": results, "learning_merge": learning}, ensure_ascii=False))
             return 0
         if args.command == "promote-knowledge":
             from .compiler import promote_knowledge_outbox

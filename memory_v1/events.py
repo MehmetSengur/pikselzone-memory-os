@@ -250,7 +250,11 @@ class EventWriter:
                 companion_mgr = CompanionManager(
                     self.config.vault_path, continuity_scope=continuity_scope
                 )
-                rule_learner = RuleLearner(companion_mgr)
+                from .learning_inbox import learning_sink, record_journal
+
+                # companion/Kurallar.md and Journal.md have one writer (the
+                # memory-engine host); here they are queued as observations.
+                rule_learner = RuleLearner(companion_mgr, sink=learning_sink(self.config, runtime))
                 skill_engine = SkillEngine(self.config.vault_path)
 
                 from .provenance import split_rendered_transcript
@@ -281,10 +285,11 @@ class EventWriter:
                     learnings = summary.get("learnings", [])
                     if decisions or learnings:
                         narrative = " ".join(decisions[:2] + learnings[:2])
-                        companion_mgr.append_journal_entry(
+                        record_journal(
+                            self.config, companion_mgr,
                             title=f"{event.replace('_', ' ').capitalize()} Özeti",
-                            narrative=narrative,
-                            runtime=runtime,
+                            narrative=narrative, runtime=runtime,
+                            source_session=f"{runtime}-{state_key}",
                         )
 
                     # Skill Engine: Observe multi-step workflows in conversations and summaries

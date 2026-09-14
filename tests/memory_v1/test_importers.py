@@ -40,6 +40,17 @@ class TestHistoryImportEngine(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def _merge_as_engine(self) -> None:
+        # The workstation queues what it learned; only the memory-engine host
+        # writes companion/Kurallar.md (memory_v1.learning_inbox).
+        from memory_v1.learning_inbox import merge_learning_inbox
+        engine = MemoryConfig.from_dict({
+            "role": "memory-engine", "vault_path": str(self.vault), "state_path": str(self.root / "engine-state"),
+            "runtimes": ["hermes"], "transcript_roots": {"hermes": [str(self.root)]},
+            "can_write_event_memory": True, "can_run_compiler": True, "provider": {"mode": "runtime-native"},
+        })
+        merge_learning_inbox(engine)
+
     # 1. ChatGPT export JSON import
     def test_import_chatgpt_json(self):
         chatgpt_data = [
@@ -81,6 +92,7 @@ class TestHistoryImportEngine(unittest.TestCase):
         self.assertTrue(len(receipt.receipt_sha256) == 64)
 
         # Verify rule was distilled to Kurallar.md
+        self._merge_as_engine()
         rules_text = (self.vault / "companion" / "Kurallar.md").read_text(encoding="utf-8")
         self.assertIn("kebab-case", rules_text)
         # Verify secret was REDACTED
@@ -118,6 +130,7 @@ class TestHistoryImportEngine(unittest.TestCase):
         self.assertEqual(receipt.sessions_imported, 1)
         self.assertTrue(receipt.rules_extracted >= 1)
 
+        self._merge_as_engine()
         rules_text = (self.vault / "companion" / "Kurallar.md").read_text(encoding="utf-8")
         self.assertIn("restart: always", rules_text)
 
@@ -139,6 +152,7 @@ class TestHistoryImportEngine(unittest.TestCase):
         self.assertEqual(receipt.sessions_imported, 1)
         self.assertTrue(receipt.rules_extracted >= 1)
 
+        self._merge_as_engine()
         rules_text = (self.vault / "companion" / "Kurallar.md").read_text(encoding="utf-8")
         self.assertIn("drop table", rules_text)
 
@@ -238,6 +252,7 @@ class TestHistoryImportEngine(unittest.TestCase):
 
         receipt = self.importer.import_file(source_file, project="demo-proje")
         self.assertEqual(receipt.project, "demo-proje")
+        self._merge_as_engine()
         rules_text = (self.vault / "companion" / "Kurallar.md").read_text(encoding="utf-8")
         self.assertIn("demo-proje", rules_text)
 
