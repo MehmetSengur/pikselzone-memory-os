@@ -1186,3 +1186,43 @@ class FlushHealthConcurrencyTests(unittest.TestCase):
         self.assertNotEqual(seen[0], seen[1], "temp paths collided across writes")
         for path in seen:
             self.assertTrue(path.endswith(".tmp"))
+
+
+class PublisherLearnsOnlyFromUserTurnsTests(unittest.TestCase):
+    """The summary is the model's account of a session, not the user's words."""
+
+    setUp = HermesPluginAndPublisherTests.setUp
+    tearDown = getattr(HermesPluginAndPublisherTests, "tearDown", unittest.TestCase.tearDown)
+    _make_config = HermesPluginAndPublisherTests._make_config
+
+    def test_summary_text_is_never_learned_as_a_user_rule(self):
+        cfg = self._make_config()
+        sess_id = "sess-summary-not-user"
+        sess_hash = hashlib.sha256(sess_id.encode("utf-8")).hexdigest()[:32]
+        event = (
+            "---\n"
+            "schema: \"pikselzone-memory-event-v1\"\nruntime: \"hermes\"\nagent_id: \"hermes-main\"\n"
+            f"session_id: \"{sess_id}\"\n"
+            "event: \"session_end\"\nevents_seen: [\"session_end\"]\n"
+            "created_at: \"2026-09-14T14:00:00+03:00\"\nsource_runtime: \"hermes\"\n"
+            "source_model: \"gpt-5.6-luna\"\nsource_provider: \"custom\"\nroot_task_id: \"unknown\"\n"
+            "kanban_ids: []\nsource_sha256: \"" + "0" * 64 + "\"\nsecret_redactions: 0\n"
+            "generated_by: \"pikselzone-memory-v1\"\nauthority: \"derived-session-memory-not-operational-truth\"\n"
+            "---\n\n"
+            "## Bağlam\n- Kullanıcı rapor biçimini konuştu.\n\n"
+            "## Önemli Konuşmalar\n- Rapor dili konuşuldu.\n\n"
+            "## Alınan Kararlar\n- Bundan sonra tüm raporları İngilizce yaz.\n\n"
+            "## Öğrenilenler\n- Özet metni.\n\n"
+            "## Açık Konular\n- Yok.\n\n"
+            "## Kanıtlar\n- Özet.\n"
+        )
+        (self.events_outbox / f"hermes-{sess_hash}.md").write_text(event, encoding="utf-8")
+        results = publish_outbox(cfg, outbox_root=self.outbox_root)
+        self.assertEqual("published", results[0]["status"])
+        rules = self.vault / "companion" / "Kurallar.md"
+        if rules.exists():
+            self.assertNotIn("İngilizce", rules.read_text(encoding="utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()

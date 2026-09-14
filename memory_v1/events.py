@@ -253,12 +253,12 @@ class EventWriter:
                 rule_learner = RuleLearner(companion_mgr)
                 skill_engine = SkillEngine(self.config.vault_path)
 
-                turn_pairs = []
-                for line in normalized.splitlines():
-                    if line.startswith("USER: "):
-                        turn_pairs.append(("user", line[6:]))
-                    elif line.startswith("ASSISTANT: "):
-                        turn_pairs.append(("assistant", line[11:]))
+                from .provenance import split_rendered_transcript
+
+                # Whole turns, continuation lines included: a pasted block has
+                # to reach the provenance check intact, not as a stray first
+                # line that reads like the user's own sentence.
+                turn_pairs = split_rendered_transcript(normalized)
                 if turn_pairs:
                     rule_learner.learn_from_transcript(turn_pairs, source_session=f"{runtime}-{state_key}")
 
@@ -293,11 +293,9 @@ class EventWriter:
                         if any(marker in item.lower() for marker in ("adımlar", "komut", "workflow", "prosedür", "deploy", "build", "test", "kontrol", "kurulum", "ayarla", "görev")):
                             workflow_candidates.append(item)
 
-                    # Also extract from user conversation turns if numbered steps exist
-                    for role, text in turn_pairs:
-                        if role == "user" and any(m in text.lower() for m in ("1.", "adım", "workflow", "prosedür", "kontrol et")):
-                            if "1." in text and ("2." in text or "sonra" in text):
-                                workflow_candidates.append(text)
+                    # Numbered steps in a user turn are not mined for skills: in
+                    # practice they were task briefs and pasted prompts, and every
+                    # skill synthesized that way was a one-off job description.
 
                     for cand in workflow_candidates:
                         w_name = cand.split(":", 1)[0].strip(" -:\n") if ":" in cand else cand[:40].strip(" -:\n")

@@ -176,10 +176,11 @@ def publish_outbox(
                     open_items = [x for x in (sections.get("open_items") or event.get("open_items", [])) if x != "unknown"]
                     evidence_items = [x for x in (sections.get("evidence") or event.get("evidence", [])) if x != "unknown"]
 
-                    turn_pairs = raw_user_turns or [
-                        ("user", cand)
-                        for cand in (context_items + conversations + decisions + learnings + evidence_items)
-                    ]
+                    # Only what the user typed can teach a rule. When SessionDB
+                    # turns are unavailable, the summary is the model's account of
+                    # the session; feeding it in as ("user", ...) is how summarizer
+                    # phrasing became "Kullanıcının açık kalıcı direktifi" entries.
+                    turn_pairs = raw_user_turns
                     if turn_pairs:
                         rule_learner.learn_from_transcript(turn_pairs, source_session=f"hermes-{session_hash}")
 

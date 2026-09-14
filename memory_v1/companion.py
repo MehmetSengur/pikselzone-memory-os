@@ -44,6 +44,79 @@ class RuleItem:
 
 
 @dataclasses.dataclass
+class RuleCandidate:
+    text: str
+    reason: str = ""
+    sources: list[str] = dataclasses.field(default_factory=list)
+
+
+ACTIVE_RULES_HEADER = "## Aktif Kurallar"
+CANDIDATE_RULES_HEADER = "## Kural Adayları (Candidate Rules)"
+ARCHIVED_RULES_HEADER = "## Arşivlenmiş / Geçersiz Kılınmış Kurallar"
+# A candidate becomes an active rule once this many separate sessions repeat it.
+CANDIDATE_PROMOTION_SESSIONS = 2
+_CANDIDATE_PREFIX = "- **aday:**"
+_OVERLAP_STOP_WORDS = {
+    "bir", "bu", "ve", "ile", "için", "olan", "olarak", "daha", "en", "çok",
+    "the", "a", "an", "and", "or", "to", "in", "on", "of", "for", "with",
+}
+
+
+def token_overlap(text1: str, text2: str) -> float:
+    """Jaccard overlap of meaningful words; the dedup/merge measure for rules."""
+    def words(text: str) -> set[str]:
+        return {
+            w for w in re.findall(r"\w+", text.lower(), re.UNICODE)
+            if len(w) > 2 and w not in _OVERLAP_STOP_WORDS
+        }
+    t1, t2 = words(text1), words(text2)
+    if not t1 or not t2:
+        return 0.0
+    return len(t1 & t2) / len(t1 | t2)
+
+
+def parse_rule_candidates(text: str) -> list[RuleCandidate]:
+    candidates: list[RuleCandidate] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(_CANDIDATE_PREFIX):
+            continue
+        parts = [p.strip() for p in stripped[len(_CANDIDATE_PREFIX):].split("|")]
+        candidate = RuleCandidate(text=parts[0])
+        for part in parts[1:]:
+            if part.startswith("**neden:**"):
+                candidate.reason = part[len("**neden:**"):].strip()
+            elif part.startswith("**kaynaklar:**"):
+                candidate.sources = [s.strip() for s in part[len("**kaynaklar:**"):].split(",") if s.strip()]
+        if candidate.text:
+            candidates.append(candidate)
+    return candidates
+
+
+def render_candidate_line(candidate: RuleCandidate) -> str:
+    return (
+        f"{_CANDIDATE_PREFIX} {candidate.text} | **neden:** {candidate.reason} | "
+        f"**kaynaklar:** {', '.join(candidate.sources)} | "
+        f"**gözlem:** {len(candidate.sources)} | **durum:** aday"
+    )
+
+
+def insert_under_header(lines: list[str], header: str, entry: str, *, before: str | None = None) -> list[str]:
+    """Insert ``entry`` right under ``header``, creating the header if needed."""
+    out = list(lines)
+    for index, line in enumerate(out):
+        if line.strip() == header:
+            out.insert(index + 1, entry)
+            return out
+    if before:
+        for index, line in enumerate(out):
+            if line.strip() == before:
+                out[index:index] = [header, entry, ""]
+                return out
+    return out + ["", header, entry]
+
+
+@dataclasses.dataclass
 class LastSessionData:
     runtime: str
     session_id: str
@@ -372,6 +445,71 @@ class CompanionManager:
 
         atomic_write(rules_path, "\n".join(new_lines) + "\n", mode=0o660)
         return True
+
+    def read_rule_candidates(self) -> list[RuleCandidate]:
+        rules_path = self.companion_dir / "Kurallar.md"
+        if not rules_path.is_file():
+            return []
+        text, _ = secure_read_text(rules_path, root=self.vault_path, max_bytes=256 * 1024)
+        return parse_rule_candidates(text)
+
+    def record_rule_candidate(self, rule_text: str, reason: str = "", source: str = "") -> str:
+        """Track a preference seen without an explicit standing marker.
+
+        It is written under "Kural Adayları", never into the active list, and
+        is promoted only when a *different* session repeats it. Returns one of
+        ``added``, ``observed``, ``promoted``, ``same-session``,
+        ``already-active`` or ``empty``.
+        """
+        rules_path = self.companion_dir / "Kurallar.md"
+        if not rules_path.is_file():
+            self.ensure_companion_files()
+        text, _ = secure_read_text(rules_path, root=self.vault_path, max_bytes=256 * 1024)
+        clean_rule, _ = redact_sensitive_text(rule_text.strip())
+        clean_reason, _ = redact_sensitive_text(reason.strip())
+        if not clean_rule:
+            return "empty"
+        for rule in self.read_rules():
+            if token_overlap(clean_rule, rule.text) > 0.65 or clean_rule.lower() in rule.text.lower():
+                return "already-active"
+
+        source = source or "oturum"
+        lines = text.splitlines()
+        match = next(
+            (c for c in parse_rule_candidates(text)
+             if c.text.lower() == clean_rule.lower() or token_overlap(clean_rule, c.text) >= 0.65),
+            None,
+        )
+        if match is None:
+            candidate = RuleCandidate(
+                text=clean_rule, reason=clean_reason or "Kullanıcı tercihi", sources=[source],
+            )
+            lines = insert_under_header(
+                lines, CANDIDATE_RULES_HEADER, render_candidate_line(candidate),
+                before=ARCHIVED_RULES_HEADER,
+            )
+            atomic_write(rules_path, "\n".join(lines) + "\n", mode=0o660)
+            return "added"
+        if source in match.sources:
+            return "same-session"
+
+        match.sources.append(source)
+        own_prefix = f"{_CANDIDATE_PREFIX} {match.text} |"
+        lines = [line for line in lines if not line.strip().startswith(own_prefix)]
+        if len(match.sources) >= CANDIDATE_PROMOTION_SESSIONS:
+            atomic_write(rules_path, "\n".join(lines) + "\n", mode=0o660)
+            self.add_or_update_rule(
+                rule_text=match.text,
+                reason=f"{match.reason} ({len(match.sources)} ayrı oturumda tekrarlandı)",
+                source=", ".join(match.sources),
+                is_direct_command=True,
+            )
+            return "promoted"
+        lines = insert_under_header(
+            lines, CANDIDATE_RULES_HEADER, render_candidate_line(match), before=ARCHIVED_RULES_HEADER,
+        )
+        atomic_write(rules_path, "\n".join(lines) + "\n", mode=0o660)
+        return "observed"
 
     # -------------------------------------------------------------------------
     # Last-Session (Operational Continuity)
