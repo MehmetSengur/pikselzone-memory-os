@@ -130,6 +130,14 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             return _clean_continue()
 
+        try:
+            # Every lifecycle event (rate-limited to one write per interval) keeps the
+            # sync roundtrip current during long sessions; never blocks the session.
+            from .sync_heartbeat import write_heartbeat
+            write_heartbeat(config)
+        except Exception:
+            pass
+
         if args.event == "UserPromptSubmit":
             from .recall import associative_recall_fast
             prompt = ""
@@ -165,13 +173,6 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 from .parity import SharedBrainParityManager
                 SharedBrainParityManager(config.vault_path).align_shared_brain()
-            except Exception:
-                pass
-            try:
-                # Lets both hosts see whether this workstation's vault changes reach
-                # the engine; rate-limited, and never blocks the session.
-                from .sync_heartbeat import write_heartbeat
-                write_heartbeat(config)
             except Exception:
                 pass
             from .recall import (

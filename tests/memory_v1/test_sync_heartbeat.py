@@ -61,7 +61,8 @@ class SyncHeartbeatTests(unittest.TestCase):
         self._ack(now=5_000_000)  # engine clock may differ wildly; only sequence matters
         row = hb.sync_roundtrip_row(self.mac, now=1200)
         self.assertEqual("pass", row["status"])
-        self.assertIn("seq=1 acknowledged", row["detail"])
+        self.assertIn("acked_seq=1", row["detail"])
+        self.assertIn("current", row["detail"])
 
     def test_old_acknowledgement_does_not_cover_newer_local_changes(self):
         hb.write_heartbeat(self.mac, now=1000)
@@ -93,6 +94,54 @@ class SyncHeartbeatTests(unittest.TestCase):
         self.assertEqual("warn", row["status"])
         self.assertIn("engine-memory-still-usable", row["detail"])
         self.assertEqual("pass", hb.sync_roundtrip_row(self.vps, now=2100)["status"])
+
+
+class SyncFreshnessTests(SyncHeartbeatTests):
+    """An acknowledgement is evidence about the heartbeat it names, not about now."""
+
+    def test_old_acknowledgement_without_newer_heartbeats_is_not_re_verified(self):
+        hb.write_heartbeat(self.mac, now=1000)
+        self._ack(now=1100)
+        row = hb.sync_roundtrip_row(self.mac, now=1000 + hb.ROUNDTRIP_FRESH_SECONDS + 60)
+        self.assertEqual("unknown", row["status"])  # neither healthy nor declared broken
+        self.assertIn("not-re-verified", row["detail"])
+
+    def test_rereading_the_same_ack_does_not_refresh_it(self):
+        hb.write_heartbeat(self.mac, now=1000)
+        self._ack(now=1100)
+        first = hb.sync_roundtrip_row(self.mac, now=1000 + 3600)
+        second = hb.sync_roundtrip_row(self.mac, now=1000 + hb.ROUNDTRIP_FRESH_SECONDS + 60)
+        self.assertIn("last_roundtrip_written=60m_ago", first["detail"])
+        self.assertEqual("unknown", second["status"])
+
+    def test_long_open_session_keeps_the_roundtrip_current_through_its_own_events(self):
+        hb.write_heartbeat(self.mac, now=1000)
+        self._ack(now=1100)
+        later = 1000 + hb.ROUNDTRIP_FRESH_SECONDS + 600
+        hb.write_heartbeat(self.mac, now=later)          # a Stop hook in the same session
+        self.assertEqual("pass", hb.sync_roundtrip_row(self.mac, now=later + 60)["status"])  # in flight
+        self._ack(now=later + 90)
+        row = hb.sync_roundtrip_row(self.mac, now=later + 120)
+        self.assertEqual("pass", row["status"])
+        self.assertIn("current", row["detail"])
+
+    def test_newer_pending_heartbeat_is_not_covered_by_the_old_ack(self):
+        hb.write_heartbeat(self.mac, now=1000)
+        self._ack(now=1100)
+        hb.write_heartbeat(self.mac, now=1000 + hb.MIN_INTERVAL_SECONDS)
+        row = hb.sync_roundtrip_row(self.mac, now=1000 + hb.MIN_INTERVAL_SECONDS + hb.UNACKED_WARN_SECONDS + 1)
+        self.assertEqual("warn", row["status"])
+        self.assertIn("pending=1_heartbeats", row["detail"])
+        self.assertIn("obsidian_app=not-running", row["detail"])
+        self.assertIn("local-changes-not-yet-on-engine", row["detail"])
+
+    def test_engine_clock_skew_does_not_change_the_workstation_result(self):
+        hb.write_heartbeat(self.mac, now=1000)
+        self._ack(now=10**9)  # engine clock far ahead
+        near = hb.sync_roundtrip_row(self.mac, now=1300)
+        self._ack(now=1)      # a repeated ack with a clock far behind changes nothing
+        self.assertEqual(near, hb.sync_roundtrip_row(self.mac, now=1300))
+        self.assertEqual("pass", near["status"])
 
 
 if __name__ == "__main__":

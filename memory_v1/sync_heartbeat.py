@@ -12,8 +12,12 @@ on its own clock, when it first saw each new sequence and writes an
 acknowledgement file only when something new arrived. Each side then judges
 freshness on its own clock:
 
-- the workstation compares its latest sequence with the acknowledged one; an
-  old acknowledgement never stands in for the current state;
+- the workstation compares its latest sequence with the acknowledged one. The
+  age of the last verified roundtrip is the age of the acknowledged heartbeat
+  as this host wrote it (its own clock), so re-reading an old acknowledgement
+  never makes it look fresh, and an old acknowledgement never covers newer
+  heartbeats. With no newer heartbeat the state is "not re-verified", not
+  "broken";
 - the engine reports how long ago it last saw a new heartbeat from each
   workstation, as a warning only: its own memory stays usable.
 """
@@ -35,6 +39,8 @@ HEARTBEAT_REL = Path("companion") / "sync-heartbeat"
 ACK_PREFIX = "_ack-"
 MIN_INTERVAL_SECONDS = 600
 UNACKED_WARN_SECONDS = 15 * 60
+# A roundtrip older than this no longer describes the current sync state.
+ROUNDTRIP_FRESH_SECONDS = 2 * 3600
 FOREIGN_QUIET_WARN_SECONDS = 24 * 3600
 HISTORY_KEEP = 50
 _HOST_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -197,18 +203,34 @@ def sync_roundtrip_row(config: MemoryConfig, *, now: float | None = None) -> dic
     seq = int(state.get("seq") or 0)
     if not seq:
         return {"check": "sync_roundtrip", "status": "unknown", "detail": "no-heartbeat-written-yet"}
-    acked, seen_at = _acked_seq(config, str(state.get("host") or _host(config)))
-    if acked >= seq:
-        return {"check": "sync_roundtrip", "status": "pass", "detail": f"seq={seq} acknowledged by engine at {seen_at}"}
-    history = state.get("history") or {}
-    first_unacked = float(history.get(str(acked + 1)) or state.get("written_at_epoch") or moment)
-    age = int(moment - first_unacked)
+    history = {str(k): float(v) for k, v in (state.get("history") or {}).items()}
+    acked, _engine_seen_at = _acked_seq(config, str(state.get("host") or _host(config)))
     app = obsidian_app_running()
     app_text = "unknown" if app is None else ("running" if app else "not-running")
-    detail = f"local_seq={seq};acked_seq={acked};unacknowledged_for={age // 60}m;obsidian_app={app_text}"
-    if age <= UNACKED_WARN_SECONDS:
-        return {"check": "sync_roundtrip", "status": "pass", "detail": detail + ";in-flight"}
-    return {"check": "sync_roundtrip", "status": "warn", "detail": detail + ";local-changes-not-yet-on-engine"}
+    parts = [f"local_seq={seq}", f"acked_seq={acked}"]
+    verified_age = None
+    if acked and str(acked) in history:
+        # When THIS host wrote the heartbeat the engine acknowledged (local clock).
+        verified_age = int(moment - history[str(acked)])
+        parts.append(f"last_roundtrip_written={verified_age // 60}m_ago")
+    elif acked:
+        parts.append("last_roundtrip_written=unknown(history-trimmed)")
+    else:
+        parts.append("no-roundtrip-yet")
+    parts.append(f"obsidian_app={app_text}")
+
+    if seq > acked:
+        first_unacked = history.get(str(acked + 1), float(state.get("written_at_epoch") or moment))
+        pending_age = int(moment - first_unacked)
+        parts.append(f"pending={seq - acked}_heartbeats_for={pending_age // 60}m")
+        if pending_age > UNACKED_WARN_SECONDS:
+            return {"check": "sync_roundtrip", "status": "warn",
+                    "detail": ";".join(parts + ["local-changes-not-yet-on-engine"])}
+        return {"check": "sync_roundtrip", "status": "pass", "detail": ";".join(parts + ["in-flight"])}
+    if verified_age is not None and verified_age <= ROUNDTRIP_FRESH_SECONDS:
+        return {"check": "sync_roundtrip", "status": "pass", "detail": ";".join(parts + ["current"])}
+    return {"check": "sync_roundtrip", "status": "unknown",
+            "detail": ";".join(parts + ["not-re-verified:no-newer-heartbeat-to-confirm-current-sync"])}
 
 
 def learning_inbox_row(config: MemoryConfig, *, now: float | None = None) -> dict[str, str]:
