@@ -962,6 +962,7 @@ def _render_and_stage_event(
     redactions: int,
     hook_event: str,
     receipt: Optional[dict[str, Any]] = None,
+    session_model: Optional[str] = None,
 ) -> Optional[str]:
     """Render canonical markdown event and atomically stage into outbox."""
     now = dt.datetime.now().astimezone()
@@ -990,6 +991,8 @@ def _render_and_stage_event(
         f'source_runtime: "hermes"',
         f'source_model: {json.dumps(source_model)}',
         f'source_provider: {json.dumps(source_provider)}',
+        f'session_model: {json.dumps(session_model or "unknown")}',
+        f'summarizer_model: {json.dumps(source_model)}',
         f'root_task_id: {json.dumps(root_task_id or "unknown")}',
         'kanban_ids: []',
         f'source_sha256: {json.dumps(source_sha)}',
@@ -1182,7 +1185,8 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
         logger.debug("pz-memory-v1: session %s already executing in another task/thread", session_id)
         return
     try:
-        summary, provider, model = _summarize_in_session_profile(session_id, transcript)
+        # ``model`` is the model the session ran on; the summarizer reports its own.
+        summary, provider, summarizer_model = _summarize_in_session_profile(session_id, transcript)
         if summary is None:
             logger.warning("pz-memory-v1: summarizer failed for session %s; source remains retryable", session_id)
             _record_flush_health("blocked", "summarizer-failed")
@@ -1194,12 +1198,13 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
         staged_path = _render_and_stage_event(
             session_id=session_id,
             summary=summary,
-            source_model=model or "gpt-5.4-mini-2026-03-17",
+            source_model=summarizer_model or "gpt-5.4-mini-2026-03-17",
             source_provider=provider or "custom",
             root_task_id=task_id,
             source_sha=source_sha,
             redactions=redactions,
             hook_event="session_finalize",
+            session_model=model,
             receipt=receipt,
         )
         if staged_path and _mark_durable_settlement(

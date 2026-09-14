@@ -34,7 +34,9 @@ FRONTMATTER_FIELDS = {
     "source_sha256", "secret_redactions", "generated_by", "authority",
 }
 # Optional frontmatter keys tolerated by parse_event_artifact / _validate_event_object.
-OPTIONAL_FRONTMATTER_FIELDS = {"source_provider", "project"}
+# session_model: the model the session ran on; summarizer_model: the model
+# that wrote this summary. source_model keeps its historical meaning per path.
+OPTIONAL_FRONTMATTER_FIELDS = {"source_provider", "project", "session_model", "summarizer_model"}
 _PROJECT_RE = re.compile(r"unscoped|[a-z0-9][a-z0-9-]{0,63}")
 
 
@@ -141,6 +143,8 @@ class EventWriter:
                     source_digest=source_digest, summary=summary,
                     redaction_count=existing["secret_redactions"],
                     project=existing.get("project") or project,
+                    session_model=existing.get("session_model"),
+                    summarizer_model=existing.get("summarizer_model"),
                 )
                 atomic_write(event_path, rendered.encode("utf-8"), mode=0o640)
                 atomic_json(state_path, {
@@ -213,6 +217,8 @@ class EventWriter:
                 runtime=runtime, agent_id=agent_id, session_id=session_id,
                 event=event, events_seen=events_seen, created_at=timestamp,
                 source_model=actual_source_model, source_provider=source_provider,
+                session_model=(source_model if source_model and source_model != "unknown" else None),
+                summarizer_model=getattr(self.provider, "last_source_model", None),
                 root_task_id=root_task_id, project=project,
                 kanban_ids=kanban_ids or [], source_digest=source_digest,
                 summary=summary, redaction_count=(
@@ -355,6 +361,7 @@ class EventWriter:
         root_task_id: str | None, kanban_ids: list[str], source_digest: str,
         summary: dict[str, Any], redaction_count: int,
         project: str | None = None,
+        session_model: str | None = None, summarizer_model: str | None = None,
     ) -> str:
         frontmatter = [
             "---",
@@ -370,6 +377,10 @@ class EventWriter:
         ]
         if source_provider:
             frontmatter.append(f"source_provider: {json.dumps(source_provider)}")
+        if session_model:
+            frontmatter.append(f"session_model: {json.dumps(session_model)}")
+        if summarizer_model:
+            frontmatter.append(f"summarizer_model: {json.dumps(summarizer_model)}")
         frontmatter.append(f"project: {json.dumps(project or 'unscoped')}")
         frontmatter.extend([
             f"root_task_id: {json.dumps(root_task_id or 'unknown')}",
