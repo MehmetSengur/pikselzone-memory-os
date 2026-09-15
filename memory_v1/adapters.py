@@ -13,7 +13,8 @@ from typing import Any
 from .core import (
     DuplicateEvent, MemoryConfig, MemoryError, NoMemory, NormalizedTranscript, PolicyError,
     SchemaError,
-    atomic_json, clamp_transcript, discover_codex_binary, ensure_safe_directory, iso_now,
+    atomic_json, clamp_transcript, discover_codex_binary, ensure_safe_directory,
+    exclusive_lock, iso_now,
     normalize_transcript,
     path_within, reject_symlink_chain, safe_unlink, session_key, sha256_file,
 )
@@ -365,6 +366,55 @@ def _hook_config_matches_current(
     return checkpoint_sha == _hook_config_sha(config, runtime)
 
 
+#: Turn settlement is scoped to each turn's source digest, not to the session:
+#: a later turn in a thread the user came back to stays eligible, while a turn
+#: a runtime re-captures after it was promoted is settled without a provider
+#: call.  The newest digests are kept, bounded.
+TURN_SETTLEMENT_SCHEMA = "pikselzone-memory-turn-settlement-v1"
+MAX_SETTLED_TURN_DIGESTS = 256
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _turn_settlement_path(config: MemoryConfig, runtime: str, state_key: str) -> Path:
+    return config.state_path / "queue" / "settled" / f"{runtime}-{state_key}.json"
+
+
+def settled_turn_digests(
+    config: MemoryConfig, *, runtime: str, state_key: str
+) -> list[str]:
+    path = _turn_settlement_path(config, runtime, state_key)
+    if not path.is_file():
+        return []
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(value, dict) or value.get("schema") != TURN_SETTLEMENT_SCHEMA:
+        return []
+    digests = value.get("turn_digests")
+    if not isinstance(digests, list):
+        return []
+    return [item for item in digests if isinstance(item, str) and _DIGEST_RE.fullmatch(item)]
+
+
+def _record_settled_turn_digests(
+    config: MemoryConfig, *, runtime: str, state_key: str, digests: list[str]
+) -> None:
+    if not digests:
+        return
+    recorded = settled_turn_digests(config, runtime=runtime, state_key=state_key)
+    recorded.extend(item for item in digests if item not in recorded)
+    path = _turn_settlement_path(config, runtime, state_key)
+    ensure_safe_directory(path.parent, create=True)
+    atomic_json(path, {
+        "schema": TURN_SETTLEMENT_SCHEMA,
+        "runtime": runtime,
+        "session_key": state_key,
+        "turn_digests": recorded[-MAX_SETTLED_TURN_DIGESTS:],
+        "updated_at": iso_now(),
+    })
+
+
 def drain_checkpoint(
     config: MemoryConfig, queue_path: Path, *,
     provider: StructuredResponsesProvider | None = None,
@@ -400,6 +450,30 @@ def drain_checkpoint(
 
 
 def _drain_validated_checkpoint(
+    config: MemoryConfig, queue_path: Path, *,
+    provider: StructuredResponsesProvider | None = None,
+) -> Path:
+    """Serialize every drain of one session from selection to settlement.
+
+    An idle batch, a threshold batch and a terminal boundary of the same
+    session can be spawned close together.  Without this lock two workers
+    could select the same raw turns, and the second would merge turns the
+    first had already promoted before failing to settle them.
+    """
+    from .retry import CHECKPOINT_NAME_RE
+
+    match = CHECKPOINT_NAME_RE.match(queue_path.name)
+    identity = (
+        f"{match.group('runtime')}-{match.group('session_key')}" if match
+        else hashlib.sha256(queue_path.name.encode("utf-8")).hexdigest()[:32]
+    )
+    with exclusive_lock(config.state_path / "locks" / f"drain-{identity}.lock"):
+        if not queue_path.exists() and not queue_path.is_symlink():
+            raise NoMemory("checkpoint-already-settled")
+        return _drain_locked_checkpoint(config, queue_path, provider=provider)
+
+
+def _drain_locked_checkpoint(
     config: MemoryConfig, queue_path: Path, *,
     provider: StructuredResponsesProvider | None = None,
 ) -> Path:
@@ -453,15 +527,22 @@ def _drain_validated_checkpoint(
     if not selected:
         raise SchemaError("checkpoint-session-empty")
 
+    selected_turn_digests: list[str] = []
+
     def settle_selected() -> None:
         if sha256_file(queue_path) != checkpoint_digest:
             raise PolicyError("checkpoint-changed-during-drain")
+        # Ledger first: a crash before the unlinks leaves raw turns the next
+        # drain settles without a provider call, never a second promotion.
+        _record_settled_turn_digests(
+            config, runtime=runtime, state_key=s_key, digests=selected_turn_digests
+        )
         for path in selected:
             safe_unlink(path, root=pending)
 
     if event == TURN_CHECKPOINT_EVENT:
+        already_settled = set(settled_turn_digests(config, runtime=runtime, state_key=s_key))
         checkpoint_values: list[dict[str, Any]] = []
-        seen_digests: set[str] = set()
         for path in selected:
             try:
                 item = json.loads(path.read_text(encoding="utf-8"))
@@ -469,13 +550,35 @@ def _drain_validated_checkpoint(
                 raise SchemaError("checkpoint-corrupt") from exc
             digest = item.get("source_digest")
             text = item.get("normalized_transcript")
-            if not isinstance(digest, str) or not isinstance(text, str) or digest in seen_digests:
+            if (
+                not isinstance(digest, str) or not isinstance(text, str)
+                or digest in selected_turn_digests
+            ):
                 continue
             NormalizedTranscript.from_checkpoint(text, digest)
-            seen_digests.add(digest)
-            checkpoint_values.append(item)
+            selected_turn_digests.append(digest)
+            if digest not in already_settled:
+                checkpoint_values.append(item)
         if not checkpoint_values:
-            raise SchemaError("checkpoint-recovery-empty")
+            if not selected_turn_digests:
+                raise SchemaError("checkpoint-recovery-empty")
+            # Every selected turn was already promoted: settle without a
+            # provider call and answer like a duplicate boundary does.
+            settle_selected()
+            state_file = config.state_path / "sessions" / runtime / f"{s_key}.json"
+            try:
+                existing = json.loads(state_file.read_text(encoding="utf-8")).get("event_path")
+            except (OSError, json.JSONDecodeError, AttributeError):
+                existing = None
+            if isinstance(existing, str):
+                existing_path = Path(existing)
+                if (
+                    existing_path.is_absolute()
+                    and path_within(existing_path, config.vault_path / "daily")
+                    and existing_path.is_file()
+                ):
+                    return existing_path
+            raise NoMemory("turn-batch-already-settled")
         combined = clamp_transcript(
             "\n".join(item["normalized_transcript"] for item in checkpoint_values)
         )
@@ -487,6 +590,17 @@ def _drain_validated_checkpoint(
             value["normalized_transcript"], value["source_digest"]
         )
         flush_value = value
+        # The terminal transcript covers the pending turns it absorbs, so
+        # they are settled by digest as well.
+        for path in selected:
+            if path == queue_path:
+                continue
+            try:
+                digest = json.loads(path.read_text(encoding="utf-8")).get("source_digest")
+            except (OSError, json.JSONDecodeError, AttributeError):
+                continue
+            if isinstance(digest, str) and digest not in selected_turn_digests:
+                selected_turn_digests.append(digest)
     active_provider = provider or create_provider(config)
     try:
         event_path = EventWriter(config, active_provider).flush(
@@ -497,6 +611,7 @@ def _drain_validated_checkpoint(
             kanban_ids=flush_value["kanban_ids"],
             project=flush_value.get("project"),
             continuity_scope=flush_value.get("continuity_scope"),
+            merge_sections=(event == TURN_CHECKPOINT_EVENT),
         )
     except DuplicateEvent as exc:
         event_path = Path(str(exc))

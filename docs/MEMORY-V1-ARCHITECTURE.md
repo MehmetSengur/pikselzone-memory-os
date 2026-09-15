@@ -72,6 +72,7 @@ completed assistant turn (Codex/Claude Stop; Hermes next pre_llm_call)
   -> short redacted local checkpoint, 0600/0660, session-key scoped
   -> no provider call on the normal path
   -> PreCompact or SessionEnd consumes pending material and promotes once
+  -> a thread with no SessionEnd promotes its pending turns by idle finalize
   -> same-session identical source adds events_seen without another pipeline pass
   -> native terminal boundary can promote pending raw state
   -> native plugin startup can only raw-stage a tracked crashed turn
@@ -134,7 +135,85 @@ Runtime semantics are deliberately not unified:
 | Codex CLI | `Stop` (completed assistant turn) | source/test covered; native lifecycle canary still required after hook installation |
 | Claude Code | `Stop` operator candidate | source/test covered; native runtime proof remains unverified |
 | Hermes | `pre_llm_call` snapshots the previous completed SessionDB turn | terminal callbacks use PluginLlm; plugin startup is raw-only; VPS deployment evidence remains required |
-| Codex Desktop/App | unknown | no CLI behavior is inferred |
+| Codex Desktop/App | `Stop`, only where the project's Stop hook is trusted | no `SessionEnd` for user threads (measured 2026-09-15); promotion is idle finalize |
+
+### Codex Desktop/App lifecycle (measured 2026-09-15)
+
+Measured on the workstation against ChatGPT.app's bundled codex 0.153.4
+(originator `Codex Desktop`, thread `source=vscode`):
+
+- In ten days, 43 Desktop user threads produced 0 `session_end` states.  In the
+  same window the interactive CLI (`codex-tui`, `/exit`) delivered SessionEnd
+  5/5 and `codex exec` 6/6.
+- The App does send `SessionEnd`, but only for its internal subagent threads
+  (guardian review, `reason: other`, cwd `~/.codex/memories`,
+  `transcript_path: null`).  Those are already capture-off
+  (`cwd-outside-root`).
+- `Stop` from the App reached the hook runner for the first time on
+  2026-09-15, from the Orchestrator root.
+- Codex runs a project hook only when its entry is trusted in
+  `~/.codex/config.toml` `[hooks.state]`
+  (`<root>/.codex/hooks.json:<event>:…` → `trusted_hash`).  On 2026-09-15 a
+  trusted `stop` entry existed only for Orchestrator and operations-repo.
+  pikselzone-memory-os, with 18 Desktop threads in the window, had trusted
+  `session_start`/`session_end`/`pre_compact`/`pre_tool_use` but no `stop` or
+  `user_prompt_submit`.  This is the most likely reason the 33 older Desktop
+  threads under registered roots left neither a checkpoint nor a state: their
+  Stop hook never ran.  Whether the App silently skips untrusted hooks, or
+  whether an App update changed trust, was not proven.
+
+### Idle finalize (workstation)
+
+A thread whose runtime never sends SessionEnd would otherwise keep its raw
+turns pending forever: `Stop` only stages them, and stale recovery looks only
+at terminal checkpoints.  Idle finalize closes that gap without a new
+boundary type:
+
+```text
+any Codex/Claude SessionStart (after stale terminal recovery)
+  -> find_idle_turn_batches: per session, only raw turn_complete pending,
+     newest one older than idle_finalize_minutes (default 45, 0 disables),
+     oldest one past its retry backoff; Hermes never included
+  -> at most 2 detached drains; the starting thread is excluded (its own
+     resume path already owns it)
+  -> drain: all pending turns of that session -> one provider call
+     -> checkpoint_recovery merged into the session's single daily artifact
+```
+
+- **Trigger.** Idle finalize rides on SessionStart; a launchd sweeper was
+  rejected.  It adds no daemon, LaunchAgent or hook-config change.  It reuses
+  the bounded detached spawn the stale recovery already uses, and it runs
+  exactly when recall is about to need the result.  If no runtime starts, raw
+  turns stay durable and nothing is lost.  Selection reads only filenames and
+  mtimes, so the 5-second startup budget is unaffected.  Any workstation
+  runtime's start sweeps both Codex and Claude, so a Desktop-only thread is
+  finalized by the next Claude session too.
+- **Settlement is per turn digest.**  Every turn a drain settles (batch or
+  terminal) is recorded in `queue/settled/<runtime>-<session_key>.json`, keeping
+  the newest 256 digests.  A thread the user returns to produces new digests
+  that remain eligible.  A turn re-captured after settlement is removed
+  without a provider call, and the drain answers with the session's existing
+  artifact.  The session-level `source_digest` plus `status=empty` tombstone
+  still makes an identical batch idempotent.
+- **One artifact per session.**  A turn batch covers only the turns since the
+  previous promotion.  Its sections are therefore merged (existing items
+  first, exact duplicates dropped, `created_at` kept) instead of replacing the
+  artifact.  A later real PreCompact/SessionEnd carries the whole transcript
+  and keeps replacing it, adding its name to `events_seen`.  An empty batch
+  keeps the session's `event_path`, so the next memory batch cannot start a
+  second daily file.  An existing artifact that cannot be parsed fails the
+  drain before the provider is called.  Batches reuse the existing
+  `checkpoint_recovery` event name, so older engine code that validates
+  `events_seen` accepts them unchanged.
+- **Failure.**  A provider failure settles nothing.  The retry state is
+  recorded on the oldest pending turn, the representative checkpoint, and the
+  session is not selected again until that backoff has elapsed
+  (`retry.py` limits apply unchanged).  Schema and policy failures are
+  permanent and stay visible in `queue/retry`.
+- **Concurrency.**  Every drain holds `locks/drain-<runtime>-<session_key>.lock`
+  from selection through settlement.  An idle batch, the 32-turn batch and a
+  terminal boundary of the same session therefore never select the same raw
+  turns twice.
 
 ### Shared-memory terminology and native-memory boundary
 

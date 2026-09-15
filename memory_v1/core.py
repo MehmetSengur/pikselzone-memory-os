@@ -27,6 +27,9 @@ EVENTS = {
     # bounded recovery drain has to promote it after a crash.
     "turn_complete", "checkpoint_recovery",
 }
+#: A workstation thread with no new turn for this long is treated as finished
+#: when its runtime never emits SessionEnd (Codex Desktop/App).
+DEFAULT_IDLE_FINALIZE_MINUTES = 45
 SUMMARY_FIELDS = (
     "context", "important_conversations", "decisions", "learnings",
     "open_items", "evidence",
@@ -351,6 +354,7 @@ class MemoryConfig:
     provider_keychain_service: str | None = None
     provider_keychain_account: str | None = None
     context_budget_chars: int = 16000
+    idle_finalize_seconds: int = 45 * 60
     backup_evidence_path: Path | None = None
     sync_evidence_path: Path | None = None
     codex_hooks_path: Path | None = None
@@ -369,7 +373,7 @@ class MemoryConfig:
             "role", "vault_path", "state_path", "runtimes", "transcript_roots",
             "can_write_event_memory", "can_run_compiler", "models", "provider",
             "context_budget_chars", "backup_evidence_path", "sync_evidence_path",
-            "activation",
+            "activation", "idle_finalize_minutes",
         }
         if not set(raw).issubset(allowed_top_level):
             raise ConfigError("config-fields-invalid")
@@ -428,6 +432,13 @@ class MemoryConfig:
         budget = int(raw.get("context_budget_chars", 16000))
         if budget < 1000 or budget > 100000:
             raise ConfigError("context-budget-invalid")
+        # 0 disables idle finalize; otherwise a thread must be quiet at least
+        # this long before its pending turns are promoted as one batch.
+        idle_raw = raw.get("idle_finalize_minutes", DEFAULT_IDLE_FINALIZE_MINUTES)
+        if isinstance(idle_raw, bool) or not isinstance(idle_raw, int):
+            raise ConfigError("idle-finalize-minutes-invalid")
+        if idle_raw != 0 and not 10 <= idle_raw <= 1440:
+            raise ConfigError("idle-finalize-minutes-invalid")
         backup = raw.get("backup_evidence_path")
         sync = raw.get("sync_evidence_path")
         activation = raw.get("activation") or {}
@@ -496,6 +507,7 @@ class MemoryConfig:
             provider_keychain_service=keychain_service,
             provider_keychain_account=keychain_account,
             context_budget_chars=budget,
+            idle_finalize_seconds=idle_raw * 60,
             backup_evidence_path=Path(backup) if backup else None,
             sync_evidence_path=Path(sync) if sync else None,
             codex_hooks_path=(

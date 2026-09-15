@@ -68,7 +68,15 @@ class EventWriter:
         root_task_id: str | None = None, kanban_ids: list[str] | None = None,
         created_at: str | None = None,
         project: str | None = None, continuity_scope: str | None = None,
+        merge_sections: bool = False,
     ) -> Path:
+        """Write or update the single daily artifact of one session.
+
+        ``merge_sections`` is for a batch of raw turns: its transcript covers
+        only the turns since the previous promotion, so its summary is added to
+        the existing artifact instead of replacing it.  A terminal boundary
+        carries the whole transcript and keeps replacing.
+        """
         if runtime not in RUNTIMES or runtime not in self.config.runtimes:
             raise PolicyError("runtime-not-enabled")
         if event not in EVENTS:
@@ -153,6 +161,18 @@ class EventWriter:
                 })
                 write_health(self.config.state_path, f"flush-{runtime}", "ok", "deduplicated-boundary")
                 return event_path
+            # Parsed before the provider call: an artifact that cannot be
+            # merged must fail the drain, not be overwritten by a partial batch.
+            merge_base: dict[str, Any] | None = None
+            if merge_sections and isinstance(previous.get("event_path"), str):
+                base_path = Path(previous["event_path"])
+                if (
+                    base_path.is_absolute()
+                    and path_within(base_path, self.config.vault_path / "daily")
+                    and base_path.name == f"{runtime}-{state_key}.md"
+                    and base_path.is_file()
+                ):
+                    merge_base = parse_event_artifact(base_path.read_text(encoding="utf-8"))
             try:
                 try:
                     raw_summary = self.provider.request(
@@ -184,14 +204,20 @@ class EventWriter:
                 write_health(self.config.state_path, f"flush-{runtime}", "blocked", str(exc))
                 raise
             if summary["status"] == "empty":
-                atomic_json(state_path, {
+                empty_state = {
                     "runtime": runtime,
                     "session_key": state_key,
                     "source_digest": source_digest,
                     "events_seen": sorted(set(previous.get("events_seen", [])) | {event}),
                     "status": "empty",
                     "updated_at": iso_now(),
-                })
+                }
+                # An empty batch after a promoted one must not orphan the
+                # session's artifact: the next memory batch would otherwise
+                # start a second daily file for the same session.
+                if isinstance(previous.get("event_path"), str):
+                    empty_state["event_path"] = previous["event_path"]
+                atomic_json(state_path, empty_state)
                 write_health(self.config.state_path, f"flush-{runtime}", "ok", "no-memory")
                 raise NoMemory("model-returned-empty")
             timestamp = created_at or iso_now()
@@ -213,21 +239,31 @@ class EventWriter:
                 or ("claude-haiku-4-5" if runtime == "claude" else self.config.flush_model)
             )
             source_provider = getattr(self.provider, "last_source_provider", None)
+            redaction_count = input_redactions + sum(
+                item.count("[REDACTED_SECRET]")
+                for field in SUMMARY_FIELDS for item in summary[field]
+            )
+            artifact_summary = summary
+            artifact_created_at = timestamp
+            if merge_base is not None:
+                artifact_summary = {"status": summary["status"]}
+                for field in SUMMARY_FIELDS:
+                    merged = [
+                        item for item in merge_base["sections"][field] if item != "unknown"
+                    ]
+                    merged.extend(item for item in summary[field] if item not in merged)
+                    artifact_summary[field] = merged
+                artifact_created_at = merge_base["created_at"]
+                redaction_count += merge_base["secret_redactions"]
             rendered = self._render(
                 runtime=runtime, agent_id=agent_id, session_id=session_id,
-                event=event, events_seen=events_seen, created_at=timestamp,
+                event=event, events_seen=events_seen, created_at=artifact_created_at,
                 source_model=actual_source_model, source_provider=source_provider,
                 session_model=(source_model if source_model and source_model != "unknown" else None),
                 summarizer_model=getattr(self.provider, "last_source_model", None),
                 root_task_id=root_task_id, project=project,
                 kanban_ids=kanban_ids or [], source_digest=source_digest,
-                summary=summary, redaction_count=(
-                    input_redactions
-                    + sum(
-                        item.count("[REDACTED_SECRET]")
-                        for field in SUMMARY_FIELDS for item in summary[field]
-                    )
-                ),
+                summary=artifact_summary, redaction_count=redaction_count,
             )
             parse_event_artifact(rendered)
             atomic_write(event_path, rendered.encode("utf-8"), mode=0o640)

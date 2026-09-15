@@ -39,7 +39,11 @@ Obsidian vault; durable promotion remains boundary-driven and idempotent.
 “Ortak hafıza” means the Pikselzone Memory OS shared brain when handled by
 Memory OS-aware instructions.  Codex native memory is a separate store and is
 not read, imported, or silently synchronized.  Codex Desktop/App lifecycle
-support remains `UNKNOWN` until independently observed.
+was measured on 2026-09-15 (codex 0.153.4).  User threads send `Stop` where
+the project's Stop hook is trusted, but never `SessionEnd`; the App sends
+SessionEnd only for internal subagent threads.  Their pending turns are
+promoted by idle finalize (see `docs/MEMORY-V1-ARCHITECTURE.md`, "Idle
+finalize").
 
 A successful `NoMemory` classification is semantic settlement: the exact
 boundary snapshot is consumed without a daily artifact or Second Brain

@@ -57,9 +57,15 @@ MAX_STALE_RECOVERY_SPAWNS = 2
 
 #: Terminal boundaries are the only ones stale recovery promotes.  A pending
 #: ``turn_complete`` checkpoint is deliberately not a promotion boundary (see
-#: ``drain_checkpoint``); it is recovered by the existing current-session path
-#: or absorbed by the next terminal flush.
+#: ``drain_checkpoint``); it is recovered by the existing current-session path,
+#: absorbed by the next terminal flush, or promoted by idle finalize below.
 STALE_RECOVERABLE_EVENTS = ("session_end", "pre_compact", "session_finalize", "session_reset")
+
+#: Idle finalize is a workstation concern: Codex Desktop/App never sends
+#: SessionEnd for a user thread, so its turns would otherwise stay pending
+#: forever.  Hermes owns its own native lifecycle and is never swept here.
+IDLE_FINALIZE_RUNTIMES = ("codex", "claude")
+MAX_IDLE_FINALIZE_SPAWNS = 2
 
 CHECKPOINT_NAME_RE = re.compile(
     r"^(?P<runtime>codex|claude|hermes)-(?P<session_key>[0-9a-f]{32})"
@@ -326,6 +332,61 @@ def find_stale_recoverable_checkpoints(
     return [path for _, path in candidates[:max(0, limit)]]
 
 
+def find_idle_turn_batches(
+    config: MemoryConfig, *, now: dt.datetime | None = None,
+    limit: int = MAX_IDLE_FINALIZE_SPAWNS,
+    idle_seconds: int | None = None,
+    exclude: frozenset[tuple[str, str]] = frozenset(),
+) -> list[Path]:
+    """One representative turn checkpoint per workstation session gone idle.
+
+    A session qualifies only when every pending checkpoint it has is a raw
+    ``turn_complete`` (a pending terminal one belongs to stale recovery and
+    already absorbs the turns), its newest checkpoint is older than the idle
+    window, and its oldest checkpoint -- the one a batch drain records retry
+    state on -- is past its backoff.  Draining the representative promotes all
+    of that session's pending turns as one batch.  Only filenames and mtimes
+    are read, so this stays inside the startup hook budget.
+    """
+    window = config.idle_finalize_seconds if idle_seconds is None else idle_seconds
+    pending = config.state_path / "queue" / "pending"
+    if window <= 0 or limit <= 0 or not pending.is_dir():
+        return []
+    moment = now or dt.datetime.now().astimezone()
+    cutoff = moment.timestamp() - window
+    sessions: dict[tuple[str, str], list[tuple[float, str, Path]]] = {}
+    blocked: set[tuple[str, str]] = set()
+    for path in pending.glob("*.json"):
+        match = CHECKPOINT_NAME_RE.match(path.name)
+        if match is None or match.group("runtime") not in IDLE_FINALIZE_RUNTIMES:
+            continue
+        identity = (match.group("runtime"), match.group("session_key"))
+        if match.group("event") != "turn_complete":
+            blocked.add(identity)
+            continue
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if not path.is_file():
+            continue
+        sessions.setdefault(identity, []).append((info.st_mtime, path.name, path))
+    candidates: list[tuple[float, Path]] = []
+    for identity, entries in sessions.items():
+        if identity in blocked or identity in exclude:
+            continue
+        entries.sort()
+        newest = entries[-1][0]
+        if newest > cutoff:
+            continue
+        representative = entries[0][2]
+        if not retry_due(load_retry_state(config, representative), now=moment):
+            continue
+        candidates.append((newest, representative))
+    candidates.sort()
+    return [path for _, path in candidates[:limit]]
+
+
 def prune_orphan_retry_states(config: MemoryConfig) -> int:
     """Drop sidecars whose checkpoint is gone.  Keeps the observable state
     honest without ever touching a raw checkpoint."""
@@ -364,5 +425,8 @@ __all__ = [
     "retry_summary",
     "retry_due",
     "find_stale_recoverable_checkpoints",
+    "IDLE_FINALIZE_RUNTIMES",
+    "MAX_IDLE_FINALIZE_SPAWNS",
+    "find_idle_turn_batches",
     "prune_orphan_retry_states",
 ]

@@ -17,9 +17,11 @@ from .adapters import (
     load_hook_input,
     pending_turn_checkpoint_count,
 )
-from .core import MemoryConfig, MemoryError, ensure_safe_directory, write_health
+from .core import MemoryConfig, MemoryError, ensure_safe_directory, session_key, write_health
 from .provider import scrubbed_subprocess_env
-from .retry import find_stale_recoverable_checkpoints, prune_orphan_retry_states
+from .retry import (
+    find_idle_turn_batches, find_stale_recoverable_checkpoints, prune_orphan_retry_states,
+)
 
 
 def build_drain_command(
@@ -250,6 +252,27 @@ def main(argv: list[str] | None = None) -> int:
                         )
             except Exception:
                 pass
+            # Codex Desktop/App never sends SessionEnd for a user thread, so a
+            # thread the user simply closed would keep its raw turns pending
+            # forever.  Any workstation SessionStart promotes the turns of
+            # threads that have gone quiet, as one batch per thread.  The
+            # starting thread is excluded: its own resume path above owns it.
+            if args.runtime != "hermes":
+                try:
+                    exclude: frozenset[tuple[str, str]] = frozenset()
+                    if isinstance(startup_session_id, str) and startup_session_id != "startup":
+                        exclude = frozenset({(args.runtime, session_key(startup_session_id))})
+                    idle = find_idle_turn_batches(config, exclude=exclude)
+                    if idle:
+                        log_dir = config.state_path / "logs"
+                        ensure_safe_directory(log_dir, create=True)
+                        for idle_path in idle:
+                            idle_runtime = idle_path.name.split("-", 1)[0]
+                            _spawn_drain(
+                                args.config, idle_path, log_dir / f"drain-{idle_runtime}.log"
+                            )
+                except Exception:
+                    pass
             wire = {
                 "continue": True,
                 "hookSpecificOutput": {
