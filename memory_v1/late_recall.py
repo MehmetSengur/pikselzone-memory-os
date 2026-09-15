@@ -7,9 +7,14 @@ without that thread's newest memory, and waiting for it would stall startup.
 
 This module closes the gap without waiting.  SessionStart records which
 same-project threads it is finalizing.  Each later UserPromptSubmit of that
-session checks them once: a thread promoted since the session started is
-delivered as a condensed, sanitized summary; one still being processed or
-failed is announced once so the agent knows its startup memory is incomplete.
+session checks them:
+
+* a thread promoted since the session started is delivered as one condensed,
+  sanitized block -- whole or not at all, never cut at the character budget;
+  a block that does not fit waits for the next prompt;
+* a thread still in flight, or waiting on a scheduled retry, stays tracked and
+  is announced once;
+* only a permanent or exhausted failure ends tracking, announced once.
 
 Bounds: two hours per session, a fixed character budget, the same project as
 the startup bundle (cross-project knowledge stays with associative recall), and
@@ -34,6 +39,18 @@ LATE_RECALL_SCHEMA = "pikselzone-memory-late-recall-v1"
 LATE_RECALL_EVIDENCE_SCHEMA = "pikselzone-memory-late-recall-evidence-v1"
 LATE_RECALL_TTL_SECONDS = 2 * 3600
 LATE_RECALL_BUDGET_CHARS = 1500
+
+LATE_RECALL_HEADER = (
+    "=== PIKSELZONE LATE RECALL (idle finalize) ===\n"
+    "[DERIVED MEMORY — verify against operational truth]"
+)
+LATE_RECALL_INTRO = "Bu oturum açıldıktan sonra hafızaya işlenen, kapanmamış thread özetleri:"
+
+#: A condensed block has at most these items, each cut to ``_ITEM_CHARS``
+#: *before* it becomes a block, so one block plus the header and intro always
+#: fits the budget (pinned by a test).  The block itself is never cut.
+_BLOCK_PICKS = (("Bağlam", "context", 1), ("Karar", "decisions", 2),
+                ("Açık", "open_items", 1), ("Kanıt", "evidence", 1))
 _ITEM_CHARS = 220
 _KEY_RE = re.compile(r"[0-9a-f]{32}")
 
@@ -112,26 +129,49 @@ def _remove(config: MemoryConfig, path: Path) -> None:
         pass
 
 
-def _condensed(artifact: dict[str, Any]) -> list[str]:
+def condensed_block(artifact: dict[str, Any], rel_path: str) -> str:
+    """The whole unit late recall delivers for one promoted thread."""
+    from .recall import sanitize_untrusted_memory
+
     sections = artifact["sections"]
-    picks = (
-        ("Bağlam", sections.get("context", [])[:2]),
-        ("Karar", sections.get("decisions", [])[:3]),
-        ("Açık", sections.get("open_items", [])[:2]),
-        ("Kanıt", sections.get("evidence", [])[:2]),
-    )
-    return [
-        f"- {label}: {item[:_ITEM_CHARS]}"
-        for label, items in picks for item in items if item and item != "unknown"
-    ]
+    lines = [f"### {rel_path}"]
+    for label, field, limit in _BLOCK_PICKS:
+        items = [item for item in sections.get(field, []) if item and item != "unknown"]
+        lines.extend(f"- {label}: {item[:_ITEM_CHARS]}" for item in items[:limit])
+    text, _ = sanitize_untrusted_memory("\n".join(lines))
+    return text
+
+
+def _promoted_artifact(
+    config: MemoryConfig, target: dict[str, Any], state: dict[str, Any], project: Any,
+) -> tuple[Path, dict[str, Any]] | None:
+    event_path = state.get("event_path")
+    if not isinstance(event_path, str):
+        return None
+    candidate = Path(event_path)
+    if not (
+        candidate.is_absolute() and path_within(candidate, config.vault_path / "daily")
+        and candidate.name == f"{target['runtime']}-{target['session_key']}.md"
+        and candidate.is_file()
+    ):
+        return None
+    try:
+        artifact = parse_event_artifact(candidate.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if artifact.get("project") != project:
+        return None
+    return candidate, artifact
 
 
 def deliver_late_recall(
     config: MemoryConfig, *, runtime: str, session_id: str, now: dt.datetime | None = None,
 ) -> str:
-    """Return late-recall context for this prompt, or ``""``.  Updates the
-    marker so every thread is delivered or announced at most once."""
-    from .recall import sanitize_untrusted_memory
+    """Return late-recall context for this prompt, or ``""``.
+
+    A target is marked ``delivered`` only when its whole block is in the
+    returned text; notices are marked shown only when they are in it too.
+    """
     from .retry import load_retry_state
 
     path = _marker_path(config, runtime, session_id)
@@ -152,19 +192,17 @@ def deliver_late_recall(
         return ""
 
     pending_dir = config.state_path / "queue" / "pending"
-    daily_root = config.vault_path / "daily"
-    blocks: list[str] = []
-    delivered: list[dict[str, str]] = []
-    still_pending = 0
-    newly_failed = 0
+    ready: list[tuple[dict[str, Any], str, dict[str, str]]] = []
+    in_flight = 0
+    retrying: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
     for target in targets:
         if not isinstance(target, dict) or target.get("status") != "pending":
             continue
-        target_runtime = target.get("runtime")
         key = target.get("session_key")
         checkpoint = target.get("checkpoint")
         if (
-            target_runtime not in {"codex", "claude"} or not isinstance(key, str)
+            target.get("runtime") not in {"codex", "claude"} or not isinstance(key, str)
             or not _KEY_RE.fullmatch(key) or not isinstance(checkpoint, str)
             or "/" in checkpoint
         ):
@@ -172,83 +210,100 @@ def deliver_late_recall(
             continue
         try:
             state = json.loads(
-                (config.state_path / "sessions" / target_runtime / f"{key}.json")
+                (config.state_path / "sessions" / target["runtime"] / f"{key}.json")
                 .read_text(encoding="utf-8")
             )
         except (OSError, json.JSONDecodeError):
             state = {}
-        updated = _parse_time(state.get("updated_at")) if isinstance(state, dict) else None
+        if not isinstance(state, dict):
+            state = {}
+        updated = _parse_time(state.get("updated_at"))
         if updated is not None and updated >= started:
-            event_path = state.get("event_path")
-            if isinstance(event_path, str):
-                candidate = Path(event_path)
-                if (
-                    candidate.is_absolute() and path_within(candidate, daily_root)
-                    and candidate.name == f"{target_runtime}-{key}.md" and candidate.is_file()
-                ):
-                    try:
-                        artifact = parse_event_artifact(candidate.read_text(encoding="utf-8"))
-                    except Exception:
-                        artifact = None
-                    if artifact is not None and artifact.get("project") == marker.get("project"):
-                        lines = _condensed(artifact)
-                        if lines:
-                            rel = candidate.relative_to(config.vault_path)
-                            blocks.append(f"### {rel}\n" + "\n".join(lines))
-                        target["status"] = "delivered"
-                        delivered.append({
-                            "event_path": str(candidate),
-                            "event_sha256": sha256_file(candidate),
-                        })
-                        continue
+            promoted = _promoted_artifact(config, target, state, marker.get("project"))
+            if promoted is not None:
+                candidate, artifact = promoted
+                block = condensed_block(artifact, str(candidate.relative_to(config.vault_path)))
+                ready.append((target, block, {
+                    "event_path": str(candidate),
+                    "event_sha256": sha256_file(candidate),
+                    "state_updated_at": state.get("updated_at"),
+                }))
+                continue
             if state.get("status") == "empty":
                 target["status"] = "empty"
                 continue
         checkpoint_path = pending_dir / checkpoint
         if checkpoint_path.exists():
-            retry = load_retry_state(config, checkpoint_path)
-            if retry.get("status") in {"permanent", "retry-exhausted", "retry-scheduled"}:
+            retry_status = load_retry_state(config, checkpoint_path).get("status")
+            if retry_status in {"permanent", "retry-exhausted"}:
                 target["status"] = "failed"
-                newly_failed += 1
+                failed.append(target)
+            elif retry_status == "retry-scheduled":
+                # Still tracked: the retry runs at a later SessionStart and
+                # may promote the thread within this session's window.
+                retrying.append(target)
             else:
-                still_pending += 1
+                in_flight += 1
             continue
         # Settled without a newer promotion (already covered earlier).
         target["status"] = "settled"
 
-    parts: list[str] = []
-    if blocks:
-        parts.append(
-            "Bu oturum açıldıktan sonra hafızaya işlenen, kapanmamış thread özetleri:"
-        )
-        parts.extend(blocks)
-    if still_pending and not marker.get("notice_shown"):
-        parts.append(
-            f"Not: {still_pending} kapanmamış thread'in son turları henüz hafızaya "
-            "işleniyor; bu oturumun başlangıç hafızası onları içermiyor."
-        )
-        marker["notice_shown"] = True
-    if newly_failed:
-        parts.append(
-            f"Not: {newly_failed} kapanmamış thread hafızaya işlenemedi (retry kaydı "
-            "var); başlangıç hafızası onları içermiyor."
-        )
+    notices: list[tuple[str, Any]] = []
+    if in_flight and not marker.get("notice_shown"):
+        notices.append((
+            f"Not: {in_flight} kapanmamış thread'in son turları henüz hafızaya "
+            "işleniyor; bu oturumun başlangıç hafızası onları içermiyor.",
+            "in-flight",
+        ))
+    unannounced_retry = [t for t in retrying if not t.get("retry_notice_shown")]
+    if unannounced_retry:
+        notices.append((
+            f"Not: {len(unannounced_retry)} kapanmamış thread geçici bir hata nedeniyle "
+            "henüz hafızaya işlenemedi; bir sonraki oturum açılışında yeniden denenecek "
+            "ve bu oturum sürerken başarılı olursa buraya eklenecek.",
+            unannounced_retry,
+        ))
+    if failed:
+        notices.append((
+            f"Not: {len(failed)} kapanmamış thread hafızaya işlenemedi (kalıcı hata, "
+            "retry kaydı korunuyor); başlangıç hafızası onları içermiyor.",
+            "failed",
+        ))
 
-    if still_pending:
+    parts = [LATE_RECALL_HEADER]
+
+    def fits(extra: str) -> bool:
+        return len("\n".join(parts + [extra])) <= LATE_RECALL_BUDGET_CHARS
+
+    delivered: list[dict[str, str]] = []
+    for target, block, receipt in ready:
+        addition = block if delivered else f"{LATE_RECALL_INTRO}\n{block}"
+        if not fits(addition):
+            continue  # stays pending, whole, for the next prompt
+        parts.append(addition)
+        target["status"] = "delivered"
+        delivered.append(receipt)
+    for text, owner in notices:
+        if not fits(text):
+            continue
+        parts.append(text)
+        if owner == "in-flight":
+            marker["notice_shown"] = True
+        elif isinstance(owner, list):
+            for target in owner:
+                target["retry_notice_shown"] = True
+    # Failed targets are final whether or not their notice fit.
+
+    if any(isinstance(t, dict) and t.get("status") == "pending" for t in targets):
         try:
             atomic_json(path, marker)
         except Exception:
             pass
     else:
         _remove(config, path)
-    if not parts:
+    if len(parts) == 1:
         return ""
-
-    body, _ = sanitize_untrusted_memory("\n".join(parts))
-    text = (
-        "=== PIKSELZONE LATE RECALL (idle finalize) ===\n"
-        "[DERIVED MEMORY — verify against operational truth]\n" + body
-    )[:LATE_RECALL_BUDGET_CHARS]
+    text = "\n".join(parts)
     if delivered:
         evidence = config.state_path / "evidence" / f"late-recall-{runtime}.json"
         try:
@@ -258,6 +313,7 @@ def deliver_late_recall(
                 "runtime": runtime,
                 "session_key": session_key(session_id),
                 "project": marker.get("project"),
+                "session_started_at": marker.get("created_at"),
                 "observed_at": iso_now(),
                 "delivered": delivered,
                 "text": text,
@@ -270,6 +326,8 @@ def deliver_late_recall(
 __all__ = [
     "LATE_RECALL_SCHEMA",
     "LATE_RECALL_TTL_SECONDS",
+    "LATE_RECALL_BUDGET_CHARS",
+    "condensed_block",
     "record_pending_finalize",
     "deliver_late_recall",
 ]

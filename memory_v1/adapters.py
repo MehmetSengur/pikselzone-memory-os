@@ -161,6 +161,25 @@ def _last_completed_turn(normalized: str) -> str:
     return text
 
 
+def turn_segment_digests(normalized: str) -> list[str]:
+    """Digest of every completed USER..ASSISTANT turn inside a transcript.
+
+    Each digest is computed exactly as a Stop checkpoint computes its own
+    (``_last_completed_turn``), so a turn promoted from a raw checkpoint can be
+    recognised inside a later terminal transcript.
+    """
+    lines = normalized.splitlines()
+    starts = [index for index, line in enumerate(lines) if line.startswith("USER: ")]
+    digests: list[str] = []
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        segment = lines[start:end]
+        if any(line.startswith("ASSISTANT: ") for line in segment):
+            text = "\n".join(segment).strip()
+            digests.append(hashlib.sha256(text.encode("utf-8")).hexdigest())
+    return digests
+
+
 def _checkpoint_paths_for_session(
     config: MemoryConfig, *, runtime: str, state_key: str
 ) -> list[Path]:
@@ -568,6 +587,7 @@ def _drain_locked_checkpoint(
     # content pending; one written for a new turn was never selected.
     selected_hashes: dict[Path, str] = {}
     processed_turn_digests: list[str] = []
+    terminal_replaces = True
 
     def read_selected(path: Path) -> dict[str, Any]:
         try:
@@ -673,6 +693,16 @@ def _drain_locked_checkpoint(
             else:
                 selected_hashes.pop(path, None)
         selected = absorbed
+        # The terminal summary replaces the session artifact only when this
+        # transcript still contains every turn an earlier promotion covered.
+        # A clamped or truncated transcript is merged instead, so the summary
+        # of turns it no longer holds is not erased.
+        terminal_turns = turn_segment_digests(terminal_text)
+        already_promoted = settled_turn_digests(config, runtime=runtime, state_key=s_key)
+        terminal_replaces = set(already_promoted) <= set(terminal_turns)
+        for digest in terminal_turns:
+            if digest not in processed_turn_digests:
+                processed_turn_digests.append(digest)
     active_provider = provider or create_provider(config)
     try:
         event_path = EventWriter(config, active_provider).flush(
@@ -683,7 +713,7 @@ def _drain_locked_checkpoint(
             kanban_ids=flush_value["kanban_ids"],
             project=flush_value.get("project"),
             continuity_scope=flush_value.get("continuity_scope"),
-            merge_sections=(event == TURN_CHECKPOINT_EVENT),
+            merge_sections=(event == TURN_CHECKPOINT_EVENT or not terminal_replaces),
             settled_turn_digests=processed_turn_digests,
         )
     except DuplicateEvent as exc:

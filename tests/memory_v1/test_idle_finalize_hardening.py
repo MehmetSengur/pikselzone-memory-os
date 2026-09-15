@@ -383,7 +383,8 @@ class LateRecallTests(HardeningBase):
             drain_checkpoint(self.config, path, provider=base.FakeProvider(
                 ProviderBlocked("claude-timeout")
             ))
-        self.assertIn("hafızaya işlenemedi", self._prompt())
+        # A timeout is retryable: the thread stays tracked, announced once.
+        self.assertIn("yeniden denenecek", self._prompt())
 
 
 if __name__ == "__main__":

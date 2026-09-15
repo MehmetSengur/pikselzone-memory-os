@@ -229,12 +229,23 @@ Codex/Claude SessionStart in a registered root (after stale terminal recovery)
   the startup budget, so the session that triggers a finalize starts without
   that thread's newest memory.  *Late recall* narrows the gap:
   - SessionStart records the same-project threads it is finalizing.
-  - Each UserPromptSubmit of that session, within 2 hours, injects once the
-    condensed, sanitized summary of every target promoted since the session
-    started.
-  - A target still being processed, or one that failed, gets a one-time notice
-    that startup memory is incomplete.
-  - Evidence is written to `evidence/late-recall-<runtime>.json`.
+  - Each UserPromptSubmit of that session, within 2 hours, delivers every
+    target promoted since the session started as one condensed, sanitized
+    block.  A block is at most one context item, two decisions, one open item
+    and one evidence item, each cut to 220 characters.
+  - The 1,500-character budget is applied per whole block.  One block always
+    fits with the header; a block that does not fit next to others stays
+    pending and whole for the next prompt.  Text is never cut at the budget,
+    and only blocks actually in the text are marked delivered or appear in the
+    evidence.
+  - A target still in flight gets a one-time notice.  A target waiting on a
+    scheduled retry stays tracked, gets a one-time notice, and is delivered if
+    a later SessionStart's retry promotes it within the window.  Only a
+    permanent or exhausted failure ends tracking, with its own notice; the raw
+    checkpoint and retry record are kept.
+  - Evidence is written to `evidence/late-recall-<runtime>.json` and records
+    the session start time and, per delivered artifact, the state update time
+    that proves the promotion came after the start.
 
   Limits:
   - A prompt sent before the drain finishes gets only the notice.
@@ -262,7 +273,9 @@ Codex/Claude SessionStart in a registered root (after stale terminal recovery)
   the summarizer did not receive.
 - **Terminal absorb.**  PreCompact or SessionEnd settles only the raw turns
   whose text is contained in its own, possibly clamped, transcript.  A turn
-  outside it stays pending, and idle finalize merges it later.
+  outside it stays pending, and idle finalize merges it later.  The terminal
+  also records the digest of every turn its transcript holds, computed exactly
+  as a Stop checkpoint computes its own.
 - **Changes during a drain.**  Each selected file's hash is taken when it is
   read.  Settlement unlinks only files whose bytes are unchanged, so a
   checkpoint the Stop hook rewrote mid-drain keeps its new content pending.  A
@@ -278,8 +291,13 @@ Codex/Claude SessionStart in a registered root (after stale terminal recovery)
 - **One artifact per session.**  A turn batch covers only the turns since the
   previous promotion, so its sections are merged rather than replacing the
   artifact: existing items first, exact duplicates dropped, `created_at` kept.
-  - A later real PreCompact or SessionEnd carries the whole transcript, keeps
-    replacing the artifact, and adds its name to `events_seen`.
+  - A later real PreCompact or SessionEnd adds its name to `events_seen`.  It
+    replaces the artifact only when its transcript still contains every turn
+    digest in `settled_turn_digests`.  If an earlier-promoted turn is missing
+    (clamped to 120,000 characters, capped at 200 turns, or rewritten after
+    its Stop), the terminal summary is merged instead, so the summary of
+    those turns survives.  The cost is possible reworded duplication, never
+    loss.  Only the newest 256 digests are compared.
   - An empty batch keeps the session's `event_path`, so the next memory batch
     cannot start a second daily file.
   - An artifact that cannot be parsed fails the drain before the provider is
@@ -291,8 +309,13 @@ Codex/Claude SessionStart in a registered root (after stale terminal recovery)
   failures are permanent and stay visible in `queue/retry`.
 - **Acceptance** requires the real-app chain in
   `runbooks/idle-finalize-acceptance.md`: conversation → checkpoint → durable
-  artifact → correct recall in a new session.  Unit tests and doctor output
-  are not acceptance.
+  artifact → correct recall.  Unit tests and doctor output are not acceptance.
+  One run must prove each path separately, and the verdict fails if any is
+  missing:
+  - promotion by idle finalize (`checkpoint_recovery`, no terminal event);
+  - late recall in the session that triggered the finalize, with its promotion
+    after that session started;
+  - startup recall in a different session that started after the promotion.
 
 ### Shared-memory terminology and native-memory boundary
 
