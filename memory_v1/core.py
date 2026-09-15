@@ -254,9 +254,18 @@ def _open_directory_nofollow(path: Path, *, create: bool = False) -> int:
 
 
 def secure_read_file(
-    path: Path, *, root: Path | None = None, max_bytes: int | None = None
+    path: Path, *, root: Path | None = None, max_bytes: int | None = None,
+    tail: bool = False,
 ) -> tuple[bytes, str]:
-    """Read stable bytes below a pinned, no-follow directory descriptor."""
+    """Read stable bytes below a pinned, no-follow directory descriptor.
+
+    ``tail`` changes only what happens when the file is larger than
+    ``max_bytes``: instead of failing, the newest ``max_bytes`` are read and
+    everything up to and including the first line break is dropped, unless the
+    window already starts on a line boundary.  Every other guarantee is
+    unchanged: no-follow traversal, a single regular file, and an unchanged
+    stat across the read.  A window without any line break raises.
+    """
     if not path.is_absolute():
         raise PolicyError("secure-read-path-not-absolute")
     active_root = root or Path(path.anchor)
@@ -285,6 +294,13 @@ def secure_read_file(
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             raise PolicyError("secure-read-not-single-regular-file")
+        tail_start = 0
+        drop_leading_partial_line = False
+        if tail and max_bytes is not None and before.st_size > max_bytes:
+            tail_start = before.st_size - max_bytes
+            # The byte before the window tells whether it starts mid-line.
+            os.lseek(descriptor, tail_start - 1, os.SEEK_SET)
+            drop_leading_partial_line = os.read(descriptor, 1) != b"\n"
         chunks: list[bytes] = []
         total = 0
         while True:
@@ -293,7 +309,9 @@ def secure_read_file(
                 break
             total += len(chunk)
             if max_bytes is not None and total > max_bytes:
-                raise PolicyError("secure-read-too-large")
+                # In tail mode the window is exactly max_bytes; more means the
+                # file grew during the read.
+                raise PolicyError("secure-read-changed" if tail_start else "secure-read-too-large")
             chunks.append(chunk)
         after = os.fstat(descriptor)
         if (
@@ -310,13 +328,21 @@ def secure_read_file(
         if directory_descriptor is not None:
             os.close(directory_descriptor)
     data = b"".join(chunks)
+    if drop_leading_partial_line:
+        boundary = data.find(b"\n")
+        if boundary < 0 or boundary + 1 >= len(data):
+            # No complete line inside the window: returning nothing would make
+            # a truncated transcript look empty.
+            raise PolicyError("secure-read-tail-without-line-boundary")
+        data = data[boundary + 1:]
     return data, sha256_bytes(data)
 
 
 def secure_read_text(
-    path: Path, *, root: Path | None = None, max_bytes: int | None = None
+    path: Path, *, root: Path | None = None, max_bytes: int | None = None,
+    tail: bool = False,
 ) -> tuple[str, str]:
-    data, digest = secure_read_file(path, root=root, max_bytes=max_bytes)
+    data, digest = secure_read_file(path, root=root, max_bytes=max_bytes, tail=tail)
     try:
         return data.decode("utf-8"), digest
     except UnicodeDecodeError as exc:
@@ -974,6 +1000,9 @@ def _message_from_record(record: dict[str, Any]) -> tuple[str, Any, bool]:
 
 
 TRANSCRIPT_MAX_CHARS = 120000
+#: Bytes of a transcript file read for capture: the whole file when smaller,
+#: otherwise its newest window (see ``_transcript_records``).
+TRANSCRIPT_READ_MAX_BYTES = 20 * 1024 * 1024
 
 
 def clamp_transcript(rendered: str, max_chars: int = TRANSCRIPT_MAX_CHARS) -> str:
@@ -1024,8 +1053,14 @@ def _transcript_records(
         )
         if matching_root is None:
             raise PolicyError("transcript-path-outside-allowed-roots")
+        # A resumed Codex thread keeps appending to its original rollout, so a
+        # live transcript can outgrow any fixed ceiling.  The normalizer keeps
+        # at most the newest 200 turns / 120k characters and a Stop checkpoint
+        # only the last completed turn, so the newest window is what capture
+        # needs.  Rollout and Claude records are self-contained lines; nothing
+        # from the dropped head (e.g. session_meta) is used to extract turns.
         source_text, _ = secure_read_text(
-            source, root=matching_root, max_bytes=20 * 1024 * 1024
+            source, root=matching_root, max_bytes=TRANSCRIPT_READ_MAX_BYTES, tail=True,
         )
         for line_number, raw_line in enumerate(source_text.splitlines(), start=1):
             if not raw_line.strip():
@@ -1088,6 +1123,16 @@ def transcript_turns(
         flattened = re.sub(r"\s+", " ", redacted).strip()
         if flattened:
             turns.append((role, flattened))
+
+    if strict and not turns and isinstance(source, Path):
+        # A windowed read proves nothing about turns before the window, so a
+        # window without turns is a failed read, never an empty session.
+        try:
+            windowed = source.stat().st_size > TRANSCRIPT_READ_MAX_BYTES
+        except OSError:
+            windowed = False
+        if windowed:
+            raise SchemaError("transcript-window-without-turns")
 
     if candidates_count > 0 and not turns:
         if state_path:
