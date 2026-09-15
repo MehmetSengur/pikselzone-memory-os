@@ -27,8 +27,8 @@ EVENTS = {
     # bounded recovery drain has to promote it after a crash.
     "turn_complete", "checkpoint_recovery",
 }
-#: A workstation thread with no new turn for this long is treated as finished
-#: when its runtime never emits SessionEnd (Codex Desktop/App).
+#: A workstation thread with no new turn for this long is finalized at the next
+#: registered SessionStart when no SessionEnd arrived (Codex Desktop/App).
 DEFAULT_IDLE_FINALIZE_MINUTES = 45
 SUMMARY_FIELDS = (
     "context", "important_conversations", "decisions", "learnings",

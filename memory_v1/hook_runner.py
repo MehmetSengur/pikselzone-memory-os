@@ -50,6 +50,29 @@ def _spawn_drain(config_path: Path, queue_path: Path, log_path: Path) -> None:
         )
 
 
+_SESSION_UUID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+
+def _payload_session_id(payload: dict) -> str | None:
+    """The session identity SessionStart and UserPromptSubmit must agree on."""
+    transcript_p = (
+        payload.get("transcript_path")
+        or payload.get("rollout_path")
+        or payload.get("transcriptPath")
+    )
+    if transcript_p and isinstance(transcript_p, str):
+        match = _SESSION_UUID_RE.search(transcript_p)
+        if match:
+            return match.group(1)
+    for key in ("thread_id", "threadId", "conversation_id", "session_id", "sessionId"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _clean_continue() -> int:
     print(json.dumps({"continue": True}))
     return 0
@@ -161,6 +184,19 @@ def main(argv: list[str] | None = None) -> int:
                 except OSError:
                     pass
                 rendered = ""
+            # Memory idle finalize promoted after this session started.
+            late = ""
+            if args.runtime != "hermes":
+                try:
+                    late_session = _payload_session_id(gate_payload)
+                    if late_session:
+                        from .late_recall import deliver_late_recall
+                        late = deliver_late_recall(
+                            config, runtime=args.runtime, session_id=late_session
+                        )
+                except Exception:
+                    late = ""
+            rendered = "\n\n".join(part for part in (late, rendered) if part)
             if rendered:
                 print(json.dumps({
                     "continue": True,
@@ -184,28 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                 RECALL_EVIDENCE_PROVENANCE_NATIVE,
             )
             payload = load_hook_input(None, raw_stdin)
-            transcript_p = (
-                payload.get("transcript_path")
-                or payload.get("rollout_path")
-                or payload.get("transcriptPath")
-            )
-            startup_session_id = None
-            if transcript_p and isinstance(transcript_p, str):
-                m = re.search(
-                    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
-                    transcript_p,
-                )
-                if m:
-                    startup_session_id = m.group(1)
-            if not startup_session_id:
-                startup_session_id = (
-                    payload.get("thread_id")
-                    or payload.get("threadId")
-                    or payload.get("conversation_id")
-                    or payload.get("session_id")
-                    or payload.get("sessionId")
-                    or "startup"
-                )
+            startup_session_id = _payload_session_id(payload) or "startup"
             bundle = build_startup_recall_bundle(
                 config, runtime=args.runtime, session_key=startup_session_id,
                 continuity_scope=continuity_scope,
@@ -252,17 +267,30 @@ def main(argv: list[str] | None = None) -> int:
                         )
             except Exception:
                 pass
-            # Codex Desktop/App never sends SessionEnd for a user thread, so a
-            # thread the user simply closed would keep its raw turns pending
-            # forever.  Any workstation SessionStart promotes the turns of
-            # threads that have gone quiet, as one batch per thread.  The
-            # starting thread is excluded: its own resume path above owns it.
+            # A thread that never reaches SessionEnd (Codex Desktop sends it
+            # only on archive/delete, normal close, or 30 minutes idle while
+            # open in no client) would keep its raw turns pending forever.
+            # This is not a timer: quiet threads are finalized here, at the
+            # next registered workstation SessionStart after their idle
+            # window, as one batch per thread.  The starting thread is
+            # excluded: its own resume path above owns it.
             if args.runtime != "hermes":
                 try:
                     exclude: frozenset[tuple[str, str]] = frozenset()
                     if isinstance(startup_session_id, str) and startup_session_id != "startup":
                         exclude = frozenset({(args.runtime, session_key(startup_session_id))})
                     idle = find_idle_turn_batches(config, exclude=exclude)
+                    if idle and startup_session_id != "startup":
+                        # Recorded before spawning, so a drain can never finish
+                        # before this session's start time.
+                        try:
+                            from .late_recall import record_pending_finalize
+                            record_pending_finalize(
+                                config, runtime=args.runtime, session_id=startup_session_id,
+                                project=continuity_scope, checkpoints=idle,
+                            )
+                        except Exception:
+                            pass
                     if idle:
                         log_dir = config.state_path / "logs"
                         ensure_safe_directory(log_dir, create=True)

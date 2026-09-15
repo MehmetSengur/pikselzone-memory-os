@@ -61,9 +61,11 @@ MAX_STALE_RECOVERY_SPAWNS = 2
 #: absorbed by the next terminal flush, or promoted by idle finalize below.
 STALE_RECOVERABLE_EVENTS = ("session_end", "pre_compact", "session_finalize", "session_reset")
 
-#: Idle finalize is a workstation concern: Codex Desktop/App never sends
-#: SessionEnd for a user thread, so its turns would otherwise stay pending
-#: forever.  Hermes owns its own native lifecycle and is never swept here.
+#: Idle finalize is a workstation concern: a Codex Desktop/App thread that is
+#: never archived, closed, or left unopened for 30 minutes never reaches
+#: SessionEnd, so its turns would otherwise stay pending forever.  It runs only
+#: from SessionStart; it is not a timer.  Hermes owns its own native lifecycle
+#: and is never swept here.
 IDLE_FINALIZE_RUNTIMES = ("codex", "claude")
 MAX_IDLE_FINALIZE_SPAWNS = 2
 

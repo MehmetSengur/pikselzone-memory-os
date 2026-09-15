@@ -54,6 +54,24 @@ valuable as successful ones and must not be dropped.
 Return only the requested structured object."""
 
 
+#: Newest raw-turn digests a session state remembers as promoted.
+MAX_SETTLED_TURN_DIGESTS = 256
+
+
+def _merged_turn_digests(previous: dict[str, Any], new: list[str] | None) -> list[str]:
+    recorded_raw = previous.get("settled_turn_digests")
+    recorded = [
+        item for item in recorded_raw if isinstance(item, str)
+    ] if isinstance(recorded_raw, list) else []
+    recorded.extend(item for item in (new or []) if item not in recorded)
+    return recorded[-MAX_SETTLED_TURN_DIGESTS:]
+
+
+def _turn_digest_field(digests: list[str]) -> dict[str, Any]:
+    """Session states without raw-turn settlement (Hermes) keep their shape."""
+    return {"settled_turn_digests": digests} if digests else {}
+
+
 class EventWriter:
     def __init__(
         self, config: MemoryConfig, provider: Any
@@ -69,6 +87,7 @@ class EventWriter:
         created_at: str | None = None,
         project: str | None = None, continuity_scope: str | None = None,
         merge_sections: bool = False,
+        settled_turn_digests: list[str] | None = None,
     ) -> Path:
         """Write or update the single daily artifact of one session.
 
@@ -76,6 +95,10 @@ class EventWriter:
         only the turns since the previous promotion, so its summary is added to
         the existing artifact instead of replacing it.  A terminal boundary
         carries the whole transcript and keeps replacing.
+
+        ``settled_turn_digests`` are the raw turns this transcript covers.  They
+        are recorded in the same session-state write as the outcome (memory,
+        empty or duplicate), never before it.
         """
         if runtime not in RUNTIMES or runtime not in self.config.runtimes:
             raise PolicyError("runtime-not-enabled")
@@ -100,11 +123,17 @@ class EventWriter:
         with exclusive_lock(lock):
             state_path = self.config.state_path / "sessions" / runtime / f"{state_key}.json"
             previous = self._load_state(state_path)
+            turn_digests = _merged_turn_digests(previous, settled_turn_digests)
             if (
                 previous.get("source_digest") == source_digest
                 and event in previous.get("events_seen", [])
                 and previous.get("event_path")
             ):
+                if turn_digests != previous.get("settled_turn_digests", []):
+                    atomic_json(state_path, {
+                        **previous, "settled_turn_digests": turn_digests,
+                        "updated_at": iso_now(),
+                    })
                 raise DuplicateEvent(previous["event_path"])
             # A successful empty classification is itself durable semantic
             # state, even though it deliberately has no daily event artifact.
@@ -120,6 +149,7 @@ class EventWriter:
                     "source_digest": source_digest,
                     "events_seen": events_seen,
                     "status": "empty",
+                    **_turn_digest_field(turn_digests),
                     "updated_at": iso_now(),
                 })
                 write_health(
@@ -157,6 +187,7 @@ class EventWriter:
                 atomic_write(event_path, rendered.encode("utf-8"), mode=0o640)
                 atomic_json(state_path, {
                     **previous, "events_seen": events_seen, "event_path": str(event_path),
+                    **_turn_digest_field(turn_digests),
                     "updated_at": iso_now(),
                 })
                 write_health(self.config.state_path, f"flush-{runtime}", "ok", "deduplicated-boundary")
@@ -210,6 +241,7 @@ class EventWriter:
                     "source_digest": source_digest,
                     "events_seen": sorted(set(previous.get("events_seen", [])) | {event}),
                     "status": "empty",
+                    **_turn_digest_field(turn_digests),
                     "updated_at": iso_now(),
                 }
                 # An empty batch after a promoted one must not orphan the
@@ -274,6 +306,7 @@ class EventWriter:
                 "events_seen": events_seen,
                 "event_path": str(event_path),
                 "status": "ok",
+                **_turn_digest_field(turn_digests),
                 "updated_at": iso_now(),
             })
             write_health(self.config.state_path, f"flush-{runtime}", "ok")
