@@ -1,6 +1,7 @@
 """Hermes container-side knowledge candidate generator using PluginLlm."""
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -9,6 +10,8 @@ import os
 import posixpath
 import shutil
 import sys
+import threading
+import types
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +19,48 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("pz-memory-generator")
 
 PLUGIN_ID = "pz-memory-v1"
+
+
+# Re-entrancy flag, shared with ``__init__`` and ``memory_v1.hermes_compiler``
+# through one ``sys.modules`` entry: see the long explanation beside
+# ``internal_call_guard`` in ``__init__.py``. A per-module save/restore is not
+# safe, because a concurrent holder restores a stale "1" and wedges the flag on.
+_INTERNAL_CALL_ENV = "PZ_MEMORY_INTERNAL_CALL"
+_INTERNAL_CALL_STATE_KEY = "_pz_memory_internal_call_state_v1"
+
+
+def _internal_call_state():
+    state = sys.modules.get(_INTERNAL_CALL_STATE_KEY)
+    if state is None:
+        candidate = types.ModuleType(_INTERNAL_CALL_STATE_KEY)
+        candidate.lock = threading.Lock()
+        candidate.depth = 0
+        candidate.previous = None
+        state = sys.modules.setdefault(_INTERNAL_CALL_STATE_KEY, candidate)
+    return state
+
+
+@contextlib.contextmanager
+def internal_call_guard():
+    """Mark provider calls this module makes itself. Re-entrant and thread-safe."""
+    state = _internal_call_state()
+    with state.lock:
+        if state.depth == 0:
+            state.previous = os.environ.get(_INTERNAL_CALL_ENV)
+        state.depth += 1
+        os.environ[_INTERNAL_CALL_ENV] = "1"
+    try:
+        yield
+    finally:
+        with state.lock:
+            state.depth = max(0, state.depth - 1)
+            if state.depth == 0:
+                if state.previous is None:
+                    os.environ.pop(_INTERNAL_CALL_ENV, None)
+                else:
+                    os.environ[_INTERNAL_CALL_ENV] = state.previous
+                state.previous = None
+
 BASE_DIR = "/opt/data/memory-v1"
 
 COMPILER_INSTRUCTION = """You are the Pikselzone Memory V1 knowledge compiler.
@@ -130,9 +175,7 @@ Compile the updated knowledge base articles according to instructions.
     else:
         from agent.plugin_llm import PluginLlm, PluginLlmTextInput
         llm = PluginLlm(plugin_id=PLUGIN_ID)
-        prev_env = os.environ.get("PZ_MEMORY_INTERNAL_CALL")
-        os.environ["PZ_MEMORY_INTERNAL_CALL"] = "1"
-        try:
+        with internal_call_guard():
             res = llm.complete_structured(
                 instructions=COMPILER_INSTRUCTION,
                 input=[PluginLlmTextInput(text=prompt)],
@@ -141,11 +184,6 @@ Compile the updated knowledge base articles according to instructions.
                 timeout=180.0,
                 purpose="knowledge-compilation",
             )
-        finally:
-            if prev_env is None:
-                os.environ.pop("PZ_MEMORY_INTERNAL_CALL", None)
-            else:
-                os.environ["PZ_MEMORY_INTERNAL_CALL"] = prev_env
 
     parsed = getattr(res, "parsed", None)
     if not isinstance(parsed, dict):

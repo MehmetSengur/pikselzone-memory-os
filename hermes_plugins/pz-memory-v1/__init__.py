@@ -18,6 +18,7 @@ Enforces:
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import inspect
@@ -26,7 +27,9 @@ import logging
 import os
 import posixpath
 import re
+import sys
 import threading
+import types
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -159,6 +162,58 @@ def redact_sensitive_text(text: str) -> tuple[str, int]:
 
 def _is_internal_call() -> bool:
     return os.environ.get("PZ_MEMORY_INTERNAL_CALL") == "1"
+
+
+# ── re-entrancy flag ─────────────────────────────────────────────────────────
+# The flag is process-wide (an env var), so save/restore around each provider
+# call is not safe on its own: with two summarizations in flight, the second one
+# reads "1" as the value to restore, the first one clears the flag on the way
+# out, and the second one then puts "1" back for good. Every later lifecycle
+# callback in that process is skipped as an "internal recursive call" until the
+# process restarts. Depth is therefore counted under one process-wide lock and
+# only the outermost holder restores what it found.
+#
+# The state lives in ``sys.modules`` rather than in a module global because this
+# plugin is loaded by file path (no stable package name) and the same protocol
+# is used by ``knowledge_generator`` and ``memory_v1.hermes_compiler``; keying it
+# by name is what lets those separate module objects share one counter.
+_INTERNAL_CALL_ENV = "PZ_MEMORY_INTERNAL_CALL"
+_INTERNAL_CALL_STATE_KEY = "_pz_memory_internal_call_state_v1"
+
+
+def _internal_call_state() -> Any:
+    state = sys.modules.get(_INTERNAL_CALL_STATE_KEY)
+    if state is None:
+        candidate = types.ModuleType(_INTERNAL_CALL_STATE_KEY)
+        candidate.lock = threading.Lock()
+        candidate.depth = 0
+        candidate.previous = None
+        # setdefault is atomic, so two threads racing to create it still end up
+        # sharing the instance that actually landed in sys.modules.
+        state = sys.modules.setdefault(_INTERNAL_CALL_STATE_KEY, candidate)
+    return state
+
+
+@contextlib.contextmanager
+def internal_call_guard():
+    """Mark provider calls this plugin makes itself. Re-entrant and thread-safe."""
+    state = _internal_call_state()
+    with state.lock:
+        if state.depth == 0:
+            state.previous = os.environ.get(_INTERNAL_CALL_ENV)
+        state.depth += 1
+        os.environ[_INTERNAL_CALL_ENV] = "1"
+    try:
+        yield
+    finally:
+        with state.lock:
+            state.depth = max(0, state.depth - 1)
+            if state.depth == 0:
+                if state.previous is None:
+                    os.environ.pop(_INTERNAL_CALL_ENV, None)
+                else:
+                    os.environ[_INTERNAL_CALL_ENV] = state.previous
+                state.previous = None
 
 
 _NATIVE_HOOK_FUNCTIONS = frozenset({"invoke_hook", "_invoke_hook_callback", "_run_hook_callback_bounded", "_plugin_hooks"})
@@ -1073,36 +1128,30 @@ def _summarize_with_hermes(
     from agent.plugin_llm import PluginLlm, PluginLlmTextInput
 
     llm = PluginLlm(plugin_id=PLUGIN_ID)
-    prev_env = os.environ.get("PZ_MEMORY_INTERNAL_CALL")
-    os.environ["PZ_MEMORY_INTERNAL_CALL"] = "1"
-    try:
+    with internal_call_guard():
         # Optional deployment routing stays inside Hermes' credential and plugin
         # trust boundary. Unset preserves the existing runtime-selected model.
         flush_model = os.environ.get("PZ_MEMORY_FLUSH_MODEL", "").strip()
         routing = {"model": flush_model} if flush_model else {}
-        res = llm.complete_structured(
-            instructions=FLUSH_INSTRUCTION,
-            input=[PluginLlmTextInput(text=transcript)],
-            json_schema=SUMMARY_SCHEMA,
-            json_mode=True,
-            timeout=120.0,
-            purpose="memory-session-flush",
-            **routing,
-        )
-        parsed = res.parsed if isinstance(res.parsed, dict) else {}
-        provider = str(res.provider or "custom:pz-openai-serial")
-        model = str(res.model or "gpt-5.4-mini-2026-03-17")
-        return parsed, provider, model
-    except Exception as exc:
-        logger.warning("pz-memory-v1: LLM completion failed: %s", exc)
-        if error_sink is not None:
-            error_sink["exc"] = exc
-        return None, "", ""
-    finally:
-        if prev_env is None:
-            os.environ.pop("PZ_MEMORY_INTERNAL_CALL", None)
-        else:
-            os.environ["PZ_MEMORY_INTERNAL_CALL"] = prev_env
+        try:
+            res = llm.complete_structured(
+                instructions=FLUSH_INSTRUCTION,
+                input=[PluginLlmTextInput(text=transcript)],
+                json_schema=SUMMARY_SCHEMA,
+                json_mode=True,
+                timeout=120.0,
+                purpose="memory-session-flush",
+                **routing,
+            )
+            parsed = res.parsed if isinstance(res.parsed, dict) else {}
+            provider = str(res.provider or "custom:pz-openai-serial")
+            model = str(res.model or "gpt-5.4-mini-2026-03-17")
+            return parsed, provider, model
+        except Exception as exc:
+            logger.warning("pz-memory-v1: LLM completion failed: %s", exc)
+            if error_sink is not None:
+                error_sink["exc"] = exc
+            return None, "", ""
 
 
 def _render_and_stage_event(

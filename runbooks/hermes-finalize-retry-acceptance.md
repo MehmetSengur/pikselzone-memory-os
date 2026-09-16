@@ -168,6 +168,51 @@ current transcript. Each adopted session costs one summarizer call against the
 subscription quota, which is why a bulk adoption is a separate decision and is
 not scripted here.
 
+## 5. Value-preserving acceptance (added 16 September 2026)
+
+The Desktop/Bot Mode run on 16 September produced a real finalize artifact
+(`daily/2026-09-16/hermes-95a1564e…-3f3a73007cd3e767.md`, published and synced
+with the same sha256 on the VPS and the Mac), but the summary kept only the
+*fact* that a control value had been confirmed — the distinctive value itself
+(`PZ-BOTMODE-CANARY-a67322b7`) is absent from the artifact. A token that does not
+survive into the artifact can never be recalled from it, so that run proves the
+pipeline end to end and proves nothing about remembering.
+
+The next acceptance run must therefore be value-preserving:
+
+1. Hold one session with **a real decision** and **one distinctive identifier**
+   (a code, a file name, a number) in normal working language — not a token-only
+   ping, and not a canary sentence whose only content is the token.
+2. Close the session the way it normally closes and let the native boundary run.
+3. Require the artifact to contain the decision **and** the identifier verbatim.
+   A summary that paraphrases the decision without the identifier is a FAIL for
+   this test even though the pipeline worked.
+4. Ask for it in a **new** session and report which source answered — startup
+   recall bundle, a targeted Memory OS query, or Hermes' own session retrieval —
+   separately. Answering from the same still-open chat is not evidence.
+5. If the startup bundle does not carry it, investigate bundle selection, budget
+   and ingest state each on their own evidence. **Do not attribute the gap to the
+   compiler by default**; on 16 September the compiler backlog row (`stale_uningested_events`)
+   was merely the most visible number, not a demonstrated cause.
+
+## 6. Re-entrancy flag race (fixed in this branch)
+
+`PZ_MEMORY_INTERNAL_CALL` used to be saved and restored around every provider
+call. Codex reproduced the resulting race locally: with two summarizations in
+flight, the second one records "1" as the value to restore, the first one clears
+the variable, and the second one then restores "1" permanently — after which
+every lifecycle callback in that process is dropped as an internal recursive
+call. The flag is now a depth counter under one process-wide lock, shared by the
+plugin, the knowledge generator and the engine-side compiler worker, with a
+deterministic regression test (`tests/memory_v1/test_internal_call_guard.py`).
+
+This is a real defect fixed on its own merits. It is **not** established as the
+cause of the 16 September VPS incident, where lifecycle callbacks stopped after a
+multi-session finalize; that incident's evidence (hook-trace frozen at 18:37:51,
+Hermes' own `skipped after previous timeout or while still running` warnings, and
+recovery after a dashboard restart) is consistent with more than one explanation
+and stays open.
+
 ## Rollback
 
 The change is two plugin files, two engine files and the pinned baseline.
