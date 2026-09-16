@@ -157,8 +157,47 @@ def redact_sensitive_text(text: str) -> tuple[str, int]:
     return redacted, count
 
 
+_INTERNAL_CALL_LOCK = threading.Lock()
+_INTERNAL_CALL_DEPTH = 0
+_INTERNAL_CALL_PREVIOUS: Optional[str] = None
+
+
 def _is_internal_call() -> bool:
     return os.environ.get("PZ_MEMORY_INTERNAL_CALL") == "1"
+
+
+def _enter_internal_call() -> None:
+    """Mark this process as being inside its own summarizer call.
+
+    Reference counted under a lock.  Saving and restoring the single process
+    flag per call interleaved badly: with two overlapping summaries the second
+    one saved the first one's "1" and put it back on the way out, so the flag
+    outlived both and every later lifecycle event in the process was treated as
+    a recursive internal call -- permanently.
+    """
+    global _INTERNAL_CALL_DEPTH, _INTERNAL_CALL_PREVIOUS
+
+    with _INTERNAL_CALL_LOCK:
+        if _INTERNAL_CALL_DEPTH == 0:
+            _INTERNAL_CALL_PREVIOUS = os.environ.get("PZ_MEMORY_INTERNAL_CALL")
+        _INTERNAL_CALL_DEPTH += 1
+        os.environ["PZ_MEMORY_INTERNAL_CALL"] = "1"
+
+
+def _exit_internal_call() -> None:
+    """Drop this call's claim, and clear the flag only when the last one ends."""
+    global _INTERNAL_CALL_DEPTH, _INTERNAL_CALL_PREVIOUS
+
+    with _INTERNAL_CALL_LOCK:
+        _INTERNAL_CALL_DEPTH = max(0, _INTERNAL_CALL_DEPTH - 1)
+        if _INTERNAL_CALL_DEPTH:
+            return
+        if _INTERNAL_CALL_PREVIOUS is None:
+            os.environ.pop("PZ_MEMORY_INTERNAL_CALL", None)
+        else:
+            # An outer caller (or the runtime) had already set it; leave theirs.
+            os.environ["PZ_MEMORY_INTERNAL_CALL"] = _INTERNAL_CALL_PREVIOUS
+        _INTERNAL_CALL_PREVIOUS = None
 
 
 _NATIVE_HOOK_FUNCTIONS = frozenset({"invoke_hook", "_invoke_hook_callback", "_run_hook_callback_bounded", "_plugin_hooks"})
@@ -573,7 +612,26 @@ def _last_completed_turn(transcript: str) -> Optional[str]:
     return turn
 
 
-def _checkpoint_paths(session_id: str) -> list[str]:
+def _checkpoint_owner(path: str) -> Optional[str]:
+    """The owner recorded inside one checkpoint, or None when it predates them."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return None
+    owner = payload.get("owner")
+    return owner if isinstance(owner, str) and owner else None
+
+
+def _checkpoint_paths(session_id: str, database: str = "") -> list[str]:
+    """Checkpoints for this session, narrowed to one owner when known.
+
+    Ownership lives inside the record rather than in the filename: startup
+    discovery and ``pre_llm_call`` must produce the *same* checkpoint identity
+    for one turn, and only one of them always knows which database it came
+    from.  Records written before ownership existed carry none and stay
+    visible to every caller, exactly as they did before.
+    """
     root = _checkpoint_root()
     session_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
     try:
@@ -583,7 +641,14 @@ def _checkpoint_paths(session_id: str) -> list[str]:
         )
     except OSError:
         return []
-    return [posixpath.join(root, name) for name in names]
+    paths = [posixpath.join(root, name) for name in names]
+    owner = _owner_hash(database)
+    if not owner:
+        return paths
+    return [
+        path for path in paths
+        if _checkpoint_owner(path) in (None, owner)
+    ]
 
 
 def _checkpoint_destination(session_id: str, digest: str) -> str:
@@ -595,10 +660,11 @@ def _checkpoint_destination(session_id: str, digest: str) -> str:
 
 def _stage_completed_turn_checkpoint(
     session_id: str, turn: str, model: Optional[str], task_id: Optional[str], redactions: int,
+    database: str = "",
 ) -> bool:
     """Persist one canonical redacted final turn without invoking PluginLlm."""
     digest = hashlib.sha256(turn.encode("utf-8")).hexdigest()
-    existing = _checkpoint_paths(session_id)
+    existing = _checkpoint_paths(session_id, database)
     destination = _checkpoint_destination(session_id, digest)
     if os.path.isfile(destination):
         return True
@@ -614,6 +680,10 @@ def _stage_completed_turn_checkpoint(
         "source_model": model or "unknown",
         "root_task_id": task_id or "unknown",
         "secret_redactions": redactions,
+        # Which SessionDB this turn came from, so another profile holding the
+        # same session id can neither claim nor delete it.
+        "database": str(database or ""),
+        "owner": _owner_hash(database),
         "observed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     try:
@@ -643,7 +713,11 @@ def _stage_turn_checkpoint(session_id: str) -> bool:
     turn = _last_completed_turn(transcript)
     if not turn:
         return False
-    return _stage_completed_turn_checkpoint(session_id, turn, model, task_id, redactions)
+    owning_db = _SESSION_DB_PATHS.get(session_id)
+    return _stage_completed_turn_checkpoint(
+        session_id, turn, model, task_id, redactions,
+        database=str(owning_db) if owning_db is not None else "",
+    )
 
 
 def _discovery_cursor_path() -> str:
@@ -939,7 +1013,7 @@ def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -
                     continue
                 destination = _checkpoint_destination(session_id, digest)
                 if os.path.isfile(destination) or _stage_completed_turn_checkpoint(
-                    session_id, turn, model, task_id, redactions,
+                    session_id, turn, model, task_id, redactions, database=str(db_path),
                 ):
                     sessions[identity] = entry
                     changed = True
@@ -958,8 +1032,26 @@ def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -
         _write_discovery_cursor({"schema": DISCOVERY_CURSOR_SCHEMA, "sessions": sessions})
 
 
-def _clear_turn_checkpoints(session_id: str) -> None:
-    for path in _checkpoint_paths(session_id):
+def _clear_turn_checkpoints(
+    session_id: str, database: str = "", covered_transcript: Optional[str] = None,
+) -> None:
+    """Delete only the raw turns a settlement actually accounts for.
+
+    Two different turns used to be destroyed here: another profile's checkpoint
+    for a session that merely shares the id, and a later turn of this very
+    session that no settlement had covered yet.  Ownership narrows the first,
+    and the settled transcript decides the second.
+    """
+    for path in _checkpoint_paths(session_id, database):
+        if covered_transcript is not None:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                turn = payload.get("normalized_transcript")
+            except (OSError, ValueError, TypeError):
+                turn = None
+            if not isinstance(turn, str) or turn not in covered_transcript:
+                continue
         try:
             os.unlink(path)
         except OSError:
@@ -1010,7 +1102,7 @@ def _recover_pending_turn_checkpoints() -> None:
         transcript = "\n".join(item["normalized_transcript"] for item in unique)
         source_sha = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
         if _is_source_settled(session_id, source_sha):
-            _clear_turn_checkpoints(session_id)
+            _clear_turn_checkpoints(session_id, covered_transcript=transcript)
             continue
         summary, provider, model = _summarize_with_hermes(transcript)
         if not summary:
@@ -1019,7 +1111,7 @@ def _recover_pending_turn_checkpoints() -> None:
             if _mark_durable_settlement(
                 session_id, source_sha, status="checkpoint-recovery-empty",
             ):
-                _clear_turn_checkpoints(session_id)
+                _clear_turn_checkpoints(session_id, covered_transcript=transcript)
             continue
         staged = _render_and_stage_event(
             session_id=session_id, summary=summary,
@@ -1033,7 +1125,7 @@ def _recover_pending_turn_checkpoints() -> None:
         if staged and _mark_durable_settlement(
             session_id, source_sha, status="checkpoint-recovery", event_path=staged,
         ):
-            _clear_turn_checkpoints(session_id)
+            _clear_turn_checkpoints(session_id, covered_transcript=transcript)
 
 
 def _summarize_in_session_profile(
@@ -1073,8 +1165,7 @@ def _summarize_with_hermes(
     from agent.plugin_llm import PluginLlm, PluginLlmTextInput
 
     llm = PluginLlm(plugin_id=PLUGIN_ID)
-    prev_env = os.environ.get("PZ_MEMORY_INTERNAL_CALL")
-    os.environ["PZ_MEMORY_INTERNAL_CALL"] = "1"
+    _enter_internal_call()
     try:
         # Optional deployment routing stays inside Hermes' credential and plugin
         # trust boundary. Unset preserves the existing runtime-selected model.
@@ -1099,10 +1190,7 @@ def _summarize_with_hermes(
             error_sink["exc"] = exc
         return None, "", ""
     finally:
-        if prev_env is None:
-            os.environ.pop("PZ_MEMORY_INTERNAL_CALL", None)
-        else:
-            os.environ["PZ_MEMORY_INTERNAL_CALL"] = prev_env
+        _exit_internal_call()
 
 
 def _render_and_stage_event(
@@ -1413,7 +1501,9 @@ def _settle_source(
         session_id, source_sha, status="staged-event", event_path=staged_path,
         database=database,
     ):
-        _clear_turn_checkpoints(session_id)
+        _clear_turn_checkpoints(
+            session_id, database=database, covered_transcript=transcript,
+        )
         retry.clear_record(base_dir, session_id, source_sha, database)
         _record_flush_health("ok")
         return True
@@ -1654,13 +1744,15 @@ def _defer_lifecycle_event(event_name: str, session_id: str) -> None:
         if not transcript:
             return
         turn = _last_completed_turn(transcript)
+        owning_db = _SESSION_DB_PATHS.get(session_id)
+        database = str(owning_db) if owning_db is not None else ""
         if turn:
-            _stage_completed_turn_checkpoint(session_id, turn, model, task_id, redactions)
+            _stage_completed_turn_checkpoint(
+                session_id, turn, model, task_id, redactions, database=database,
+            )
         if event_name != "on_session_finalize":
             return
         source_sha = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
-        owning_db = _SESSION_DB_PATHS.get(session_id)
-        database = str(owning_db) if owning_db is not None else ""
         if _is_source_settled(session_id, source_sha, database=database):
             return
         _finalize_retry_module().record_failure(
@@ -1699,7 +1791,11 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
         # interactive prompt returns.  Keep this boundary cheap and provider
         # free: one atomic canonical checkpoint is the durable handoff.
         turn = _last_completed_turn(transcript)
-        if turn and _stage_completed_turn_checkpoint(session_id, turn, model, task_id, redactions):
+        owning_db = _SESSION_DB_PATHS.get(session_id)
+        if turn and _stage_completed_turn_checkpoint(
+            session_id, turn, model, task_id, redactions,
+            database=str(owning_db) if owning_db is not None else "",
+        ):
             logger.info("pz-memory-v1: durably staged completed turn for session %s", session_id)
         elif turn:
             logger.warning("pz-memory-v1: failed to stage completed turn for session %s", session_id)

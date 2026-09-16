@@ -298,13 +298,15 @@ class HermesPluginFixture:
         matches = sorted(directory.glob(f"hermes-{digest}*.json"))
         return matches[0] if matches else directory / f"hermes-{digest}.json"
 
-    def _source_sha(self, messages=None) -> str:
+    def _transcript(self, messages=None) -> str:
         items = messages if messages is not None else self.messages
-        transcript = "\n".join(
+        return "\n".join(
             ("USER: " if item["role"] == "user" else "ASSISTANT: ") + item["content"]
             for item in items
         )
-        return hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+
+    def _source_sha(self, messages=None) -> str:
+        return hashlib.sha256(self._transcript(messages).encode("utf-8")).hexdigest()
 
     def _retry_records(self) -> list[dict]:
         return self.retry.iter_records(str(self.base))
