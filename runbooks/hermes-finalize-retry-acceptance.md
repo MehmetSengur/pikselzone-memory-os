@@ -10,6 +10,23 @@ The change itself is local: branch `fix/hermes-finalize-retry`, base
 the deployed bytes). No VPS installation, service restart, push, live recovery
 or legacy adoption is part of it.
 
+**Do not deploy this branch on its own.** The live host also runs the Bot Mode
+guard from `1b1726f`, which `70bb5ad` predates: the deployed
+`memory_v1/hermes_guards.py` hashes to `24cd6add…`, which is `1b1726f`'s
+version, not the base's. Installing this branch alone would quietly revert that
+guard. The deployable candidate is
+`integration/hermes-finalize-retry-bot-guard`, a merge of this branch and
+`1b1726f`; its `hermes_guards.py` matches the deployed file byte for byte, and
+its combined suite — including the Bot Mode guard tests — is green.
+
+Before and after any installation, confirm the guard file is the one the live
+host already had:
+
+```bash
+ssh pz-contabo 'sha256sum /srv/pz-hermes/memory-os/memory_v1/hermes_guards.py'
+# expected: 24cd6add45921aed685541424511df36692ab308cd836afd02ccffccdb3a4853
+```
+
 ## What changed, in one paragraph
 
 `on_session_finalize` used to log "source remains retryable" and return. Nothing
