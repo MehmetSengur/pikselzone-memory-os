@@ -95,6 +95,7 @@ def backlog_metrics(config: MemoryConfig) -> dict[str, Any]:
         "retry_tracked_sessions": 0,
         "sessions_with_checkpoints": 0,
         "settled_sessions": 0,
+        "stale_after_settlement": 0,
         "unresolved_sessions": 0,
         "unresolved_sample": [],
     }
@@ -114,27 +115,51 @@ def backlog_metrics(config: MemoryConfig) -> dict[str, Any]:
             retry_sessions.add(session_id)
 
     checkpoint_sessions: set[str] = set()
+    newest_checkpoint: dict[str, str] = {}
     for record in _scan(state / "checkpoints", CHECKPOINT_SCHEMA):
         session_id = record.get("session_id")
-        if record.get("runtime") == "hermes" and isinstance(session_id, str) and session_id:
-            checkpoint_sessions.add(session_id)
+        if record.get("runtime") != "hermes" or not isinstance(session_id, str) or not session_id:
+            continue
+        checkpoint_sessions.add(session_id)
+        observed_at = str(record.get("observed_at") or "")
+        if observed_at > newest_checkpoint.get(session_id, ""):
+            newest_checkpoint[session_id] = observed_at
 
     settled_sessions: set[str] = set()
+    settled_at: dict[str, str] = {}
     for record in _scan(state / "settlements", SETTLEMENT_SCHEMA):
         session_id = record.get("session_id")
-        if isinstance(session_id, str) and session_id:
-            settled_sessions.add(session_id)
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        settled_sessions.add(session_id)
+        moment = str(record.get("settled_at") or "")
+        if moment > settled_at.get(session_id, ""):
+            settled_at[session_id] = moment
+
+    # A settlement only accounts for the source it settled.  When a checkpoint
+    # is newer than the settlement, that later turn is demonstrably not covered
+    # by it, and calling the session settled would hide real outstanding work.
+    stale = sorted(
+        session_id for session_id in checkpoint_sessions & settled_sessions
+        if session_id not in retry_sessions
+        and newest_checkpoint.get(session_id, "") > settled_at.get(session_id, "")
+    )
 
     # Unresolved: raw turns are preserved, but nothing -- neither a settlement
     # nor a retry record -- accounts for them.  These are the sessions that
     # predate the retry contract, or whose failure was never recorded.
-    unresolved = sorted(checkpoint_sessions - settled_sessions - retry_sessions)
+    unresolved = sorted(
+        (checkpoint_sessions - settled_sessions - retry_sessions) | set(stale)
+    )
     return {
         "available": True,
         **counts,
         "retry_tracked_sessions": len(retry_sessions),
         "sessions_with_checkpoints": len(checkpoint_sessions),
-        "settled_sessions": len(checkpoint_sessions & settled_sessions),
+        # Only sessions whose settlement demonstrably covers their newest
+        # checkpoint are reported as settled.
+        "settled_sessions": len(checkpoint_sessions & settled_sessions) - len(stale),
+        "stale_after_settlement": len(stale),
         "unresolved_sessions": len(unresolved),
         "unresolved_sample": unresolved[:MAX_REPORTED_SESSIONS],
     }

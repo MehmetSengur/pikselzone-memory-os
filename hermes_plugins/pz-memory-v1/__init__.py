@@ -50,6 +50,19 @@ _IN_MEMORY_PROCESSED: set[str] = set()
 # runs inside the live Hermes process, beside real user sessions.
 RETRY_TRIGGER_MIN_INTERVAL_SECONDS = 300.0
 MAX_RETRY_JOBS_PER_RUN = 2
+#: Skipped work -- an active session, an unreachable database -- costs nothing,
+#: so it must not consume the attempt budget.  The scan is therefore wider than
+#: the budget, and only real attempts count against it.
+MAX_RETRY_SCAN_PER_RUN = 20
+RETRY_SKIP_OUTCOMES = frozenset({
+    "already-settled", "invalid-record", "locked", "no-transcript",
+    "owner-unavailable", "session-active", "superseded",
+})
+#: A quota can reset long after the last session of the day ended.  Long-lived
+#: surfaces run a slow watchdog so a due record still moves without one.
+RETRY_WATCHDOG_INTERVAL_SECONDS = 900.0
+_RETRY_WATCHDOG_STOP = threading.Event()
+_RETRY_WATCHDOG_STARTED = False
 _RETRY_TRIGGER_LOCK = threading.Lock()
 _RETRY_RUN_IN_PROGRESS = False
 _LAST_RETRY_RUN_AT = 0.0
@@ -243,53 +256,111 @@ def _settlement_root() -> str:
     return _memory_path("state", "settlements")
 
 
-def _settlement_key(session_id: str, source_sha: str) -> str:
-    return f"{session_id}\0{source_sha}"
+def _owner_hash(database: str) -> str:
+    """Short identity of the SessionDB that owns a session.
+
+    Two profiles can hold rows carrying the same session id.  Scoping the
+    settlement, the lock and the retry record by owner keeps one profile's work
+    from overwriting or blocking the other's.
+    """
+    if not database:
+        return ""
+    return hashlib.sha256(str(database).encode("utf-8")).hexdigest()[:8]
 
 
-def _settlement_destination(session_id: str, settlements_dir: Optional[str] = None) -> str:
-    """Return the bounded per-session record for its last settled source digest."""
+def _settlement_key(session_id: str, source_sha: str, database: str = "") -> str:
+    return f"{session_id}\0{_owner_hash(database)}\0{source_sha}"
+
+
+def _settlement_destination(
+    session_id: str, settlements_dir: Optional[str] = None, database: str = "",
+) -> str:
+    """Return the bounded per-owner record for its last settled source digest."""
     root = settlements_dir or _settlement_root()
     session_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
-    return posixpath.join(root, f"hermes-{session_hash}.json")
+    owner = _owner_hash(database)
+    suffix = f"-{owner}" if owner else ""
+    return posixpath.join(root, f"hermes-{session_hash}{suffix}.json")
+
+
+def _settlement_candidates(
+    session_id: str, settlements_dir: Optional[str] = None, database: str = "",
+) -> list[str]:
+    """Settlement files that could account for this session.
+
+    With an owner, its own file plus the historical owner-less one (written
+    before this scoping existed, and still on disk in production).  Without an
+    owner, every file for the session, because the caller is asking whether
+    this exact content was settled at all.
+    """
+    root = settlements_dir or _settlement_root()
+    session_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    if database:
+        return [
+            _settlement_destination(session_id, settlements_dir, database),
+            posixpath.join(root, f"hermes-{session_hash}.json"),
+        ]
+    try:
+        names = sorted(
+            name for name in os.listdir(root)
+            if name.startswith(f"hermes-{session_hash}") and name.endswith(".json")
+        )
+    except OSError:
+        return []
+    return [posixpath.join(root, name) for name in names]
 
 
 def _is_source_settled(
     session_id: str,
     source_sha: str,
     settlements_dir: Optional[str] = None,
+    database: str = "",
 ) -> bool:
     """Return true only when this exact normalized source is durably settled."""
     if not session_id or not source_sha:
         return False
-    key = _settlement_key(session_id, source_sha)
+    key = _settlement_key(session_id, source_sha, database)
     if key in _IN_MEMORY_SETTLED:
         return True
-    path = _settlement_destination(session_id, settlements_dir)
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            value = json.load(fh)
+    for path in _settlement_candidates(session_id, settlements_dir, database):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                value = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            continue
         if (
-            value.get("schema") == "pikselzone-memory-hermes-settlement-v1"
-            and value.get("session_id") == session_id
-            and value.get("source_sha256") == source_sha
+            value.get("schema") != "pikselzone-memory-hermes-settlement-v1"
+            or value.get("session_id") != session_id
+            or value.get("source_sha256") != source_sha
         ):
-            _IN_MEMORY_SETTLED.add(key)
-            return True
-    except (OSError, ValueError, TypeError):
-        pass
+            continue
+        recorded_db = str(value.get("database") or "")
+        # A record that names a different owner belongs to another session that
+        # merely shares this id, so it settles nothing here.
+        if database and recorded_db and recorded_db != str(database):
+            continue
+        _IN_MEMORY_SETTLED.add(key)
+        return True
     return False
 
 
-def _acquire_execution_lock(session_id: str, locks_dir: Optional[str] = None) -> bool:
-    """Acquire a transient execution lock for one bounded settlement attempt."""
-    if not session_id or session_id in _IN_MEMORY_EXECUTING:
+def _acquire_execution_lock(
+    session_id: str, locks_dir: Optional[str] = None, database: str = "",
+) -> bool:
+    """Acquire a transient execution lock for one bounded settlement attempt.
+
+    Scoped by owning database: a live finalize in one profile must not lock out
+    a different session that happens to carry the same id in another.
+    """
+    owner = _owner_hash(database)
+    lock_key = f"{session_id}-{owner}" if owner else session_id
+    if not session_id or lock_key in _IN_MEMORY_EXECUTING:
         return False
 
     target_dir = locks_dir or _memory_path("state", "locks")
     try:
         os.makedirs(target_dir, mode=0o770, exist_ok=True)
-        exec_file = posixpath.join(target_dir, f"{session_id}.executing")
+        exec_file = posixpath.join(target_dir, f"{lock_key}.executing")
         try:
             fd = os.open(exec_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o660)
             payload = json.dumps({
@@ -299,7 +370,7 @@ def _acquire_execution_lock(session_id: str, locks_dir: Optional[str] = None) ->
             })
             os.write(fd, payload.encode("utf-8"))
             os.close(fd)
-            _IN_MEMORY_EXECUTING.add(session_id)
+            _IN_MEMORY_EXECUTING.add(lock_key)
             return True
         except FileExistsError:
             try:
@@ -308,22 +379,26 @@ def _acquire_execution_lock(session_id: str, locks_dir: Optional[str] = None) ->
                     os.unlink(exec_file)
                     fd = os.open(exec_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o660)
                     os.close(fd)
-                    _IN_MEMORY_EXECUTING.add(session_id)
+                    _IN_MEMORY_EXECUTING.add(lock_key)
                     return True
             except OSError:
                 pass
             return False
     except OSError as exc:
         logger.debug("pz-memory-v1: transient lock creation failed (%s), relying on in-memory lock: %s", session_id, exc)
-        _IN_MEMORY_EXECUTING.add(session_id)
+        _IN_MEMORY_EXECUTING.add(lock_key)
         return True
 
 
-def _release_execution_lock(session_id: str, locks_dir: Optional[str] = None) -> None:
+def _release_execution_lock(
+    session_id: str, locks_dir: Optional[str] = None, database: str = "",
+) -> None:
     """Release transient execution lock."""
-    _IN_MEMORY_EXECUTING.discard(session_id)
+    owner = _owner_hash(database)
+    lock_key = f"{session_id}-{owner}" if owner else session_id
+    _IN_MEMORY_EXECUTING.discard(lock_key)
     target_dir = locks_dir or _memory_path("state", "locks")
-    exec_file = posixpath.join(target_dir, f"{session_id}.executing")
+    exec_file = posixpath.join(target_dir, f"{lock_key}.executing")
     try:
         os.unlink(exec_file)
     except OSError:
@@ -336,6 +411,7 @@ def _mark_durable_settlement(
     settlements_dir: Optional[str] = None,
     status: str = "completed",
     event_path: Optional[str] = None,
+    database: str = "",
 ) -> bool:
     """Persist the last successful semantic source for one session.
 
@@ -356,9 +432,10 @@ def _mark_durable_settlement(
             "status": status,
             "settled_at": now_iso,
             "event_path": event_path,
+            "database": str(database or ""),
         }
         raw = json.dumps(data, indent=2).encode("utf-8")
-        final_file = _settlement_destination(session_id, target_dir)
+        final_file = _settlement_destination(session_id, target_dir, database)
         tmp_file = f"{final_file}.{os.getpid()}.tmp"
         with open(tmp_file, "wb") as fh:
             fh.write(raw)
@@ -366,6 +443,8 @@ def _mark_durable_settlement(
             os.fsync(fh.fileno())
         os.chmod(tmp_file, 0o660)
         os.replace(tmp_file, final_file)
+        _IN_MEMORY_SETTLED.add(_settlement_key(session_id, source_sha, database))
+        # Also answer the owner-less question "was this exact content settled".
         _IN_MEMORY_SETTLED.add(_settlement_key(session_id, source_sha))
         return True
     except Exception as exc:
@@ -1230,11 +1309,16 @@ def _staged_event_path(session_id: str, source_sha: str) -> Optional[str]:
     settlement.  Re-summarizing would spend the provider again for a file that
     already exists, so the retry reuses it and only redoes the settlement.
     """
+    path = _deterministic_event_path(session_id, source_sha)
+    return path if os.path.isfile(path) else None
+
+
+def _deterministic_event_path(session_id: str, source_sha: str) -> str:
+    """The one outbox filename this (session, source) pair ever produces."""
     session_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
-    path = posixpath.join(
+    return posixpath.join(
         _memory_path("outbox", "events"), f"hermes-{session_hash}-{source_sha[:16]}.md",
     )
-    return path if os.path.isfile(path) else None
 
 
 def _settle_source(
@@ -1262,10 +1346,14 @@ def _settle_source(
     retry = _finalize_retry_module()
     base_dir = _memory_base_dir()
 
-    def _fail(reason_code: Optional[str], exc: Optional[BaseException], detail: str) -> bool:
+    def _fail(
+        reason_code: Optional[str], exc: Optional[BaseException], detail: str,
+        *, artifact_produced: Optional[bool] = None, event_path: Optional[str] = None,
+    ) -> bool:
         record = retry.record_failure(
             base_dir, session_id=session_id, source_sha=source_sha,
             profile=profile, database=database, exc=exc, reason_code=reason_code,
+            artifact_produced=artifact_produced, event_path=event_path,
         )
         logger.warning(
             "pz-memory-v1: %s for session %s; retry %s attempt %s/%s reason %s",
@@ -1275,7 +1363,20 @@ def _settle_source(
         _record_flush_health("blocked", f"{detail}:{record.get('reason_code', 'unknown')}")
         return False
 
+    record = retry.load_record(base_dir, session_id, source_sha, database)
     staged_path = _staged_event_path(session_id, source_sha)
+    if staged_path is None and record.get("artifact_produced"):
+        # The publisher already promoted the artifact and removed the staged
+        # copy.  Summarizing again would spend the provider a second time and
+        # publish the same session twice, so this attempt only owes a
+        # settlement for the artifact that already exists.
+        staged_path = str(record.get("event_path") or "") or _deterministic_event_path(
+            session_id, source_sha,
+        )
+        logger.info(
+            "pz-memory-v1: settling session %s against its already published artifact",
+            session_id,
+        )
     if staged_path is None:
         error_sink: dict[str, Any] = {}
         summary, provider, summarizer_model = _summarize_in_session_profile(
@@ -1284,8 +1385,10 @@ def _settle_source(
         if summary is None:
             return _fail(None, error_sink.get("exc"), "summarizer-failed")
         if summary.get("status") == "empty":
-            if _mark_durable_settlement(session_id, source_sha, status="validated-empty"):
-                retry.clear_record(base_dir, session_id, source_sha)
+            if _mark_durable_settlement(
+                session_id, source_sha, status="validated-empty", database=database,
+            ):
+                retry.clear_record(base_dir, session_id, source_sha, database)
                 _record_flush_health("ok", "no-memory")
                 return True
             # Nothing durable was written, so this is not a settled session.
@@ -1308,12 +1411,18 @@ def _settle_source(
 
     if _mark_durable_settlement(
         session_id, source_sha, status="staged-event", event_path=staged_path,
+        database=database,
     ):
         _clear_turn_checkpoints(session_id)
-        retry.clear_record(base_dir, session_id, source_sha)
+        retry.clear_record(base_dir, session_id, source_sha, database)
         _record_flush_health("ok")
         return True
-    return _fail("settlement-write", None, "settlement-write-failed")
+    # The artifact exists but the settlement does not.  Record both facts, so a
+    # retry settles it instead of producing the content a second time.
+    return _fail(
+        "settlement-write", None, "settlement-write-failed",
+        artifact_produced=True, event_path=staged_path,
+    )
 
 
 def _read_owned_session(
@@ -1359,8 +1468,8 @@ def _recover_one_finalize_retry(record: dict[str, Any]) -> str:
     database = str(record.get("database") or "")
     if not session_id or not source_sha:
         return "invalid-record"
-    if _is_source_settled(session_id, source_sha):
-        retry.clear_record(base_dir, session_id, source_sha)
+    if _is_source_settled(session_id, source_sha, database=database):
+        retry.clear_record(base_dir, session_id, source_sha, database)
         return "already-settled"
 
     metadata, export = _read_owned_session(database, session_id)
@@ -1376,12 +1485,17 @@ def _recover_one_finalize_retry(record: dict[str, Any]) -> str:
     if hashlib.sha256(transcript.encode("utf-8")).hexdigest() != source_sha:
         # The session moved on.  The newer source is a different digest with its
         # own boundary, so this record is obsolete rather than failed.
-        retry.clear_record(base_dir, session_id, source_sha)
+        retry.clear_record(base_dir, session_id, source_sha, database)
         return "superseded"
 
-    if not _acquire_execution_lock(session_id):
+    if not _acquire_execution_lock(session_id, database=database):
         return "locked"
     try:
+        # State can change between selecting this record and holding the lock:
+        # a live finalize may have settled this very source while we queued.
+        if _is_source_settled(session_id, source_sha, database=database):
+            retry.clear_record(base_dir, session_id, source_sha, database)
+            return "already-settled"
         settled = _settle_source(
             session_id=session_id,
             transcript=transcript,
@@ -1389,7 +1503,11 @@ def _recover_one_finalize_retry(record: dict[str, Any]) -> str:
             model=model,
             task_id=task_id,
             redactions=redactions,
-            hook_event="finalize_retry",
+            # ``checkpoint_recovery`` is the event contract's name for a
+            # promotion a bounded recovery had to make; a name of its own would
+            # be rejected by the parser and never publish.  Recovery stays
+            # distinguishable through its evidence provenance.
+            hook_event="checkpoint_recovery",
             receipt=None,
             profile=str(record.get("profile") or ""),
             database=database,
@@ -1397,7 +1515,7 @@ def _recover_one_finalize_retry(record: dict[str, Any]) -> str:
             provenance_override="hermes-retry-recovery",
         )
     finally:
-        _release_execution_lock(session_id)
+        _release_execution_lock(session_id, database=database)
     return "settled" if settled else "failed"
 
 
@@ -1416,13 +1534,20 @@ def run_due_finalize_retries(
     outcomes: dict[str, int] = {}
     try:
         retry = _finalize_retry_module()
-        for record in retry.due_records(_memory_base_dir(), now=now, limit=limit):
+        attempted = 0
+        for record in retry.due_records(
+            _memory_base_dir(), now=now, limit=MAX_RETRY_SCAN_PER_RUN,
+        ):
+            if attempted >= limit:
+                break
             try:
                 outcome = _recover_one_finalize_retry(record)
             except Exception as exc:
                 logger.warning("pz-memory-v1: finalize retry attempt failed: %s", exc)
                 outcome = "error"
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            if outcome not in RETRY_SKIP_OUTCOMES:
+                attempted += 1
     finally:
         with _RETRY_TRIGGER_LOCK:
             _RETRY_RUN_IN_PROGRESS = False
@@ -1438,6 +1563,50 @@ def _finalize_retry_worker(trigger: str) -> None:
             )
     except Exception as exc:
         logger.warning("pz-memory-v1: finalize retry run failed: %s", exc)
+
+
+def _retry_watchdog_loop() -> None:
+    """Move due records forward in a process no session event ever reaches.
+
+    Waits first, so plugin registration itself never touches the provider.
+    """
+    while not _RETRY_WATCHDOG_STOP.wait(RETRY_WATCHDOG_INTERVAL_SECONDS):
+        try:
+            run_due_finalize_retries()
+        except Exception as exc:
+            logger.warning("pz-memory-v1: finalize retry watchdog run failed: %s", exc)
+
+
+def _retry_watchdog_enabled() -> bool:
+    """Only long-lived surfaces run the watchdog.
+
+    A one-shot CLI invocation would gain nothing from a timer thread, so this
+    stays off unless the deployment says the process is a lasting one (the
+    dashboard and Telegram units already set ``PZ_HERMES_USER_SURFACE``) or an
+    operator asks for it explicitly.
+    """
+    if os.environ.get("PZ_MEMORY_FINALIZE_RETRY", "1").strip().lower() in {"0", "false", "no"}:
+        return False
+    explicit = os.environ.get("PZ_MEMORY_RETRY_WATCHDOG", "").strip().lower()
+    if explicit in {"1", "true", "yes"}:
+        return True
+    if explicit in {"0", "false", "no"}:
+        return False
+    return os.environ.get("PZ_HERMES_USER_SURFACE", "").strip() == "1"
+
+
+def _maybe_start_retry_watchdog() -> None:
+    global _RETRY_WATCHDOG_STARTED
+
+    if _RETRY_WATCHDOG_STARTED or not _retry_watchdog_enabled():
+        return
+    try:
+        threading.Thread(
+            target=_retry_watchdog_loop, name="pz-memory-retry-watchdog", daemon=True,
+        ).start()
+        _RETRY_WATCHDOG_STARTED = True
+    except Exception as exc:
+        logger.warning("pz-memory-v1: could not start finalize retry watchdog: %s", exc)
 
 
 def _maybe_trigger_finalize_retries(trigger: str) -> None:
@@ -1470,13 +1639,51 @@ def _maybe_trigger_finalize_retries(trigger: str) -> None:
         logger.warning("pz-memory-v1: could not start finalize retry run: %s", exc)
 
 
-def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
-    if _is_internal_call():
-        logger.debug("pz-memory-v1: ignoring internal recursive call")
-        return
+def _defer_lifecycle_event(event_name: str, session_id: str) -> None:
+    """Handle a lifecycle event that arrived while this process was summarizing.
 
+    The guard exists to stop the summarizer's own call from re-entering the
+    semantic path.  Returning outright also cost the live session its raw turn
+    and, for a finalize, any record that it still needs settling.  Both halves
+    below are provider-free, so neither can recurse.
+    """
+    if event_name not in {"on_session_end", "on_session_finalize"}:
+        return
+    try:
+        transcript, model, task_id, redactions = _get_session_transcript(session_id)
+        if not transcript:
+            return
+        turn = _last_completed_turn(transcript)
+        if turn:
+            _stage_completed_turn_checkpoint(session_id, turn, model, task_id, redactions)
+        if event_name != "on_session_finalize":
+            return
+        source_sha = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+        owning_db = _SESSION_DB_PATHS.get(session_id)
+        database = str(owning_db) if owning_db is not None else ""
+        if _is_source_settled(session_id, source_sha, database=database):
+            return
+        _finalize_retry_module().record_failure(
+            _memory_base_dir(), session_id=session_id, source_sha=source_sha,
+            profile=owning_db.parent.name if owning_db is not None else "",
+            database=database, reason_code="guard-deferred",
+        )
+        logger.info(
+            "pz-memory-v1: finalize for %s deferred to recovery by the internal-call guard",
+            session_id,
+        )
+    except Exception as exc:
+        logger.warning("pz-memory-v1: failed to defer lifecycle event: %s", exc)
+
+
+def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
     session_id = kwargs.get("session_id")
     if not session_id or not isinstance(session_id, str):
+        return
+
+    if _is_internal_call():
+        logger.debug("pz-memory-v1: internal call in progress; deferring %s", event_name)
+        _defer_lifecycle_event(event_name, session_id)
         return
 
     # Record unforgeable lifecycle receipt immediately at registered callback entry
@@ -1505,14 +1712,17 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
     # this callback is a genuine terminal boundary.  Its identity is the
     # current normalized source digest, never the whole session ID.
     source_sha = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
-    if _is_source_settled(session_id, source_sha):
+    owning_db = _SESSION_DB_PATHS.get(session_id)
+    owning_database = str(owning_db) if owning_db is not None else ""
+    if _is_source_settled(session_id, source_sha, database=owning_database):
         logger.debug("pz-memory-v1: source %s already settled", source_sha[:16])
-        _finalize_retry_module().clear_record(_memory_base_dir(), session_id, source_sha)
+        _finalize_retry_module().clear_record(
+            _memory_base_dir(), session_id, source_sha, owning_database,
+        )
         return
-    if not _acquire_execution_lock(session_id):
+    if not _acquire_execution_lock(session_id, database=owning_database):
         logger.debug("pz-memory-v1: session %s already executing in another task/thread", session_id)
         return
-    owning_db = _SESSION_DB_PATHS.get(session_id)
     try:
         # ``model`` is the model the session ran on; the summarizer reports its own.
         _settle_source(
@@ -1525,10 +1735,10 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
             hook_event="session_finalize",
             receipt=receipt,
             profile=owning_db.parent.name if owning_db is not None else "",
-            database=str(owning_db) if owning_db is not None else "",
+            database=owning_database,
         )
     finally:
-        _release_execution_lock(session_id)
+        _release_execution_lock(session_id, database=owning_database)
 
 
 def on_session_start(**kwargs: Any) -> None:
@@ -1774,4 +1984,6 @@ def register(ctx: Any) -> None:
         _discover_final_turn_checkpoints()
     except Exception as exc:
         logger.warning("pz-memory-v1: native plugin-startup discovery degraded: %s", exc)
+    # Provider-free at registration: the watchdog's first act is to wait.
+    _maybe_start_retry_watchdog()
     logger.info("pz-memory-v1 plugin registered lifecycle hooks and raw startup discovery")

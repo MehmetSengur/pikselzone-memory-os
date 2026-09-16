@@ -302,6 +302,7 @@ def _hermes_finalize_rows(config: MemoryConfig) -> list[dict[str, str]]:
     )]
     backlog_detail = (
         f"unresolved_sessions={metrics['unresolved_sessions']};"
+        f"stale_after_settlement={metrics['stale_after_settlement']};"
         f"sessions_with_checkpoints={metrics['sessions_with_checkpoints']};"
         f"settled={metrics['settled_sessions']};"
         f"retry_tracked={metrics['retry_tracked_sessions']}"

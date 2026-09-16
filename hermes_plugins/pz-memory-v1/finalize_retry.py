@@ -46,6 +46,16 @@ MAX_ATTEMPTS = 5
 BASE_BACKOFF_SECONDS = 300
 MAX_BACKOFF_SECONDS = 6 * 3600
 
+#: A subscription quota window routinely outlives the generic schedule -- the
+#: observed production failure reset in about an hour, but a daily plan limit
+#: does not.  Five short attempts would exhaust in under three hours and
+#: abandon the session for a reason we know is temporary, so a quota failure
+#: gets its own longer, still bounded horizon.
+QUOTA_REASONS = frozenset({"usage-limit"})
+QUOTA_MAX_ATTEMPTS = 8
+QUOTA_BASE_BACKOFF_SECONDS = 3600
+QUOTA_MAX_BACKOFF_SECONDS = 24 * 3600
+
 STATUS_SCHEDULED = "retry-scheduled"
 STATUS_EXHAUSTED = "retry-exhausted"
 STATUS_PERMANENT = "permanent"
@@ -55,7 +65,10 @@ CLASSIFICATION_RETRYABLE = "retryable"
 CLASSIFICATION_PERMANENT = "permanent"
 CLASSIFICATION_UNKNOWN = "unknown"
 
-RECORD_NAME_RE = re.compile(r"^hermes-(?P<session>[0-9a-f]{32})-(?P<source>[0-9a-f]{16})\.json$")
+RECORD_NAME_RE = re.compile(
+    r"^hermes-(?P<session>[0-9a-f]{32})(?:-(?P<owner>[0-9a-f]{8}))?"
+    r"-(?P<source>[0-9a-f]{16})\.json$"
+)
 
 # Ordered most specific first: the first pattern that matches decides both the
 # reason code and, through _REASON_CLASSIFICATION, whether a retry is allowed.
@@ -81,6 +94,9 @@ _REASON_CLASSIFICATION: dict[str, str] = {
     # A settlement or outbox write that failed is local I/O, not provider state.
     "settlement-write": CLASSIFICATION_RETRYABLE,
     "stage-write": CLASSIFICATION_RETRYABLE,
+    # A finalize that arrived while this process was inside its own summarizer
+    # call.  Nothing is wrong with the session; it just needs a later attempt.
+    "guard-deferred": CLASSIFICATION_RETRYABLE,
     "trust-denied": CLASSIFICATION_PERMANENT,
     "auth": CLASSIFICATION_PERMANENT,
     "schema": CLASSIFICATION_PERMANENT,
@@ -98,10 +114,24 @@ def _session_hash(session_id: str) -> str:
     return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
 
 
-def record_path(base_dir: str, session_id: str, source_sha: str) -> str:
-    """Digest-scoped record path, mirroring the settlement naming scheme."""
+def owner_hash(database: str) -> str:
+    """Short, stable identity for the SessionDB that owns a session.
+
+    Two profiles can hold rows with the same session id.  Without this the
+    record for one of them would silently overwrite the other's.
+    """
+    if not database:
+        return ""
+    return hashlib.sha256(str(database).encode("utf-8")).hexdigest()[:8]
+
+
+def record_path(base_dir: str, session_id: str, source_sha: str, database: str = "") -> str:
+    """Record path scoped to owner and source digest."""
+    owner = owner_hash(database)
+    suffix = f"-{owner}" if owner else ""
     return posixpath.join(
-        retry_dir(base_dir), f"hermes-{_session_hash(session_id)}-{source_sha[:16]}.json"
+        retry_dir(base_dir),
+        f"hermes-{_session_hash(session_id)}{suffix}-{source_sha[:16]}.json",
     )
 
 
@@ -126,9 +156,17 @@ def classify_failure(
     return CLASSIFICATION_UNKNOWN, "unknown"
 
 
-def _backoff_seconds(attempts: int) -> int:
+def schedule_for(reason_code: str) -> tuple[int, int, int]:
+    """Return ``(max_attempts, base_backoff, max_backoff)`` for one reason."""
+    if reason_code in QUOTA_REASONS:
+        return QUOTA_MAX_ATTEMPTS, QUOTA_BASE_BACKOFF_SECONDS, QUOTA_MAX_BACKOFF_SECONDS
+    return MAX_ATTEMPTS, BASE_BACKOFF_SECONDS, MAX_BACKOFF_SECONDS
+
+
+def _backoff_seconds(attempts: int, base: int = BASE_BACKOFF_SECONDS,
+                     cap: int = MAX_BACKOFF_SECONDS) -> int:
     exponent = max(0, min(attempts - 1, 16))
-    return min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * (2 ** exponent))
+    return min(cap, base * (2 ** exponent))
 
 
 def parse_iso(value: Any) -> Optional[dt.datetime]:
@@ -155,8 +193,10 @@ def _read_record(path: str) -> dict[str, Any]:
     return value
 
 
-def load_record(base_dir: str, session_id: str, source_sha: str) -> dict[str, Any]:
-    return _read_record(record_path(base_dir, session_id, source_sha))
+def load_record(
+    base_dir: str, session_id: str, source_sha: str, database: str = "",
+) -> dict[str, Any]:
+    return _read_record(record_path(base_dir, session_id, source_sha, database))
 
 
 def _write_record(path: str, state: dict[str, Any]) -> bool:
@@ -188,6 +228,9 @@ def record_failure(
     database: str = "",
     exc: Optional[BaseException] = None,
     reason_code: Optional[str] = None,
+    artifact_produced: Optional[bool] = None,
+    event_path: Optional[str] = None,
+    event_sha256: Optional[str] = None,
     now: Optional[dt.datetime] = None,
 ) -> dict[str, Any]:
     """Persist one bounded failure observation and return the new record.
@@ -197,23 +240,26 @@ def record_failure(
     """
     if not session_id or not source_sha:
         return {}
-    path = record_path(base_dir, session_id, source_sha)
+    path = record_path(base_dir, session_id, source_sha, database)
     previous = _read_record(path)
     classification, code = classify_failure(exc, reason_code)
     attempts = int(previous.get("attempts") or 0) + 1
     moment = now or dt.datetime.now().astimezone()
+    max_attempts, base_backoff, backoff_cap = schedule_for(code)
 
     if classification == CLASSIFICATION_PERMANENT:
         status, next_attempt_after = STATUS_PERMANENT, None
     elif classification == CLASSIFICATION_UNKNOWN:
         # Held for an operator: visible in doctor, never retried on its own.
         status, next_attempt_after = STATUS_HOLD, None
-    elif attempts >= MAX_ATTEMPTS:
+    elif attempts >= max_attempts:
         status, next_attempt_after = STATUS_EXHAUSTED, None
     else:
         status = STATUS_SCHEDULED
         next_attempt_after = (
-            moment + dt.timedelta(seconds=_backoff_seconds(attempts))
+            moment + dt.timedelta(
+                seconds=_backoff_seconds(attempts, base_backoff, backoff_cap)
+            )
         ).isoformat(timespec="seconds")
 
     state = {
@@ -226,7 +272,7 @@ def record_failure(
         "profile": profile or str(previous.get("profile") or ""),
         "database": database or str(previous.get("database") or ""),
         "attempts": attempts,
-        "max_attempts": MAX_ATTEMPTS,
+        "max_attempts": max_attempts,
         "classification": classification,
         "status": status,
         # Deliberately no raw provider message: it can carry transcript text,
@@ -236,19 +282,36 @@ def record_failure(
         "first_failure_at": previous.get("first_failure_at") or moment.isoformat(timespec="seconds"),
         "last_failure_at": moment.isoformat(timespec="seconds"),
         "next_attempt_after": next_attempt_after,
+        # Whether the content artifact for this source already exists.  Once it
+        # does, a retry must settle rather than summarize and publish again --
+        # the publisher may have already taken the staged file away.
+        "artifact_produced": bool(
+            previous.get("artifact_produced") if artifact_produced is None else artifact_produced
+        ),
+        "event_path": event_path if event_path is not None else previous.get("event_path"),
+        "event_sha256": (
+            event_sha256 if event_sha256 is not None else previous.get("event_sha256")
+        ),
     }
     _write_record(path, state)
     return state
 
 
-def clear_record(base_dir: str, session_id: str, source_sha: str) -> None:
+def clear_record(
+    base_dir: str, session_id: str, source_sha: str, database: str = "",
+) -> None:
     """Drop the sidecar once this source digest is settled one way or another."""
     if not session_id or not source_sha:
         return
-    try:
-        os.unlink(record_path(base_dir, session_id, source_sha))
-    except OSError:
-        pass
+    candidates = [record_path(base_dir, session_id, source_sha, database)]
+    if database:
+        # Also drop a record written before this session's owner was known.
+        candidates.append(record_path(base_dir, session_id, source_sha))
+    for candidate in candidates:
+        try:
+            os.unlink(candidate)
+        except OSError:
+            pass
 
 
 def iter_records(base_dir: str) -> list[dict[str, Any]]:
@@ -286,7 +349,7 @@ def is_due(record: dict[str, Any], *, now: Optional[dt.datetime] = None) -> bool
     """Only a scheduled record whose backoff has elapsed is due."""
     if not record or record.get("status") != STATUS_SCHEDULED:
         return False
-    if int(record.get("attempts") or 0) >= MAX_ATTEMPTS:
+    if int(record.get("attempts") or 0) >= int(record.get("max_attempts") or MAX_ATTEMPTS):
         return False
     scheduled_for = parse_iso(record.get("next_attempt_after"))
     if scheduled_for is None:

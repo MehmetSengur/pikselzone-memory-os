@@ -2,9 +2,10 @@
 """Read-only inventory of the native Hermes finalize backlog.
 
 Reports what the plugin has left unfinished: bounded retry records waiting on
-backoff, records held for an operator, and legacy sessions whose raw turn
-checkpoints predate the retry contract and are therefore accounted for by
-nothing at all.
+backoff, records held for an operator, and sessions whose raw turn checkpoints
+nothing accounts for -- either because they predate the retry contract, or
+because their settlement is older than their newest checkpoint and therefore
+cannot cover it.
 
 This script never calls a provider, never drains, replays, deletes or archives
 anything, and never writes to the runtime state it inspects.  Adopting a legacy
@@ -66,15 +67,24 @@ def collect(config: MemoryConfig) -> dict:
             )
         })
 
-    # Legacy sessions: raw checkpoints preserved, but no settlement and no
-    # retry record.  Report the oldest observation so an operator can judge age.
-    settled = {
-        record.get("session_id") for record in _scan(state / "settlements", SETTLEMENT_SCHEMA)
-    }
+    # Unresolved sessions: raw checkpoints preserved, but nothing accounts for
+    # them -- either no settlement and no retry record at all, or a settlement
+    # that predates their newest checkpoint and therefore cannot cover it.
+    settled: set = set()
+    settled_at: dict[str, str] = {}
+    for record in _scan(state / "settlements", SETTLEMENT_SCHEMA):
+        session_id = record.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        settled.add(session_id)
+        moment = str(record.get("settled_at") or "")
+        if moment > settled_at.get(session_id, ""):
+            settled_at[session_id] = moment
     tracked = {
         record.get("session_id") for record in _scan(state / "finalize-retry", FINALIZE_RETRY_SCHEMA)
     }
     observed: dict[str, str] = {}
+    newest: dict[str, str] = {}
     turns: dict[str, int] = {}
     for record in _scan(state / "checkpoints", CHECKPOINT_SCHEMA):
         session_id = record.get("session_id")
@@ -84,11 +94,24 @@ def collect(config: MemoryConfig) -> dict:
         seen_at = str(record.get("observed_at") or "")
         if session_id not in observed or seen_at < observed[session_id]:
             observed[session_id] = seen_at
-    for session_id in sorted(set(observed) - settled - tracked):
+        if seen_at > newest.get(session_id, ""):
+            newest[session_id] = seen_at
+
+    untracked = set(observed) - tracked
+    stale = {
+        session_id for session_id in untracked & settled
+        if newest.get(session_id, "") > settled_at.get(session_id, "")
+    }
+    for session_id in sorted((untracked - settled) | stale):
         inventory["unresolved_sessions"].append({
             "session_id": session_id,
             "turn_checkpoints": turns.get(session_id, 0),
             "first_observed_at": observed.get(session_id, ""),
+            "newest_checkpoint_at": newest.get(session_id, ""),
+            "reason": (
+                "checkpoint-newer-than-settlement" if session_id in stale
+                else "no-settlement-no-retry-record"
+            ),
         })
     return inventory
 
@@ -124,11 +147,14 @@ def main(argv: list[str] | None = None) -> int:
         f"Sessions with raw checkpoints: {metrics['sessions_with_checkpoints']} "
         f"(settled={metrics['settled_sessions']}, retry-tracked={metrics['retry_tracked_sessions']})"
     )
-    print(f"Unresolved legacy sessions: {metrics['unresolved_sessions']}")
+    print(
+        f"Unresolved sessions: {metrics['unresolved_sessions']} "
+        f"(of which newer than their settlement: {metrics['stale_after_settlement']})"
+    )
     for entry in inventory["unresolved_sessions"]:
         print(
             f"  - {entry['session_id']} turns={entry['turn_checkpoints']} "
-            f"first_observed={entry['first_observed_at']}"
+            f"first_observed={entry['first_observed_at']} reason={entry['reason']}"
         )
     print("\nRead-only inspection. Nothing was drained, replayed, deleted or archived.")
     return 0

@@ -124,7 +124,7 @@ class FinalizeRetryStateTests(unittest.TestCase):
         for attempt in range(1, self.retry.MAX_ATTEMPTS + 1):
             record = self.retry.record_failure(
                 self.base, session_id="s4", source_sha="e" * 64,
-                exc=USAGE_LIMIT_ERROR, now=now,
+                exc=TimeoutError("request timed out"), now=now,
             )
             self.assertEqual(record["attempts"], attempt)
             scheduled = self.retry.parse_iso(record["next_attempt_after"])
@@ -163,8 +163,12 @@ class FinalizeRetryStateTests(unittest.TestCase):
         self.assertEqual(len(due), 2)
 
 
-class HermesFinalizeRecoveryTests(unittest.TestCase):
-    """The live plugin path: failure is recorded, and recovery settles it once."""
+class HermesPluginFixture:
+    """Disposable Hermes runtime: fake SessionDB, profiles, PluginLlm and config.
+
+    Shared with the review-findings regressions so both suites drive the same
+    plugin surface instead of two drifting copies of it.
+    """
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="pz-finalize-recovery-")
@@ -288,8 +292,11 @@ class HermesFinalizeRecoveryTests(unittest.TestCase):
         })
 
     def _settlement_path(self, session_id: str) -> Path:
+        """The settlement for a session, whichever owner wrote it."""
         digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
-        return self.state / "settlements" / f"hermes-{digest}.json"
+        directory = self.state / "settlements"
+        matches = sorted(directory.glob(f"hermes-{digest}*.json"))
+        return matches[0] if matches else directory / f"hermes-{digest}.json"
 
     def _source_sha(self, messages=None) -> str:
         items = messages if messages is not None else self.messages
@@ -308,6 +315,22 @@ class HermesFinalizeRecoveryTests(unittest.TestCase):
 
     def _events(self) -> list[Path]:
         return sorted((self.base / "outbox" / "events").glob("*.md"))
+
+    def _config(self) -> MemoryConfig:
+        return MemoryConfig.from_dict({
+            "role": "memory-engine",
+            "vault_path": str(self.vault),
+            "state_path": str(self.engine_state),
+            "runtimes": ["hermes"],
+            "transcript_roots": {"hermes": [str(self.hermes_data)]},
+            "can_write_event_memory": True,
+            "can_run_compiler": True,
+            "provider": {"mode": "runtime-native"},
+        })
+
+
+class HermesFinalizeRecoveryTests(HermesPluginFixture, unittest.TestCase):
+    """The live plugin path: failure is recorded, and recovery settles it once."""
 
     # -- tests ------------------------------------------------------------
     def test_transient_failure_is_recorded_then_recovered_when_due(self) -> None:
@@ -355,7 +378,7 @@ class HermesFinalizeRecoveryTests(unittest.TestCase):
         self.assertEqual(evidence["status"], "unverified")
         self.assertNotIn("lifecycle_receipt", evidence)
         event_text = self._events()[0].read_text(encoding="utf-8")
-        self.assertIn('event: "finalize_retry"', event_text)
+        self.assertIn('event: "checkpoint_recovery"', event_text)
 
     def test_reopened_session_is_left_to_its_own_boundary(self) -> None:
         with self._runtime(raises=USAGE_LIMIT_ERROR), mock.patch.dict(os.environ, self.env):
@@ -423,13 +446,16 @@ class HermesFinalizeRecoveryTests(unittest.TestCase):
             self.plugin.on_session_finalize(session_id=self.session_id)
 
         later = dt.datetime.now().astimezone() + dt.timedelta(hours=2)
+        owning_db = self._retry_records()[0]["database"]
         with mock.patch.dict(os.environ, self.env):
-            self.assertTrue(self.plugin._acquire_execution_lock(self.session_id))
+            self.assertTrue(
+                self.plugin._acquire_execution_lock(self.session_id, database=owning_db)
+            )
             try:
                 with self._runtime():
                     result = self.plugin.run_due_finalize_retries(now=later)
             finally:
-                self.plugin._release_execution_lock(self.session_id)
+                self.plugin._release_execution_lock(self.session_id, database=owning_db)
 
         self.assertEqual(result["outcomes"], {"locked": 1})
         self.assertEqual(self._events(), [])
@@ -540,18 +566,6 @@ class HermesFinalizeRecoveryTests(unittest.TestCase):
         self.assertEqual(len(self._retry_records()), 1)
 
     # -- doctor visibility -------------------------------------------------
-    def _config(self) -> MemoryConfig:
-        return MemoryConfig.from_dict({
-            "role": "memory-engine",
-            "vault_path": str(self.vault),
-            "state_path": str(self.engine_state),
-            "runtimes": ["hermes"],
-            "transcript_roots": {"hermes": [str(self.hermes_data)]},
-            "can_write_event_memory": True,
-            "can_run_compiler": True,
-            "provider": {"mode": "runtime-native"},
-        })
-
     def test_doctor_reports_retry_state_and_legacy_backlog_separately(self) -> None:
         # One failed session under the new contract.
         with self._runtime(raises=USAGE_LIMIT_ERROR), mock.patch.dict(os.environ, self.env):

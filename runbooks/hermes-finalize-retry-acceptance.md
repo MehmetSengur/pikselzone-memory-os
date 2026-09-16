@@ -17,9 +17,13 @@ retried it: startup discovery is provider-free by design and
 `_recover_pending_turn_checkpoints` has no caller, so a session whose `ended_at`
 was already stamped never got another finalize callback. Now every finalize
 failure writes a bounded, digest-scoped retry record, and a bounded recovery run
-— triggered from `on_session_start`, `on_session_end` and, where a Kanban
-dispatcher runs, `on_kanban_dispatch_tick` — re-attempts the due ones inside the
-owning profile.
+— triggered from `on_session_start`, `on_session_end`, a slow watchdog on
+long-lived surfaces, and `on_kanban_dispatch_tick` where a Kanban dispatcher
+runs — re-attempts the due ones inside the owning profile. A recovered session
+is promoted as the contract's `checkpoint_recovery` event and stays
+distinguishable through its evidence provenance. Records, locks and settlements
+are scoped by the owning SessionDB, so two profiles holding the same session id
+never share them.
 
 ## Preconditions
 
@@ -84,9 +88,12 @@ ssh pz-contabo 'S=/srv/pz-hermes/hermes-data/memory-v1/state; \
   ls -la $S/finalize-retry/ && cat $S/finalize-retry/*.json && ls -la $S/checkpoints/'
 ```
 
-  Expected: `classification=retryable`, `status=retry-scheduled`, `attempts=1`,
-  a `next_attempt_after` roughly five minutes out, `reason_code=usage-limit` for
-  a quota error, and no raw provider message in the record.
+  Expected: `classification=retryable`, `status=retry-scheduled`, `attempts=1`
+  and no raw provider message in the record. A quota error
+  (`reason_code=usage-limit`) is scheduled about an hour out and gets up to
+  eight attempts across a day, because a plan limit routinely outlives the
+  generic five-attempt horizon; other transient failures keep the shorter
+  five-minute, five-attempt schedule.
 
 * After the backoff has elapsed, the next session start or session end in that
   Hermes process runs the recovery. Confirm the outcome in the profile log:
@@ -97,18 +104,27 @@ ssh pz-contabo 'grep -E "finalize retry run" /srv/pz-hermes/hermes-data/profiles
 
 * Confirm the recovered artifact is marked as recovery, not as a native
   finalize: its outbox evidence carries `provenance=hermes-retry-recovery` and
-  `status=unverified`. The original native finalize receipt is untouched, and no
-  receipt is manufactured for the recovery.
+  `status=unverified`, while the artifact itself declares the contract event
+  `checkpoint_recovery` so the publisher can promote it. The original native
+  finalize receipt is untouched, and no receipt is manufactured for the
+  recovery. Confirm the publisher reports `published`, not `error`.
 
-### The gap this does not close
+### Progress without a session, and what is still not covered
 
-Recovery runs inside the Hermes process. If a retry becomes due and **no**
-session starts or ends, and no Kanban dispatcher tick fires, the work waits. It
-is not lost and not silently dropped: the record stays on disk and
-`pz-memory doctor` reports it as `hermes_finalize_retry scheduled=N`. Closing
-that gap needs an out-of-process trigger — a timer that drives a bounded Hermes
-invocation — which is a deployment change and deliberately not part of this
-work.
+A quota can reset long after the last session of the day ended, so recovery no
+longer depends on a session event arriving. In a long-lived process the plugin
+runs a watchdog that wakes every 15 minutes and processes whatever is due. It
+is enabled where the deployment already marks a lasting surface
+(`PZ_HERMES_USER_SURFACE=1`, which the dashboard and Telegram units set), or
+explicitly with `PZ_MEMORY_RETRY_WATCHDOG=1`. A one-shot CLI invocation never
+starts it.
+
+What remains outside this work: if every Hermes process is stopped, nothing
+runs at all, and the due record simply waits for the next start. It is not lost
+and not silently dropped — the record stays on disk and `pz-memory doctor`
+reports it as `hermes_finalize_retry scheduled=N`. A trigger that survives the
+runtime being down would be a systemd timer driving a bounded Hermes
+invocation: a deployment change, deliberately not part of this commit.
 
 ## 3. Doctor rows
 
@@ -118,7 +134,9 @@ ssh pz-contabo 'runuser -u pzhermes -- /srv/pz-hermes/memory-os/scripts/pz-memor
 
 * `hermes_finalize_retry` — `scheduled/hold/permanent/exhausted`. Warn-only.
 * `hermes_finalize_backlog` — sessions whose raw checkpoints have neither a
-  settlement nor a retry record. Warn-only.
+  settlement nor a retry record, plus `stale_after_settlement`: sessions whose
+  newest checkpoint is *newer* than their settlement, which therefore cannot
+  account for it. Warn-only.
 * `health_flush-hermes` — still the **last** flush result only. A healthy value
   here no longer means there is no backlog; that is what the two rows above are
   for.
@@ -164,5 +182,7 @@ The change is two plugin files, two engine files and the pinned baseline.
    parity check lines up with the restored plugin again.
 
 A faster mitigation that needs no rollback: set
-`PZ_MEMORY_FINALIZE_RETRY=0` in the service environment. Failures are still
-recorded and still visible in doctor, but no automatic recovery run starts.
+`PZ_MEMORY_FINALIZE_RETRY=0` in the service environment, which stops both the
+lifecycle triggers and the watchdog. Failures are still recorded and still
+visible in doctor, but no automatic recovery run starts. To keep the triggers
+and drop only the timer, set `PZ_MEMORY_RETRY_WATCHDOG=0`.
