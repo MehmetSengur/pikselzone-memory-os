@@ -26,8 +26,11 @@ Invariants:
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import re
+import shutil
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -110,20 +113,35 @@ TRANSIENT_MARKERS = (
 )
 
 
+#: Checked before the transport gate.  ``validate_summary`` raises these when
+#: the *summarizer's own output* is malformed or directive-shaped; the stored
+#: checkpoint is intact and a resample routinely succeeds.  Calling them
+#: permanent stranded whole threads on a single unlucky generation -- two live
+#: sessions were stuck this way on ``summary-learnings-directive-shaped`` and
+#: ``summary-important_conversations-directive-shaped``.
+PROVIDER_OUTPUT_MARKERS = (
+    "summary-",
+    "memory-summary-empty",
+    "empty-summary-has-content",
+)
+
+
 def classify_drain_failure(exc: BaseException) -> str:
     """Return ``"retryable"`` or ``"permanent"`` for a failed drain.
 
-    Only :class:`ProviderBlocked`-shaped transport failures are retryable.
-    Schema, policy and configuration errors describe malformed or unsafe input
-    and are permanent by construction: retrying them cannot change the outcome
-    and would burn the bounded attempt budget of a checkpoint that may still be
-    repairable by hand.
+    Transport failures and rejected *summarizer output* are retryable.  Schema,
+    policy and configuration errors that describe the stored input are permanent
+    by construction: retrying them cannot change the outcome and would burn the
+    bounded attempt budget of a checkpoint that may still be repairable by hand.
     """
     from .core import ProviderBlocked
 
     reason = str(exc)
     if any(marker in reason for marker in PERMANENT_MARKERS):
         return "permanent"
+    if any(reason.startswith(marker) for marker in PROVIDER_OUTPUT_MARKERS):
+        # The model, not the checkpoint, produced something unusable.
+        return "retryable"
     if not isinstance(exc, ProviderBlocked):
         return "permanent"
     if any(marker in reason for marker in TRANSIENT_MARKERS):
@@ -146,6 +164,33 @@ def retry_state_path(config: MemoryConfig, queue_path: Path) -> Path | None:
     if not CHECKPOINT_NAME_RE.match(queue_path.name):
         return None
     return retry_dir(config) / queue_path.name
+
+
+def turn_batch_key(names: Iterable[str]) -> str:
+    """Content identity of a turn batch, derived from checkpoint file names.
+
+    A turn checkpoint's name token is a digest of the turn it holds, so the
+    sorted set of a session's pending turn file names identifies exactly the
+    content a batch drain would send.  Deriving it from names alone means the
+    5-second startup hook never has to open a checkpoint to decide whether a
+    recorded verdict still applies.
+    """
+    unique = sorted({name for name in names if isinstance(name, str) and name})
+    return hashlib.sha256("\n".join(unique).encode("utf-8")).hexdigest()
+
+
+def pending_turn_batch_key(
+    config: MemoryConfig, *, runtime: str, session_key_value: str
+) -> str:
+    """``turn_batch_key`` for whatever this session currently has pending."""
+    pending = config.state_path / "queue" / "pending"
+    if not pending.is_dir():
+        return turn_batch_key(())
+    prefix = f"{runtime}-{session_key_value}-"
+    return turn_batch_key(
+        path.name for path in pending.glob(f"{prefix}*.json")
+        if "-turn_complete-" in path.name and path.is_file()
+    )
 
 
 def load_retry_state(config: MemoryConfig, queue_path: Path) -> dict[str, Any]:
@@ -179,15 +224,25 @@ def _parse_iso(value: Any) -> dt.datetime | None:
 
 
 def record_drain_failure(
-    config: MemoryConfig, queue_path: Path, exc: BaseException
+    config: MemoryConfig, queue_path: Path, exc: BaseException, *,
+    batch_key: str | None = None,
 ) -> dict[str, Any]:
-    """Persist one bounded failure observation and return the new state."""
+    """Persist one bounded failure observation and return the new state.
+
+    ``batch_key`` binds the verdict to the *content* a turn batch drain tried,
+    not to the representative file it was recorded on.  Without it a permanent
+    verdict written on a session's oldest turn silenced that session forever,
+    including every turn the user produced afterwards.
+    """
     path = retry_state_path(config, queue_path)
     if path is None:
         return {}
     match = CHECKPOINT_NAME_RE.match(queue_path.name)
     assert match is not None  # guaranteed by retry_state_path
     previous = load_retry_state(config, queue_path)
+    if batch_key is not None and previous.get("batch_key") not in (None, batch_key):
+        # A different batch: its attempt budget and history are its own.
+        previous = {}
     classification = classify_drain_failure(exc)
     attempts = int(previous.get("attempts") or 0) + 1
     now = dt.datetime.now().astimezone()
@@ -205,6 +260,7 @@ def record_drain_failure(
     state = {
         "schema": RETRY_SCHEMA,
         "checkpoint_id": queue_path.name,
+        "batch_key": batch_key,
         "runtime": match.group("runtime"),
         "session_key": match.group("session_key"),
         "event": match.group("event"),
@@ -285,10 +341,23 @@ def _write_retry_health(config: MemoryConfig) -> None:
         pass
 
 
-def retry_due(state: dict[str, Any], *, now: dt.datetime | None = None) -> bool:
+def retry_due(
+    state: dict[str, Any], *, now: dt.datetime | None = None,
+    batch_key: str | None = None,
+) -> bool:
     """A checkpoint with no recorded failure is due; a permanent or exhausted
-    one never is; a scheduled one waits out its backoff."""
+    one never is; a scheduled one waits out its backoff.
+
+    When ``batch_key`` names content that differs from the content the recorded
+    verdict was reached on, the verdict does not apply: the session has new
+    turns, and that batch has never been tried.
+    """
     if not state:
+        return True
+    if batch_key is not None and state.get("batch_key") != batch_key:
+        # Either this session produced turns since the verdict was recorded, or
+        # the verdict predates content scoping and was never bound to a batch at
+        # all.  Both mean the content in hand has not actually been tried.
         return True
     status = state.get("status")
     if status in {"permanent", "retry-exhausted"}:
@@ -382,11 +451,173 @@ def find_idle_turn_batches(
         if newest > cutoff:
             continue
         representative = entries[0][2]
-        if not retry_due(load_retry_state(config, representative), now=moment):
+        # The verdict recorded on the representative describes one batch.  A
+        # session that has produced turns since then is a different batch and
+        # is eligible again, even if that verdict was permanent.
+        batch_key = turn_batch_key(name for _, name, _ in entries)
+        if not retry_due(
+            load_retry_state(config, representative), now=moment, batch_key=batch_key
+        ):
             continue
         candidates.append((newest, representative))
     candidates.sort()
     return [path for _, path in candidates[:limit]]
+
+
+QUARANTINE_SCHEMA = "pikselzone-memory-checkpoint-quarantine-v1"
+QUARANTINE_HEALTH_COMPONENT = "checkpoint-quarantine"
+
+
+def quarantine_dir(config: MemoryConfig) -> Path:
+    """Where a checkpoint nothing can promote is set aside, bytes intact."""
+    return config.state_path / "queue" / "quarantine"
+
+
+def quarantine_checkpoint(
+    config: MemoryConfig, queue_path: Path, *, reason: str = "operator",
+) -> Path:
+    """Set one poisoned raw checkpoint aside so its session can move again.
+
+    The batch-content binding above gives a stuck session a fresh attempt
+    whenever it gains a turn, but a batch drain always includes every pending
+    turn, so one turn nothing can promote re-poisons every later attempt.  This
+    is the escape hatch: the raw bytes are *moved, never deleted*, the reason is
+    written next to them, and ``doctor`` reports the result, so an operator can
+    read the turn, fix the cause, and restore it.
+    """
+    pending = config.state_path / "queue" / "pending"
+    if not queue_path.is_absolute() or not path_within(queue_path, pending):
+        raise MemoryError("quarantine-path-outside-queue")
+    if not CHECKPOINT_NAME_RE.match(queue_path.name):
+        raise MemoryError("quarantine-name-invalid")
+    if not queue_path.is_file():
+        raise MemoryError("quarantine-checkpoint-missing")
+    target_dir = quarantine_dir(config)
+    ensure_safe_directory(target_dir, create=True)
+    target = target_dir / queue_path.name
+    state = load_retry_state(config, queue_path)
+    shutil.move(str(queue_path), str(target))
+    atomic_json(target_dir / f"{queue_path.name}.meta.json", {
+        "schema": QUARANTINE_SCHEMA,
+        "checkpoint_id": queue_path.name,
+        "quarantined_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "reason": reason,
+        "last_error_type": state.get("last_error_type"),
+        "last_reason": state.get("last_reason"),
+        "attempts": state.get("attempts"),
+    })
+    clear_retry_state(config, queue_path)
+    _write_quarantine_health(config)
+    return target
+
+
+def restore_quarantined_checkpoint(config: MemoryConfig, name: str) -> Path:
+    """Put a quarantined checkpoint back in the pending queue for another try."""
+    if not CHECKPOINT_NAME_RE.match(name):
+        raise MemoryError("quarantine-name-invalid")
+    source = quarantine_dir(config) / name
+    if not source.is_file():
+        raise MemoryError("quarantine-checkpoint-missing")
+    pending = config.state_path / "queue" / "pending"
+    ensure_safe_directory(pending, create=True)
+    target = pending / name
+    if target.exists():
+        raise MemoryError("quarantine-restore-conflict")
+    shutil.move(str(source), str(target))
+    try:
+        safe_unlink(quarantine_dir(config) / f"{name}.meta.json", root=quarantine_dir(config))
+    except (MemoryError, OSError):
+        pass
+    _write_quarantine_health(config)
+    return target
+
+
+def quarantined_checkpoints(config: MemoryConfig) -> list[dict[str, Any]]:
+    directory = quarantine_dir(config)
+    if not directory.is_dir():
+        return []
+    records: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("*.json")):
+        if path.name.endswith(".meta.json") or not path.is_file():
+            continue
+        if not CHECKPOINT_NAME_RE.match(path.name):
+            continue
+        meta: dict[str, Any] = {}
+        meta_path = directory / f"{path.name}.meta.json"
+        if meta_path.is_file():
+            try:
+                loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                loaded = None
+            if isinstance(loaded, dict) and loaded.get("schema") == QUARANTINE_SCHEMA:
+                meta = loaded
+        records.append({"checkpoint_id": path.name, **meta})
+    return records
+
+
+def _write_quarantine_health(config: MemoryConfig) -> None:
+    count = len(quarantined_checkpoints(config))
+    try:
+        write_health(
+            config.state_path, QUARANTINE_HEALTH_COMPONENT,
+            "warn" if count else "ok", f"quarantined={count}",
+        )
+    except OSError:
+        pass
+
+
+def stalled_turn_sessions(config: MemoryConfig) -> list[dict[str, Any]]:
+    """Sessions whose pending turns no automatic path will promote again.
+
+    A session is stalled when the verdict recorded on its oldest pending turn is
+    permanent or exhausted *and still describes the batch it has now*.  Reported
+    rather than acted on: the raw turns are intact, and choosing between fixing
+    the cause and quarantining the turn is an operator decision.
+    """
+    from .adapters import MAX_TURN_CHECKPOINTS_PER_SESSION
+
+    pending = config.state_path / "queue" / "pending"
+    if not pending.is_dir():
+        return []
+    sessions: dict[tuple[str, str], list[tuple[float, str]]] = {}
+    for path in pending.glob("*.json"):
+        match = CHECKPOINT_NAME_RE.match(path.name)
+        if match is None or match.group("event") != "turn_complete":
+            continue
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if not path.is_file():
+            continue
+        sessions.setdefault(
+            (match.group("runtime"), match.group("session_key")), []
+        ).append((info.st_mtime, path.name))
+    stalled: list[dict[str, Any]] = []
+    for (runtime, key), entries in sorted(sessions.items()):
+        entries.sort()
+        names = [name for _, name in entries]
+        # Oldest first, exactly as the drain path picks the file a batch
+        # verdict is recorded on.
+        representative = pending / names[0]
+        state = load_retry_state(config, representative)
+        batch_key = turn_batch_key(names)
+        # Exactly the selection predicate: a session is stalled only when the
+        # path that would pick it up refuses to, for a reason no retry clears.
+        if state.get("status") not in {"permanent", "retry-exhausted"}:
+            continue
+        if retry_due(state, batch_key=batch_key):
+            continue
+        stalled.append({
+            "runtime": runtime,
+            "session_key": key,
+            "pending_turns": len(names),
+            "retention_limit": MAX_TURN_CHECKPOINTS_PER_SESSION,
+            "status": state.get("status"),
+            "last_reason": state.get("last_reason"),
+            "representative": representative.name,
+        })
+    return stalled
 
 
 def prune_orphan_retry_states(config: MemoryConfig) -> int:
@@ -430,5 +661,15 @@ __all__ = [
     "IDLE_FINALIZE_RUNTIMES",
     "MAX_IDLE_FINALIZE_SPAWNS",
     "find_idle_turn_batches",
+    "turn_batch_key",
+    "pending_turn_batch_key",
+    "PROVIDER_OUTPUT_MARKERS",
+    "QUARANTINE_SCHEMA",
+    "QUARANTINE_HEALTH_COMPONENT",
+    "quarantine_dir",
+    "quarantine_checkpoint",
+    "restore_quarantined_checkpoint",
+    "quarantined_checkpoints",
+    "stalled_turn_sessions",
     "prune_orphan_retry_states",
 ]

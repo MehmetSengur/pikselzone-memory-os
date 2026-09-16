@@ -131,9 +131,12 @@ class RetryTrackingTests(LateRecallDirectBase):
             self.config, runtime="claude", session_id=self.viewer, project="demo",
             checkpoints=[target],
         )
+        # A malformed *checkpoint*, not a rejected summary: a rejected summary
+        # is the model's output and is retried (see
+        # test_idle_finalize_permanent_stall.ClassificationTests).
         with self.assertRaises(SchemaError):
             drain_checkpoint(self.config, target, provider=base.FakeProvider(
-                SchemaError("summary-decisions-directive-shaped")
+                SchemaError("checkpoint-schema-invalid")
             ))
         self.assertIn("kalıcı hata", self._deliver())
         self.assertEqual({}, self._marker())

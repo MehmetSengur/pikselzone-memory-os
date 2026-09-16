@@ -41,7 +41,17 @@ TERMINAL_FLUSH_EVENTS = {"pre_compact", "session_end", "session_finalize", "sess
 TURN_CHECKPOINT_EVENT = "turn_complete"
 RECOVERY_EVENT = "checkpoint_recovery"
 MAX_TURN_CHECKPOINTS_PER_SESSION = 32
-MAX_TURN_CHECKPOINT_CHARS = 64 * 1024
+#: A single Stop turn is refused above this.  The old 64 KiB ceiling dropped
+#: ordinary turns -- the user routinely pastes task briefs past 80 KiB -- and a
+#: dropped turn is lost outright when the session never reaches a terminal
+#: boundary, as Codex Desktop threads do not.
+#:
+#: It is deliberately *equal to* the provider ceiling and not larger.  A batch
+#: drain always admits its first turn whole, so a turn above
+#: ``TRANSCRIPT_MAX_CHARS`` would be captured and then fail every drain with
+#: ``checkpoint-turn-too-large`` -- stalling the whole session exactly the way
+#: a permanent verdict used to.  Tying the two together makes that unreachable.
+MAX_TURN_CHECKPOINT_CHARS = TRANSCRIPT_MAX_CHARS
 
 
 def normalize_event_name(value: str) -> str:
@@ -480,7 +490,10 @@ def drain_checkpoint(
     the record.  Nothing here deletes a raw checkpoint -- only the existing
     ``settle_selected`` path does.
     """
-    from .retry import clear_retry_state, record_drain_failure
+    from .retry import (
+        CHECKPOINT_NAME_RE, clear_retry_state, pending_turn_batch_key,
+        record_drain_failure,
+    )
 
     pending = config.state_path / "queue" / "pending"
     if not queue_path.is_absolute() or not path_within(queue_path, pending):
@@ -490,13 +503,23 @@ def drain_checkpoint(
         # same recovery is a no-op, never a second event artifact.
         clear_retry_state(config, queue_path)
         raise NoMemory("checkpoint-already-settled")
+    # A turn drain promotes the whole session as one batch, so its verdict
+    # belongs to that batch's content.  Captured before the drain, because a
+    # settled drain removes the very files the key is derived from.
+    batch_key: str | None = None
+    name_match = CHECKPOINT_NAME_RE.match(queue_path.name)
+    if name_match is not None and name_match.group("event") == TURN_CHECKPOINT_EVENT:
+        batch_key = pending_turn_batch_key(
+            config, runtime=name_match.group("runtime"),
+            session_key_value=name_match.group("session_key"),
+        )
     try:
         event_path = _drain_validated_checkpoint(config, queue_path, provider=provider)
     except (DuplicateEvent, NoMemory):
         clear_retry_state(config, queue_path)
         raise
     except MemoryError as exc:
-        record_drain_failure(config, queue_path, exc)
+        record_drain_failure(config, queue_path, exc, batch_key=batch_key)
         raise
     clear_retry_state(config, queue_path)
     return event_path

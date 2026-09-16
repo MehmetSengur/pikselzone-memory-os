@@ -81,7 +81,9 @@ completed assistant turn (Codex/Claude Stop; Hermes next pre_llm_call)
 The workstation queue stores only the final completed USER/ASSISTANT pair,
 keyed by a hash of runtime/session and runtime turn ID (or the redacted turn
 digest when no turn ID is supplied).  It is idempotent, capped at 32 retained
-turns per session and 64 KiB per turn, and remains outside the shared vault.
+turns per session and 120,000 chars per turn -- the provider ceiling, so a
+captured turn always fits the batch that must send it -- and remains outside
+the shared vault.
 Provider failure leaves the raw checkpoint retryable and never blocks a normal
 runtime turn or startup.  PreCompact and SessionEnd remain the authoritative
 flush boundaries; recovery is a bounded degraded-mode path only.
@@ -306,7 +308,33 @@ Codex/Claude SessionStart in a registered root (after stale terminal recovery)
 - **Failure.**  A provider failure settles nothing.  The retry state is kept
   on the batch's oldest turn, and the session is not selected again until that
   backoff has elapsed; `retry.py` limits apply unchanged.  Schema and policy
-  failures are permanent and stay visible in `queue/retry`.
+  failures that describe the *stored checkpoint* are permanent and stay visible
+  in `queue/retry`.
+- **A verdict belongs to batch content, not to a file.**  The record written on
+  the batch's oldest turn carries a `batch_key`: the digest of the set of
+  pending turn file names, each of which is itself a digest of its turn.  A
+  session that produced turns since the verdict is a different batch and is
+  eligible again, even after a permanent one; the identical batch is never sent
+  to the provider twice.  A verdict with no `batch_key` predates this rule and
+  never applies to a turn batch.  Without this, one permanent verdict silenced
+  a thread for good: it was never idle-finalized again, its turns accumulated
+  to `MAX_TURN_CHECKPOINTS_PER_SESSION`, and its `Stop` hook then stopped
+  capturing entirely.  Two live sessions were stranded this way.
+- **A rejected summary is the model's output, not the input.**
+  `validate_summary` raises `summary-*`, `memory-summary-empty` and
+  `empty-summary-has-content` about text the summarizer produced; the stored
+  checkpoint is intact and a resample routinely succeeds.  These are retryable
+  and bounded by the ordinary attempt budget.
+- **Quarantine** is the escape hatch for a turn nothing can promote, since a
+  batch always includes every pending turn of its session.
+  `pz-memory quarantine-checkpoint --queue <path>` *moves* the raw checkpoint
+  to `queue/quarantine/` with a `.meta.json` recording why; the bytes are never
+  deleted and `restore-checkpoint --name <id>` puts it back.  A stale verdict
+  alone is cleared with `reset-retry --queue <path>`.
+- **Doctor** reports both: `turn_batch_stalled` warns when a session's pending
+  turns are blocked by a verdict that still describes the batch it has now,
+  with how close it is to the retention limit, and `checkpoint_quarantine`
+  counts what has been set aside.
 - **Acceptance** requires the real-app chain in
   `runbooks/idle-finalize-acceptance.md`: conversation → checkpoint → durable
   artifact → correct recall.  Unit tests and doctor output are not acceptance.

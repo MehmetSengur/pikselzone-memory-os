@@ -225,6 +225,8 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
         "pending_checkpoints", "pass" if pending_count == 0 else "warn", str(pending_count)
     ))
     checks.append(_checkpoint_retry_row(config))
+    checks.append(_stalled_turn_sessions_row(config))
+    checks.append(_checkpoint_quarantine_row(config))
     checks.extend(_recall_rows(config))
     if config.can_run_compiler:
         checks.append(_compiler_backlog_row(config))
@@ -267,6 +269,42 @@ def _checkpoint_retry_row(config: MemoryConfig) -> dict[str, str]:
         f"exhausted={counts['exhausted']};permanent={counts['permanent']}"
     )
     return _row("checkpoint_retry", "pass" if total == 0 else "warn", detail)
+
+
+def _stalled_turn_sessions_row(config: MemoryConfig) -> dict[str, str]:
+    """Sessions whose pending turns no automatic path will promote again.
+
+    A stalled session keeps capturing turns it can never drain until it hits
+    the per-session retention limit, after which its Stop hook stops capturing
+    at all.  Nothing here is lost -- the raw turns are intact -- but it needs an
+    operator: fix the cause and let it retry, or quarantine the poisoned turn.
+    """
+    from .retry import stalled_turn_sessions
+
+    stalled = stalled_turn_sessions(config)
+    if not stalled:
+        return _row("turn_batch_stalled", "pass", "0")
+    worst = max(stalled, key=lambda item: item["pending_turns"])
+    detail = (
+        f"sessions={len(stalled)};"
+        f"worst={worst['runtime']}-{worst['session_key'][:8]}"
+        f":{worst['pending_turns']}/{worst['retention_limit']}"
+        f";reason={str(worst.get('last_reason') or 'unknown')[:80]}"
+    )
+    return _row("turn_batch_stalled", "warn", detail)
+
+
+def _checkpoint_quarantine_row(config: MemoryConfig) -> dict[str, str]:
+    """Raw checkpoints an operator set aside.  Preserved, never promoted."""
+    from .retry import quarantined_checkpoints
+
+    records = quarantined_checkpoints(config)
+    if not records:
+        return _row("checkpoint_quarantine", "pass", "0")
+    return _row(
+        "checkpoint_quarantine", "warn",
+        f"quarantined={len(records)};oldest={records[0]['checkpoint_id']}",
+    )
 
 
 WIKILINK_RE = re.compile(r"(?<!!)\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")

@@ -31,6 +31,24 @@ def _parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("--hook-input", type=Path)
     drain = commands.add_parser("drain")
     drain.add_argument("--queue", required=True, type=Path)
+    quarantine_cmd = commands.add_parser(
+        "quarantine-checkpoint",
+        help="Set a raw checkpoint aside so its session can drain again",
+    )
+    quarantine_cmd.add_argument("--queue", required=True, type=Path)
+    quarantine_cmd.add_argument("--reason", default="operator")
+    restore_cmd = commands.add_parser(
+        "restore-checkpoint", help="Return a quarantined checkpoint to the queue",
+    )
+    restore_cmd.add_argument("--name", required=True)
+    commands.add_parser(
+        "list-quarantine", help="List quarantined checkpoints and why they were set aside",
+    )
+    reset_retry_cmd = commands.add_parser(
+        "reset-retry",
+        help="Clear a stale drain verdict so the bounded retry path tries again",
+    )
+    reset_retry_cmd.add_argument("--queue", required=True, type=Path)
     doc_cmd = commands.add_parser("doctor")
     doc_cmd.add_argument("--heal", "--fix", action="store_true", dest="heal", help="Run self-healing maintenance and produce audit receipt")
     compile_cmd = commands.add_parser("compile")
@@ -149,6 +167,35 @@ def main(argv: list[str] | None = None) -> int:
             except OSError:
                 pass
             print(json.dumps({"status": "ok", "event_path": str(path)}))
+            return 0
+        if args.command == "reset-retry":
+            from .retry import clear_retry_state, load_retry_state
+            target = args.queue.resolve()
+            previous = load_retry_state(config, target)
+            clear_retry_state(config, target)
+            print(json.dumps({
+                "status": "reset",
+                "checkpoint": target.name,
+                "previous_status": previous.get("status"),
+                "previous_reason": previous.get("last_reason"),
+            }, ensure_ascii=False))
+            return 0
+        if args.command == "quarantine-checkpoint":
+            from .retry import quarantine_checkpoint
+            target = quarantine_checkpoint(config, args.queue.resolve(), reason=args.reason)
+            print(json.dumps({"status": "quarantined", "path": str(target)}))
+            return 0
+        if args.command == "restore-checkpoint":
+            from .retry import restore_quarantined_checkpoint
+            target = restore_quarantined_checkpoint(config, args.name)
+            print(json.dumps({"status": "restored", "path": str(target)}))
+            return 0
+        if args.command == "list-quarantine":
+            from .retry import quarantined_checkpoints
+            print(json.dumps(
+                {"status": "ok", "quarantined": quarantined_checkpoints(config)},
+                ensure_ascii=False, indent=2,
+            ))
             return 0
         if args.command == "recall":
             from .recall import build_startup_recall_bundle, targeted_recall, write_recall_evidence, RECALL_EVIDENCE_PROVENANCE_MANUAL
