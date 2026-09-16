@@ -49,6 +49,29 @@ class DoctorRegistryReportTest(unittest.TestCase):
         self.assertEqual(rows["project_registry"]["status"], "warn")
         self.assertIn("no-registered-projects", rows["project_registry"]["detail"])
 
+    def test_hermes_only_engine_reports_not_applicable(self) -> None:
+        """A memory engine that only runs Hermes has no project roots to register.
+
+        The verdict comes from the active config, never from the registry file
+        merely being absent -- a workstation with no registrations is still a
+        finding.
+        """
+        engine = MemoryConfig.from_dict({
+            "role": "memory-engine",
+            "vault_path": str(self.vault),
+            "state_path": str(self.state),
+            "runtimes": ["hermes"],
+            "transcript_roots": {"hermes": [str(self.root)]},
+            "can_write_event_memory": True,
+            "can_run_compiler": True,
+            "provider": {"mode": "runtime-native"},
+        })
+        rows = {r["check"]: r for r in _project_registry_rows(engine)}
+        self.assertEqual(rows["project_registry"]["status"], "not-applicable")
+        self.assertIn("memory-engine-hermes-only", rows["project_registry"]["detail"])
+        # The workstation contract is unchanged.
+        self.assertEqual(self._rows()["project_registry"]["status"], "warn")
+
     def test_multi_root_project_is_summarised(self) -> None:
         for repo in (self.repo_a, self.repo_b):
             project_registry.register(self.state, repo, "luvaa")

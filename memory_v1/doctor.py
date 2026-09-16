@@ -65,12 +65,21 @@ def _project_registry_rows(config: MemoryConfig) -> list[dict[str, str]]:
     from .hook_install import MEMORY_EVENTS
     from .project_registry import RegistryError, load_registry
 
+    # Project registration is a workstation contract: it exists to drive
+    # Claude/Codex hook installation inside project roots.  A memory engine
+    # that only runs Hermes has no such roots, so an empty registry there is
+    # the expected shape rather than a finding.  This is decided from the
+    # active config, never inferred from the registry file being absent.
+    hermes_only_engine = config.role == "memory-engine" and set(config.runtimes) == {"hermes"}
+
     try:
         entries = load_registry(config.state_path)
     except RegistryError as exc:
         return [_row("project_registry", "fail", str(exc))]
 
     if not entries:
+        if hermes_only_engine:
+            return [_row("project_registry", "not-applicable", "memory-engine-hermes-only")]
         return [_row("project_registry", "warn", "no-registered-projects")]
 
     by_project: dict[str, list[str]] = {}
@@ -225,6 +234,7 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
         "pending_checkpoints", "pass" if pending_count == 0 else "warn", str(pending_count)
     ))
     checks.append(_checkpoint_retry_row(config))
+    checks.extend(_hermes_finalize_rows(config))
     checks.extend(_recall_rows(config))
     if config.can_run_compiler:
         checks.append(_compiler_backlog_row(config))
@@ -267,6 +277,43 @@ def _checkpoint_retry_row(config: MemoryConfig) -> dict[str, str]:
         f"exhausted={counts['exhausted']};permanent={counts['permanent']}"
     )
     return _row("checkpoint_retry", "pass" if total == 0 else "warn", detail)
+
+
+def _hermes_finalize_rows(config: MemoryConfig) -> list[dict[str, str]]:
+    """Report the native Hermes finalize backlog beside the latest flush row.
+
+    ``health_flush-hermes`` is last-write-wins, so one session settling
+    normally used to overwrite -- and hide -- the blocked row another session
+    left behind.  These rows are deliberately separate from it: the health row
+    means "the last flush result", these mean "everything still outstanding".
+    Warn-only, because the raw checkpoints are preserved either way.
+    """
+    from .hermes_backlog import backlog_metrics
+
+    metrics = backlog_metrics(config)
+    if not metrics["available"]:
+        return [_row("hermes_finalize_retry", "not-applicable", "no-hermes-runtime-state")]
+
+    retry_total = sum(metrics[key] for key in ("scheduled", "hold", "permanent", "exhausted"))
+    rows = [_row(
+        "hermes_finalize_retry", "pass" if retry_total == 0 else "warn",
+        f"scheduled={metrics['scheduled']};hold={metrics['hold']};"
+        f"permanent={metrics['permanent']};exhausted={metrics['exhausted']}",
+    )]
+    backlog_detail = (
+        f"unresolved_sessions={metrics['unresolved_sessions']};"
+        f"sessions_with_checkpoints={metrics['sessions_with_checkpoints']};"
+        f"settled={metrics['settled_sessions']};"
+        f"retry_tracked={metrics['retry_tracked_sessions']}"
+    )
+    if metrics["unresolved_sample"]:
+        backlog_detail += ";oldest=" + ",".join(metrics["unresolved_sample"][:3])
+    rows.append(_row(
+        "hermes_finalize_backlog",
+        "pass" if metrics["unresolved_sessions"] == 0 else "warn",
+        backlog_detail,
+    ))
+    return rows
 
 
 WIKILINK_RE = re.compile(r"(?<!!)\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")

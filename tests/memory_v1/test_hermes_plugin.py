@@ -198,6 +198,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             ("pre_llm_call", plugin.pre_llm_call),
             ("on_session_end", plugin.on_session_end),
             ("on_session_finalize", plugin.on_session_finalize),
+            ("on_kanban_dispatch_tick", plugin.on_kanban_dispatch_tick),
         ], registered)
         discover.assert_called_once_with()
 
@@ -1092,7 +1093,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
         patches, profile_home, constants = self._fake_root_home_with_profile_session(session)
         seen_homes = []
 
-        def fake_summarize(transcript):
+        def fake_summarize(transcript, **kwargs):
             seen_homes.append(constants.get_hermes_home())
             return None, "", ""
 
