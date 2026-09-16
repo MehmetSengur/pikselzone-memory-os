@@ -163,7 +163,7 @@ class HookHealthTests(unittest.TestCase):
             "cwd": str(self.repo), "hook_event_name": "SessionEnd",
         })
 
-        self.assertEqual(2, rc)
+        self.assertEqual(0, rc, "a capture failure never steers the runtime (exit-code contract)")
         health = self._health("hook-claude")
         self.assertEqual("blocked", health["status"])
         self.assertIn("transcript-path-outside-allowed-roots", health["detail"])
@@ -180,7 +180,7 @@ class HookHealthTests(unittest.TestCase):
             "session_id": "sess-claude-seq", "transcript_path": "relative/path.jsonl",
             "cwd": str(self.repo), "hook_event_name": "SessionEnd",
         })
-        self.assertEqual(2, rc)
+        self.assertEqual(0, rc, "a capture failure never steers the runtime (exit-code contract)")
         self.assertEqual("blocked", self._health("hook-claude")["status"])
 
     def test_zero_turn_no_op_keeps_its_own_ok_detail(self):

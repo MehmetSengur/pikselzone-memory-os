@@ -605,7 +605,7 @@ class ZeroTurnLifecycleTests(unittest.TestCase):
             "cwd": str(self.repo), "hook_event_name": "SessionEnd",
         })
 
-        self.assertEqual(2, rc)
+        self.assertEqual(0, rc, "a capture failure never steers the runtime (exit-code contract)")
         health = self._health("hook-claude")
         self.assertEqual("blocked", health["status"])
         self.assertIn("secure-read-open", health["detail"])
@@ -633,7 +633,7 @@ class ZeroTurnLifecycleTests(unittest.TestCase):
             "cwd": str(self.repo), "hook_event_name": "SessionEnd",
         })
 
-        self.assertEqual(2, rc)
+        self.assertEqual(0, rc, "a capture failure never steers the runtime (exit-code contract)")
         self.assertEqual("blocked", self._health("hook-claude")["status"])
 
     def test_transcript_outside_allowed_roots_stays_blocked(self):
@@ -646,7 +646,7 @@ class ZeroTurnLifecycleTests(unittest.TestCase):
             "cwd": str(self.repo), "hook_event_name": "SessionEnd",
         })
 
-        self.assertEqual(2, rc)
+        self.assertEqual(0, rc, "a capture failure never steers the runtime (exit-code contract)")
         health = self._health("hook-claude")
         self.assertEqual("blocked", health["status"])
         self.assertIn("transcript-path-outside-allowed-roots", health["detail"])

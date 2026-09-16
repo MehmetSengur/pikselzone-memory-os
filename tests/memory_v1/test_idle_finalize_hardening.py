@@ -287,7 +287,7 @@ class NullTranscriptTests(HardeningBase):
             "session_id": with_memory, "transcript_path": None, "cwd": str(self.repo),
             "hook_event_name": "SessionEnd", "reason": "other",
         })
-        self.assertEqual(2, rc)
+        self.assertEqual(0, rc, "a capture failure never steers the runtime (exit-code contract)")
         self.assertEqual("blocked", self._health()["status"])
 
 

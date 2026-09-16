@@ -389,6 +389,52 @@ This adapts the hardened patterns in
 without copying its single shared daily append model or granting its compiler
 edit tools.
 
+## Lifecycle hook exit codes and large transcripts
+
+`pz-memory-hook` never uses a non-zero exit code to signal a Memory OS
+failure.  In Codex and Claude Code, exit 2 is a *decision*, not an error:
+
+- On `Stop` it makes the runtime continue with a new prompt; Codex shows
+  "Stop hook exited with code 2 but did not write a continuation prompt" on
+  every turn.
+- On `UserPromptSubmit` it blocks and erases the prompt.
+- On `PreCompact` it blocks compaction.
+- In Claude it blocks `SessionStart` and `SessionEnd`.
+
+The hook makes none of these decisions, so every handled failure is written
+as `health/hook-<runtime>.json` `blocked` with its reason, and the hook exits 0.
+Only a failure before the state path is known (an unreadable config) escapes
+as exit 1, which both runtimes report as a non-blocking hook error.
+
+The PreToolUse guards in other repositories are separate commands.  They keep
+their own deliberate exit-2 blocking and are not affected.
+
+Transcript capture reads at most `TRANSCRIPT_READ_MAX_BYTES` (20 MiB).  A
+resumed Codex thread keeps appending to its original rollout, so a live
+transcript can outgrow any fixed ceiling; one grew to 22.8 MB on 2026-09-16.
+Rejecting it stopped every later Stop, PreCompact and SessionEnd capture of
+that session.  A larger file is now read from its newest 20 MiB window:
+
+- The first partial line is dropped, unless the window starts on a line
+  boundary.
+- No-follow traversal, a single regular file, allowed roots, and an unchanged
+  stat across the read are enforced exactly as for a full read.
+- A window with no complete line fails as
+  `secure-read-tail-without-line-boundary`.
+- A window with lines but no user/assistant turn fails as
+  `transcript-window-without-turns`.  A truncated read proves nothing about
+  the turns before the window, so it is recorded as blocked health and never
+  classified as an empty lifecycle.
+
+The normalizer keeps at most the newest 200 turns and 120,000 characters, and
+a Stop checkpoint only the last completed turn, so the dropped head is never
+needed for them.  Codex rollout and Claude JSONL records are self-contained
+lines; `session_meta` is not used to extract turns.
+
+A terminal boundary read from a window may no longer contain turns an earlier
+promotion covered.  The terminal replace rule ("Idle finalize") then merges
+instead of replacing.  History import of such a file sees only the window.
+
 ## Context and health
 
 `build_context` has a hard default budget of 16,000 characters but deliberately

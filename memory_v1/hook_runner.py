@@ -355,12 +355,22 @@ def main(argv: list[str] | None = None) -> int:
         else:
             _spawn_drain(args.config, queue_path, log_dir / f"drain-{args.runtime}.log")
         return 0
-    except (MemoryError, OSError) as exc:
+    except Exception as exc:
+        # Exit-code contract: a Memory OS failure never steers the runtime.
+        # Exit 2 is a *decision* in both runtimes, not an error code: on Stop
+        # it makes Codex/Claude continue with a new prompt, on
+        # UserPromptSubmit it blocks and erases the prompt, on PreCompact it
+        # blocks compaction, and in Claude it blocks SessionStart/SessionEnd.
+        # This hook makes no such decisions, so every handled failure is
+        # recorded as blocked health and exits 0.  Only a failure before the
+        # state path is known (an unreadable config) escapes as exit 1, which
+        # both runtimes report as a non-blocking hook error.
+        detail = str(exc) or exc.__class__.__name__
         try:
-            write_health(config.state_path, f"hook-{args.runtime}", "blocked", str(exc))
+            write_health(config.state_path, f"hook-{args.runtime}", "blocked", detail[:500])
         except OSError:
             pass
-        return 2
+        return 0
 
 
 if __name__ == "__main__":
