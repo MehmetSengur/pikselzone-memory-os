@@ -20,7 +20,9 @@ import test_idle_finalize as base
 import test_idle_finalize_hardening as hardening
 
 from memory_v1.adapters import checkpoint_hook, drain_checkpoint
-from memory_v1.core import ProviderBlocked, SchemaError, session_key
+from memory_v1.core import (
+    ProviderBlocked, SchemaError, TRANSCRIPT_MAX_CHARS, session_key,
+)
 from memory_v1.events import parse_event_artifact
 from memory_v1.late_recall import (
     LATE_RECALL_BUDGET_CHARS, LATE_RECALL_HEADER, LATE_RECALL_INTRO, condensed_block,
@@ -42,7 +44,9 @@ class TerminalReplaceTests(hardening.HardeningBase):
 
     def test_clamped_terminal_merges_instead_of_erasing_the_idle_summary(self):
         session = "sess-clamped-terminal"
-        filler = "y" * 45_000
+        # Sized against the ceiling so three of these turns always overflow it
+        # and the terminal transcript really is clamped, as this test requires.
+        filler = "y" * (TRANSCRIPT_MAX_CHARS * 2 // 5)
         turns = []
         for index in range(2):
             self._append(session, ("user", f"EARLY-{index} decision"), ("assistant", filler))

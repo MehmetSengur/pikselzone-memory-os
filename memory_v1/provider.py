@@ -263,16 +263,21 @@ def scrubbed_subprocess_env(extra: dict[str, str] | None = None) -> dict[str, st
 
 
 SUMMARIZER_TIMEOUT_BASE_SECONDS = 60
-SUMMARIZER_TIMEOUT_MAX_SECONDS = 300
+#: A safety net, not the operating point.  It was 300s when the transcript
+#: ceiling was 120,000 chars; at the 256 KiB ceiling the linear scale below
+#: asks for 322s, so a 300s cap would have turned every large drain into a
+#: timeout -- trading one stall for another.
+SUMMARIZER_TIMEOUT_MAX_SECONDS = 600
 
 
 def summarizer_timeout_for(prompt_chars: int) -> int:
     """Scale the subprocess timeout with the prompt, within a hard ceiling.
 
     A flat 60s was sized for small turn checkpoints.  A transcript near the
-    120k capture ceiling needs materially longer: 114,015 chars measured at
-    90.3s on haiku, which a flat 60s cuts off as a timeout even though the run
-    would have succeeded.
+    capture ceiling needs materially longer: 114,015 chars measured at 90.3s on
+    haiku, which a flat 60s cuts off as a timeout even though the run would
+    have succeeded.  Extrapolating that rate, a full 256 KiB transcript lands
+    near 210s, which the 1 second per 1,000 chars slope covers with margin.
 
     Nothing here is runtime-specific -- a long transcript costs a long
     summarize on any of them -- so every subprocess summarizer shares it.  A

@@ -79,7 +79,9 @@ class HardeningBase(base.IdleFinalizeBase):
 class BatchBoundaryTests(HardeningBase):
     def test_oversized_batch_promotes_whole_turns_and_keeps_the_rest(self):
         session = "sess-big"
-        filler = "x" * 45_000
+        # Sized against the ceiling, not a literal: two of these turns fit one
+        # batch and three do not, whatever TRANSCRIPT_MAX_CHARS is set to.
+        filler = "x" * (TRANSCRIPT_MAX_CHARS * 2 // 5)
         paths = []
         for index in range(3):
             self._append(session, ("user", f"BIG-{index} question"), ("assistant", filler))

@@ -48,6 +48,18 @@ class SummarizerTimeoutScalingTests(unittest.TestCase):
     def test_timeout_is_bounded(self):
         self.assertEqual(SUMMARIZER_TIMEOUT_MAX_SECONDS, summarizer_timeout_for(10_000_000))
 
+    def test_the_cap_does_not_bind_at_the_transcript_ceiling(self):
+        """The cap is a safety net, not the operating point.
+
+        Raising TRANSCRIPT_MAX_CHARS without raising the cap would silently
+        turn every ceiling-sized drain into a timeout -- one stall traded for
+        another.  Whoever moves either constant has to keep this true.
+        """
+        self.assertLess(
+            summarizer_timeout_for(TRANSCRIPT_MAX_CHARS), SUMMARIZER_TIMEOUT_MAX_SECONDS,
+            "raise SUMMARIZER_TIMEOUT_MAX_SECONDS to stay above the scaled timeout",
+        )
+
     def test_explicit_timeout_still_wins(self):
         seen = {}
 

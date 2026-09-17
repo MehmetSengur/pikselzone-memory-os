@@ -999,7 +999,14 @@ def _message_from_record(record: dict[str, Any]) -> tuple[str, Any, bool]:
     return "", None, False
 
 
-TRANSCRIPT_MAX_CHARS = 120000
+#: Ceiling on any transcript handed to a summarizer, and so also on a single
+#: captured turn (``MAX_TURN_CHECKPOINT_CHARS``).  Raised from 120,000 once
+#: 80k+ character turns turned out to be ordinary: pasted task briefs run well
+#: past the old ceiling, and a turn refused at capture is lost outright in a
+#: thread that never reaches a terminal boundary.  256 KiB is ~65k tokens,
+#: comfortably inside every summarizer's context window; the subprocess timeout
+#: scales with the prompt and its cap is set so this size does not reach it.
+TRANSCRIPT_MAX_CHARS = 256 * 1024
 #: Bytes of a transcript file read for capture: the whole file when smaller,
 #: otherwise its newest window (see ``_transcript_records``).
 TRANSCRIPT_READ_MAX_BYTES = 20 * 1024 * 1024

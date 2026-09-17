@@ -81,9 +81,9 @@ completed assistant turn (Codex/Claude Stop; Hermes next pre_llm_call)
 The workstation queue stores only the final completed USER/ASSISTANT pair,
 keyed by a hash of runtime/session and runtime turn ID (or the redacted turn
 digest when no turn ID is supplied).  It is idempotent, capped at 32 retained
-turns per session and 120,000 chars per turn -- the provider ceiling, so a
-captured turn always fits the batch that must send it -- and remains outside
-the shared vault.
+turns per session and `TRANSCRIPT_MAX_CHARS` (256 KiB) per turn -- the
+provider ceiling, so a captured turn always fits the batch that must send it
+-- and remains outside the shared vault.
 Provider failure leaves the raw checkpoint retryable and never blocks a normal
 runtime turn or startup.  PreCompact and SessionEnd remain the authoritative
 flush boundaries; recovery is a bounded degraded-mode path only.
@@ -209,7 +209,7 @@ Codex/Claude SessionStart in a registered root (after stale terminal recovery)
      oldest one past its retry backoff; Hermes never included
   -> late-recall marker for same-project targets, then at most 2 detached
      drains; the starting thread is excluded (its own resume path owns it)
-  -> drain: pending turns of that session, whole turns up to 120,000 chars
+  -> drain: pending turns of that session, whole turns up to the ceiling
      -> one provider call -> checkpoint_recovery merged into the session's
         single daily artifact
 ```
