@@ -253,7 +253,11 @@ def profile_recall(settings: dict, *, session_id: str, query: str, first: bool, 
             budget_chars=budget - targeted_budget - 2 if query.strip() and budget >= 6000 else budget)
         text, audit, sources, digest = bundle.text, bundle.selection_audit, bundle.source_shas, bundle.bundle_sha256
         if query.strip() and budget >= 6000:
-            targeted = targeted_recall(config, query, budget_chars=targeted_budget, max_items=3)
+            # Identity/rules already have their mandatory startup allocation.
+            # Do not spend the query allocation on the same source again.
+            startup_rules = frozenset(s for s in sources if Path(s).name in ('Core.md', 'Kurallar.md'))
+            targeted = targeted_recall(config, query, budget_chars=targeted_budget,
+                                       max_items=3, exclude_sources=startup_rules)
             if targeted['results']:
                 text += '\n' + targeted['markdown']
                 sources = {**sources, **{r['source']:r['sha256'] for r in targeted['results']}}

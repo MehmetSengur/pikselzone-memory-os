@@ -93,3 +93,13 @@ class NativeTransportBudgetTests(unittest.TestCase):
             self.assertEqual(_native_context_budget(1500),1500)
             spill['enabled']=False
             self.assertEqual(_native_context_budget(16000),16000)
+
+    def test_startup_can_reserve_targeted_slots_for_nonduplicate_sources(self):
+        (self.vault/'companion/Kurallar.md').write_text('# Kurallar\nbakım penceresi iş emri\n')
+        ordinary=targeted_recall(self.config,'bakım penceresi iş emri')
+        unique=targeted_recall(self.config,'bakım penceresi iş emri',
+                              exclude_sources=frozenset({'companion/Kurallar.md'}))
+        self.assertIn('companion/Kurallar.md',[r['source'] for r in ordinary['results']])
+        self.assertNotIn('companion/Kurallar.md',[r['source'] for r in unique['results']])
+        self.assertIn('WO-8820-7c485f',unique['markdown'])
+        self.assertTrue(any(a['reason']=='source-already-in-startup' for a in unique['selection_audit']))

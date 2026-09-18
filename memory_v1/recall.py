@@ -1232,6 +1232,7 @@ def targeted_recall(
     budget_chars: int = TARGETED_RECALL_DEFAULT_BUDGET,
     max_items: int = 5,
     include_superseded: bool = False,
+    exclude_sources: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Execute targeted deep recall across knowledge and daily vault directories.
 
@@ -1377,13 +1378,16 @@ def targeted_recall(
     # authority second, source path last.  Scan order -- i.e. which folder a
     # document happens to live in -- must never break a tie.
     candidates, scope_rejections = filter_items(config, candidates)
-    deduped = deduplicate_memory_items(candidates)
+    repeated_sources = [it for it in candidates if it.source_file in exclude_sources]
+    deduped = deduplicate_memory_items([it for it in candidates if it.source_file not in exclude_sources])
     ranked = sorted(
         deduped, key=lambda x: (-x.relevance_score, x.derived, x.source_file)
     )
 
     selected = []
-    audit = list(scope_rejections) + read_issues
+    audit = list(scope_rejections) + read_issues + [
+        {'id':it.item_id, 'source':it.source_file, 'reason':'source-already-in-startup'}
+        for it in repeated_sources]
     policy = config_policy(config)
     budget_chars = max(0, int(budget_chars * policy["budget_scale"]))
     lines = ["=== TARGETED MEMORY RECALL ===", AUTHORITY_NOTICE, ""]
