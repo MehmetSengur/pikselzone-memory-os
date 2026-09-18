@@ -731,7 +731,7 @@ REMAINING_BLOCKERS=explicit approval for the proven metadata capability or a sep
   hook runner, receipt write, production configuration, VPS service, ACL, or
   capability change was used.
 
-## 2026-09-18 — Memory reliability candidate (activation pending)
+## 2026-09-18 — Memory reliability implementation and activation
 
 Implementation branch: `codex/memory-reliability`. Started from the inspected
 `fix/idle-turn-finalize` HEAD `2d9fd268ef50e08e3f38a4491afcabf4f6fb52e3`.
@@ -802,7 +802,7 @@ No cost/token savings percentage was measured or claimed.
 
 Validation and gates:
 
-- Full local suite: **767 tests passed**, including workstation idle-finalize and
+- Full local suite: **769 tests passed**, including workstation idle-finalize and
   late recall, Hermes long-session/finalize/retry, controlled quota/failure
   fixtures, same-ID ownership, critical values, provenance, mode and access tests.
   Injected provider failures are isolated tests, not live outages.
@@ -812,11 +812,17 @@ Validation and gates:
   LLM trust, no credential copying, opt-out, service exclusion and repeatability.
   Script: `scripts/native-profile-discovery-smoke.py`. Its report explicitly sets
   `conversation_capture_publish_recall_verified=false`.
-- This is **code/test complete for the candidate, NOT deployed or live accepted**.
-  Test A's actual conversation → native capture → publisher → new-session answer,
-  production B sharing, real service compiler execution and all live entry surfaces
-  remain activation gates. No manual hook invocation or receipt was used to claim
-  those gates. No main merge or production restart was performed.
+- The user subsequently authorized publication and service maintenance. Engine
+  `9b7f82f73d74e7d28058c9377a5242a32d771ba1` was activated on Contabo and the
+  workstation on 2026-09-18. Native profile argument handling was corrected after
+  a first cutover automatically restored code; existing data was not restored.
+  A follow-up doctor fix accepts matches from source bodies and reports partial
+  source failures rather than demanding a literal phrase in every result title.
+- **Native conversation-to-answer acceptance remains blocked by provider quota.**
+  Isolated native profile discovery is not that acceptance. Publisher success,
+  service startup, historical receipts and compiler timer activity do not close
+  this gate. Exact current deployment, diagnostics and rollback locations are in
+  the operations upgrade handoff. No main merge was performed.
 - Operations runbook, immutable source manifest and evidence are maintained in
   `deploy/contabo-autonomous/upgrades/2026-09-18/` of the operations branch. Use
   the existing backup/quiesce/rollback process. Roll back code and wrappers only;

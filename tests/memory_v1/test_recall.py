@@ -91,6 +91,17 @@ class TestRecallV1(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    def test_doctor_accepts_relevant_body_without_literal_query_in_title(self):
+        from memory_v1.doctor import _recall_rows
+        (self.vault / "canonical" / "runtime-notes.md").write_text(
+            "---\nstatus: active\n---\n# Runtime Notes\nOperating context: the current runtime is Hermes.\n",
+            encoding="utf-8",
+        )
+        result = targeted_recall(self.config, "operating context", budget_chars=2000)
+        self.assertGreater(result["items_count"], 0)
+        rows = {row["check"]: row for row in _recall_rows(self.config)}
+        self.assertEqual(rows["recall_engine"]["status"], "pass")
+
     def _make_test_event(
         self,
         runtime: str = "claude",

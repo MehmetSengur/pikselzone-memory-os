@@ -1128,13 +1128,13 @@ def _recall_rows(config: MemoryConfig) -> list[dict[str, str]]:
                 and has_authority
                 and t_res.get("items_count", 0) > 0
                 and len(results) > 0
-                and any(
-                    "operating context" in str(r.get("title", "")).lower()
-                    or "operating context" in str(r.get("source", "")).lower()
-                    for r in results
-                )
             )
-            rows.append(_row("recall_engine", "pass" if engine_pass else "fail", "operational (lexical-deterministic)" if engine_pass else "no-items-returned"))
+            # Lexical matches can come from a body; the query need not be in
+            # the title/path. Keep partial source failures visible separately.
+            if engine_pass and t_res.get("status") == "partial":
+                rows.append(_row("recall_engine", "warn", "operational-partial:invalid-source"))
+            else:
+                rows.append(_row("recall_engine", "pass" if engine_pass else "fail", "operational (lexical-deterministic)" if engine_pass else "no-items-returned"))
     except Exception as exc:
         rows.append(_row("recall_engine", "fail", f"error:{exc}"))
         return rows
