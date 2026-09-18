@@ -1,0 +1,55 @@
+{
+  "activation": {
+    "activated_at": "2026-09-16T18:28:33+03:00",
+    "canary": "PZ-IDLE-CANARY-acfc949e",
+    "live_tree_before": "feat/contabo-memory-model-routing@1b1726f71cd0099482ceac0d45162131d86f6756",
+    "live_tree_now": "40d21f5c0f84f852a539eb54ea95a347c50b9ac9",
+    "branch": "fix/idle-turn-finalize",
+    "backup": "state/backups/idle-acceptance-20260916T182723+0300",
+    "idle_finalize_seconds": 2700,
+    "idle_spawn_cap_per_sessionstart": 2,
+    "backlog_at_activation": [
+      {
+        "checkpoint": "claude-8cb5772ed24037b869b62aae2ed90f47-turn_complete-7d8f9384f1d9b76e.json",
+        "project": "pikselzone-orchestrator",
+        "runtime": "claude"
+      },
+      {
+        "checkpoint": "claude-51897eff2085d819e2b222a66fe091da-turn_complete-ec5fe5bac27204bc.json",
+        "project": "pikselzone-orchestrator",
+        "runtime": "claude"
+      },
+      {
+        "checkpoint": "claude-36a3137042ae63a6ba3424cdc273be0a-turn_complete-d7e38d43d7e99914.json",
+        "project": "sengur-ambalaj",
+        "runtime": "claude"
+      },
+      {
+        "checkpoint": "claude-76e03a714889a3e9b81f033d2a175afb-turn_complete-8f17987e01e3fe6d.json",
+        "project": "pikselzone-memory-os",
+        "runtime": "claude"
+      },
+      {
+        "checkpoint": "codex-16c104f180f00574279306b69d3f2c6b-turn_complete-767e6a8eb74cddb9.json",
+        "project": "pikselzone-orchestrator",
+        "runtime": "codex"
+      },
+      {
+        "checkpoint": "claude-133eac53b30401bd9f562592f06f0533-turn_complete-fb1dedf81cf8aeb7.json",
+        "project": "pikselzone-orchestrator",
+        "runtime": "claude"
+      },
+      {
+        "checkpoint": "claude-8f9a4d22503bd3a125da734d9bc2e5cd-turn_complete-b13f673dc9229f34.json",
+        "project": "pikselzone-memory-os",
+        "runtime": "claude"
+      },
+      {
+        "checkpoint": "claude-44af83f0612ce84c7b1ea9db553641d0-turn_complete-aa7194e5df002094.json",
+        "project": "pikselzone-memory-os",
+        "runtime": "claude"
+      }
+    ],
+    "note": "Backlog drains 2 per SessionStart; the canary thread is eligible only after it is 45+ minutes idle and the older backlog has drained."
+  }
+}
