@@ -90,6 +90,94 @@ class ServiceProfileGuardTests(unittest.TestCase):
         self.assertTrue(issubclass(guards.ServiceProfileRefused, FileNotFoundError))
 
 
+def _fake_bot_mode(root: Path):
+    """tools.bot_mode_probe / bot_relay / bot_mode_dm seams, with consumers resolving them
+    through module globals the way Hermes 0.21.3 does."""
+    import shlex
+
+    probe = types.ModuleType("tools.bot_mode_probe")
+    probe._roster = lambda r: [("default", r), *((p.name, p) for p in sorted((r / "profiles").iterdir()))]
+    probe.teammates = lambda: [name for name, _home in probe._roster(root)]
+
+    relay = types.ModuleType("tools.bot_relay")
+    relay._hermes_cli = lambda: "/venv/bin/hermes"
+    relay.local_delivery_command = lambda profile, qf: [relay._hermes_cli(), "-p", profile, "chat", "--query-file", qf]
+
+    dm = types.ModuleType("tools.bot_mode_dm")
+    dm._delivery_command = lambda argv, dm_file, *, stdin_file, profile_home=None, author=None: shlex.join(
+        ["python", "bot_mode_dm.py", "--run-delivery", dm_file, *argv])
+    return probe, relay, dm
+
+
+class BotModeGuardTests(unittest.TestCase):
+    """Bot Mode rosters and DM children honour the service-profile boundary."""
+
+    def setUp(self) -> None:
+        from unittest import mock
+        self.mock = mock
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+        for name in ("pz-orchestrator", "pz-sengur", "pz-memory-compiler"):
+            (self.root / "profiles" / name).mkdir(parents=True)
+        self.compiler = self.root / "profiles" / "pz-memory-compiler"
+        (self.compiler / guards.SERVICE_MARKER).write_text(json.dumps({
+            "schema": guards.SERVICE_SCHEMA, "service": "knowledge-compiler",
+        }), encoding="utf-8")
+        self.cli = self.root / "bin" / "hermes"
+        self.cli.parent.mkdir()
+        self.cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.cli.chmod(0o755)
+        self.probe, self.relay, self.dm = _fake_bot_mode(self.root)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _guard(self, process_home=None, cli=None):
+        return guards.install_bot_mode_guards(
+            self.probe, self.relay, self.dm, process_home=process_home or self.root,
+            cli=str(self.cli) if cli is None else cli)
+
+    def test_service_profile_is_not_a_teammate(self):
+        self.assertTrue(self._guard())
+        self.assertEqual(["default", "pz-orchestrator", "pz-sengur"], self.probe.teammates())
+
+    def test_compiler_process_keeps_its_own_roster_entry(self):
+        self._guard(process_home=self.compiler)
+        self.assertIn("pz-memory-compiler", self.probe.teammates())
+
+    def test_dm_child_starts_through_the_guarded_cli(self):
+        self._guard()
+        command = self.dm._delivery_command(["hermes", "-p", "pz-sengur", "chat", "-c", "Bot Chat"], "/tmp/dm",
+                                            stdin_file=False)
+        self.assertIn(f"{self.cli} -p pz-sengur chat", command)
+        self.assertNotIn(" hermes -p", command)
+        self.assertEqual(str(self.cli), self.relay.local_delivery_command("pz-sengur", "/tmp/q")[0])
+
+    def test_guarded_cli_keeps_the_basename_hermes_routing_needs(self):
+        self.assertTrue(guards._is_hermes_cli(str(self.cli)))
+        with self.mock.patch.dict("os.environ", {guards.BOT_CLI_ENV: str(self.cli)}):
+            self.assertEqual(str(self.cli), guards.guarded_bot_cli())
+        wrong_name = self.root / "bin" / "pz-hermes"
+        wrong_name.write_text("#!/bin/sh\n", encoding="utf-8")
+        wrong_name.chmod(0o755)
+        for value in (str(wrong_name), str(self.root / "missing" / "hermes"), ""):
+            with self.mock.patch.dict("os.environ", {guards.BOT_CLI_ENV: value}):
+                self.assertIsNone(guards.guarded_bot_cli())
+
+    def test_without_a_guarded_cli_roster_is_still_filtered_and_install_reports_it(self):
+        self.assertFalse(self._guard(cli=""))
+        self.assertNotIn("pz-memory-compiler", self.probe.teammates())
+        self.assertEqual("/venv/bin/hermes", self.relay._hermes_cli())
+
+    def test_install_is_idempotent_and_reports_a_missing_seam(self):
+        self._guard()
+        wrapped = self.probe._roster
+        self.assertTrue(self._guard())
+        self.assertIs(wrapped, self.probe._roster)
+        self.assertFalse(guards.install_bot_mode_guards(types.ModuleType("empty"), self.relay, self.dm,
+                                                        process_home=self.root, cli=str(self.cli)))
+
+
 class LauncherOrderTests(unittest.TestCase):
     def test_hermes_sees_its_own_argv_before_any_hermes_import(self):
         # The Telegram unit runs `pz-hermes -p pz-orchestrator gateway run`; Hermes

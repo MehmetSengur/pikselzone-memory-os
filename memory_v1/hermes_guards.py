@@ -12,6 +12,17 @@ Service profiles are not chat surfaces
     ``session.create``/prompt paths refuse it. The compiler's own process is
     not guarded and runs as before.
 
+Bot Mode reaches profiles on its own paths
+    Hermes 0.21.3 Bot Mode lists teammates and resolves ``message_agent``
+    targets by reading ``profiles/`` directly (``tools.bot_mode_probe._roster``),
+    and delivers each DM as a separate ``hermes -p <target> chat`` child that
+    would start without these guards. In a guarded process the roster leaves
+    service profiles out, and delivery children start through the guarded
+    ``hermes`` entry named by ``PZ_HERMES_BOT_CLI`` (basename ``hermes``, so
+    Hermes' own live-owner routing still recognizes it); they inherit
+    ``PZ_HERMES_USER_SURFACE`` and get the same guards. A user-surface process
+    whose own home is a service profile is refused outright.
+
 Backend updates follow the runbook
     Desktop offers "Update" for the backend checkout, which would pull
     upstream into the running Contabo install past the memory plugin's tested
@@ -116,6 +127,67 @@ def install_profile_guards(profiles_mod: Any, *, process_home: Path | None) -> N
     profiles_mod.__pz_service_profile_guard__ = True
 
 
+BOT_CLI_ENV = "PZ_HERMES_BOT_CLI"
+
+
+def _is_hermes_cli(value: Any) -> bool:
+    # Same basename rule Hermes uses to recognize a delivery argv (bot_mode_dm).
+    name = str(value or "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+    return name in ("hermes", "hermes.exe")
+
+
+def guarded_bot_cli() -> str | None:
+    """The guarded ``hermes`` entry for Bot Mode delivery children, or None when unusable."""
+    path = os.environ.get(BOT_CLI_ENV, "")
+    if path and _is_hermes_cli(path) and os.path.isfile(path) and os.access(path, os.X_OK):
+        return path
+    return None
+
+
+def install_bot_mode_guards(
+    probe_mod: Any, relay_mod: Any, dm_mod: Any, *, process_home: Path | None, cli: str | None
+) -> bool:
+    """Keep service profiles out of Bot Mode rosters and start delivery children guarded.
+
+    Idempotent. Returns False when a seam is missing or no guarded CLI is available;
+    the roster filter is still installed whenever its seam exists."""
+    if getattr(probe_mod, "__pz_bot_mode_guard__", False):
+        return True
+    own_home = Path(process_home).resolve() if process_home else None
+    original_roster = getattr(probe_mod, "_roster", None)
+    if original_roster is None:
+        return False
+
+    @functools.wraps(original_roster)
+    def _roster(*args: Any, **kwargs: Any):
+        return [
+            (name, home) for name, home in original_roster(*args, **kwargs)
+            if not (is_service_profile_home(home) and Path(home).resolve() != own_home)
+        ]
+
+    probe_mod._roster = _roster
+    probe_mod.__pz_bot_mode_guard__ = True
+
+    original_cli = getattr(relay_mod, "_hermes_cli", None)
+    original_command = getattr(dm_mod, "_delivery_command", None)
+    if not cli or original_cli is None or original_command is None:
+        return False
+
+    @functools.wraps(original_cli)
+    def _hermes_cli() -> str:
+        return cli
+
+    @functools.wraps(original_command)
+    def _delivery_command(argv: list[str], *args: Any, **kwargs: Any):
+        if argv and _is_hermes_cli(argv[0]):
+            argv = [cli, *argv[1:]]
+        return original_command(argv, *args, **kwargs)
+
+    relay_mod._hermes_cli = _hermes_cli
+    dm_mod._delivery_command = _delivery_command
+    return True
+
+
 def install_update_guard() -> None:
     import hermes_cli.web_server_files as files
 
@@ -184,11 +256,25 @@ def main(argv: list[str] | None = None) -> int:
         from hermes_cli import profiles
         from hermes_constants import get_hermes_home
 
-        # The process home after the profile override: a service profile may run
-        # its own process, and only other service profiles are refused.
-        install_profile_guards(profiles, process_home=Path(get_hermes_home()))
+        # The process home after the profile override. A service profile runs its own
+        # process without the user-surface flag; with it, the process is refused.
+        process_home = Path(get_hermes_home())
+        if is_service_profile_home(process_home):
+            print(f"pz-hermes: profile '{process_home.name}' is a service profile and is not "
+                  "available for chats", file=sys.stderr)
+            return 2
+        install_profile_guards(profiles, process_home=process_home)
         if "dashboard" in args:
             install_update_guard()
+        try:
+            from tools import bot_mode_dm, bot_mode_probe, bot_relay
+
+            if not install_bot_mode_guards(bot_mode_probe, bot_relay, bot_mode_dm,
+                                           process_home=process_home, cli=guarded_bot_cli()):
+                print(f"pz-hermes: Bot Mode delivery guard incomplete (seam changed or {BOT_CLI_ENV} "
+                      "unusable)", file=sys.stderr)
+        except ImportError as exc:
+            print(f"pz-hermes: Bot Mode guard unavailable: {exc}", file=sys.stderr)
     try:
         from agent import system_prompt
         from agent.prompt_builder import KANBAN_GUIDANCE
