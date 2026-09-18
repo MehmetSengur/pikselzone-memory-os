@@ -21,6 +21,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pz-memory")
     parser.add_argument("--config", required=True, type=Path)
     commands = parser.add_subparsers(dest="command", required=True)
+    trace = commands.add_parser('trace', help='Trace a memory using safe references and reason codes')
+    trace.add_argument('--query', required=True)
+    trace.add_argument('--session-id', default='')
+    profiles = commands.add_parser('profiles', help='Configured versus native-observed profile integration')
+    profiles.add_argument('--base', type=Path)
+    profiles.add_argument('--reconcile', action='store_true', help='Bounded native profile inventory; never edits profile settings')
+    parser.add_argument('--manual', action='store_true', help='Explicit processing/recall in manual mode; never overrides no-memory')
     flush = commands.add_parser("flush")
     flush.add_argument("--runtime", required=True, choices=("codex", "claude", "hermes"))
     flush.add_argument("--event")
@@ -119,6 +126,27 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         config = MemoryConfig.load(args.config)
+        from .profile_integration import active_settings
+        settings = active_settings()
+        if settings:
+            import dataclasses
+            config = dataclasses.replace(config, memory={**config.memory,
+                'owner':settings['owner'], 'project':settings['project'], 'projects':settings['projects'],
+                'shared':settings['shared'], 'mode':settings['mode'], 'no_memory':settings['status']=='opt-out'})
+        if args.manual:
+            import dataclasses
+            config = dataclasses.replace(config, memory={**config.memory, 'mode':'normal'})
+        if args.command == 'trace':
+            from .trace import trace_memory
+            print(json.dumps(trace_memory(config, args.query, session_id=args.session_id), ensure_ascii=False))
+            return 0
+        if args.command == 'profiles':
+            from .profile_integration import profile_report, reconcile_profiles
+            roots = config.transcript_roots.get('hermes', ())
+            base = args.base or (Path(settings['base_dir']) if settings else (roots[0] / 'memory-v1' if roots else config.state_path.parent))
+            print(json.dumps({'profiles':reconcile_profiles() if args.reconcile else profile_report(base)}, ensure_ascii=False))
+            return 0
+
         if args.command == "flush":
             stdin_text = "" if args.hook_input else sys.stdin.read()
             payload = load_hook_input(args.hook_input, stdin_text)

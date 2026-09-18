@@ -315,6 +315,9 @@ def checkpoint_hook(
     project: str | None = None, continuity_scope: str | None = None,
 ) -> Path:
     """Atomically preserve normalized transcript data before compaction returns."""
+    from .memory_policy import config_policy
+    if not config_policy(config)['capture']:
+        raise PolicyError('memory-recording-disabled')
     if runtime not in config.runtimes:
         raise PolicyError("runtime-not-enabled")
     event_raw = event_override or _first_text(
@@ -335,7 +338,7 @@ def checkpoint_hook(
     event = normalize_event_name(event_raw)
     normalized, turn_count, digest = normalize_transcript(
         _validated_transcript_path(config, runtime, transcript),
-        allowed_roots=config.transcript_roots.get(runtime, ()),
+        allowed_roots=config.transcript_roots.get(runtime, ()), include_tool_results=True,
     )
     if turn_count == 0:
         raise SchemaError("checkpoint-transcript-empty")
@@ -490,6 +493,9 @@ def drain_checkpoint(
     the record.  Nothing here deletes a raw checkpoint -- only the existing
     ``settle_selected`` path does.
     """
+    from .memory_policy import config_policy
+    if not config_policy(config)["summarize"]:
+        raise PolicyError("automatic-processing-disabled-checkpoint-retained")
     from .retry import (
         CHECKPOINT_NAME_RE, clear_retry_state, pending_turn_batch_key,
         record_drain_failure,

@@ -66,8 +66,8 @@ class InternalCallGuardLifetimeTests(HermesPluginFixture, unittest.TestCase):
             try:
                 for _ in threads:
                     self.assertTrue(entered.acquire(timeout=5), "summarizer never started")
-                # While both are inside, a recursive call must still be refused.
-                self.assertTrue(self.plugin._is_internal_call())
+                # A different native thread remains able to capture while both summaries run.
+                self.assertFalse(self.plugin._is_internal_call())
             finally:
                 release.set()
                 for thread in threads:

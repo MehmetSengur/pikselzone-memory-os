@@ -77,8 +77,8 @@ def run_container_compiler(
         "existing_knowledge": existing_knowledge,
     }, ensure_ascii=False)
 
-    prev_env = os.environ.get("PZ_MEMORY_INTERNAL_CALL")
-    os.environ["PZ_MEMORY_INTERNAL_CALL"] = "1"
+    from memory_v1.internal_calls import enter, leave
+    enter()
     try:
         res = llm.complete_structured(
             instructions=COMPILER_INSTRUCTION,
@@ -93,10 +93,7 @@ def run_container_compiler(
         logger.error("Knowledge compilation LLM call failed: %s", exc)
         return {"status": "error", "error": str(exc)}
     finally:
-        if prev_env is None:
-            os.environ.pop("PZ_MEMORY_INTERNAL_CALL", None)
-        else:
-            os.environ["PZ_MEMORY_INTERNAL_CALL"] = prev_env
+        leave()
 
     if not parsed or parsed.get("status") != "changes":
         return {"status": "no_changes", "writes": []}

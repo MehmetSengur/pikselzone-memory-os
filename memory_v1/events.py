@@ -14,6 +14,8 @@ from .core import (
     exclusive_lock, iso_now, normalize_transcript, reject_symlink_chain,
     path_within, session_key, summary_json_schema, validate_summary, write_health,
 )
+from .critical_records import extract_records, merge_records, validate_records
+from .memory_policy import config_policy
 from .provider import StructuredResponsesProvider
 from .rule_learner import RuleLearner
 from .skill_engine import SkillEngine, WorkflowObservation
@@ -36,7 +38,7 @@ FRONTMATTER_FIELDS = {
 # Optional frontmatter keys tolerated by parse_event_artifact / _validate_event_object.
 # session_model: the model the session ran on; summarizer_model: the model
 # that wrote this summary. source_model keeps its historical meaning per path.
-OPTIONAL_FRONTMATTER_FIELDS = {"source_provider", "project", "session_model", "summarizer_model"}
+OPTIONAL_FRONTMATTER_FIELDS = {"source_provider", "project", "session_model", "summarizer_model", "critical_records", "memory_scope"}
 _PROJECT_RE = re.compile(r"unscoped|[a-z0-9][a-z0-9-]{0,63}")
 
 
@@ -113,8 +115,15 @@ class EventWriter:
         else:
             normalized, turn_count, source_digest = normalize_transcript(
                 transcript,
-                allowed_roots=self.config.transcript_roots.get(runtime, ()),
+                allowed_roots=self.config.transcript_roots.get(runtime, ()), include_tool_results=True,
             )
+        policy = config_policy(self.config, project=project)
+        if not policy["capture"]:
+            raise PolicyError("memory-recording-disabled")
+        records = extract_records(normalized, runtime=runtime, session_id=session_id,
+                                  owner=policy["owner"], project=project or "unscoped")
+        scope = {"owner": policy["owner"], "project": project or "unscoped",
+                 "visibility": "private" if policy["owner"] else "project"}
         input_redactions = normalized.count("[REDACTED_SECRET]")
         if turn_count == 0:
             raise NoMemory("transcript-empty")
@@ -183,6 +192,7 @@ class EventWriter:
                     project=existing.get("project") or project,
                     session_model=existing.get("session_model"),
                     summarizer_model=existing.get("summarizer_model"),
+                    critical_records=existing.get("critical_records", []), memory_scope=existing.get("memory_scope"),
                 )
                 atomic_write(event_path, rendered.encode("utf-8"), mode=0o640)
                 atomic_json(state_path, {
@@ -234,6 +244,8 @@ class EventWriter:
             except (ProviderBlocked, SchemaError) as exc:
                 write_health(self.config.state_path, f"flush-{runtime}", "blocked", str(exc))
                 raise
+            if summary["status"] == "empty" and records:
+                summary["status"] = "ok"
             if summary["status"] == "empty":
                 empty_state = {
                     "runtime": runtime,
@@ -296,6 +308,8 @@ class EventWriter:
                 root_task_id=root_task_id, project=project,
                 kanban_ids=kanban_ids or [], source_digest=source_digest,
                 summary=artifact_summary, redaction_count=redaction_count,
+                critical_records=merge_records((merge_base or {}).get("critical_records", []), records),
+                memory_scope=scope,
             )
             parse_event_artifact(rendered)
             atomic_write(event_path, rendered.encode("utf-8"), mode=0o640)
@@ -321,6 +335,7 @@ class EventWriter:
             # canonical writer -- the VPS knowledge compiler -- because two
             # hosts rewriting the same synced markdown produced unmergeable
             # Obsidian Sync conflicts and a collapsing index.
+            shared_learning = not scope.get("owner") and scope.get("project") in ("", "unscoped", None)
             try:
                 companion_mgr = CompanionManager(
                     self.config.vault_path, continuity_scope=continuity_scope
@@ -338,7 +353,7 @@ class EventWriter:
                 # to reach the provenance check intact, not as a stray first
                 # line that reads like the user's own sentence.
                 turn_pairs = split_rendered_transcript(normalized)
-                if turn_pairs:
+                if turn_pairs and shared_learning:
                     rule_learner.learn_from_transcript(turn_pairs, source_session=f"{runtime}-{state_key}")
 
                 if summary and summary.get("status") in {"memory", "ok"}:
@@ -353,12 +368,13 @@ class EventWriter:
                         active_project=continuity_scope or project or self.config.vault_path.name,
                         updated_at=timestamp,
                     )
-                    companion_mgr.write_last_session(ls_data)
+                    if not scope.get("owner"):
+                        companion_mgr.write_last_session(ls_data)
 
                     # Append to Journal
                     decisions = summary.get("decisions", [])
                     learnings = summary.get("learnings", [])
-                    if decisions or learnings:
+                    if shared_learning and (decisions or learnings):
                         narrative = " ".join(decisions[:2] + learnings[:2])
                         record_journal(
                             self.config, companion_mgr,
@@ -377,7 +393,7 @@ class EventWriter:
                     # practice they were task briefs and pasted prompts, and every
                     # skill synthesized that way was a one-off job description.
 
-                    for cand in workflow_candidates:
+                    for cand in workflow_candidates if shared_learning else []:
                         w_name = cand.split(":", 1)[0].strip(" -:\n") if ":" in cand else cand[:40].strip(" -:\n")
                         if ":" in w_name:
                             w_name = w_name.split(":")[-1].strip()
@@ -431,6 +447,7 @@ class EventWriter:
         summary: dict[str, Any], redaction_count: int,
         project: str | None = None,
         session_model: str | None = None, summarizer_model: str | None = None,
+        critical_records: list[dict] | None = None, memory_scope: dict | None = None,
     ) -> str:
         frontmatter = [
             "---",
@@ -450,6 +467,11 @@ class EventWriter:
             frontmatter.append(f"session_model: {json.dumps(session_model)}")
         if summarizer_model:
             frontmatter.append(f"summarizer_model: {json.dumps(summarizer_model)}")
+        if critical_records:
+            validate_records(critical_records)
+            frontmatter.append("critical_records: " + json.dumps(critical_records, ensure_ascii=False))
+        if memory_scope is not None:
+            frontmatter.append("memory_scope: " + json.dumps(memory_scope, ensure_ascii=False))
         frontmatter.append(f"project: {json.dumps(project or 'unscoped')}")
         frontmatter.extend([
             f"root_task_id: {json.dumps(root_task_id or 'unknown')}",
@@ -519,6 +541,15 @@ def parse_event_artifact(text: str) -> dict[str, Any]:
 
 
 def _validate_event_object(value: dict[str, Any]) -> None:
+    validate_records(value.get("critical_records", []))
+    scope = value.get("memory_scope", {})
+    if not isinstance(scope, dict) or any(not isinstance(v, str) for v in scope.values()):
+        raise SchemaError("event-scope-invalid")
+    if scope.get("visibility", "project") not in ("private", "project", "shared"):
+        raise SchemaError("event-scope-visibility-invalid")
+    for r in value.get("critical_records", []):
+        if r["session_id"] != value["session_id"] or r["runtime"] != value["runtime"] or r["owner"] != scope.get("owner", "") or r["project"] != scope.get("project", value.get("project", "unscoped")):
+            raise SchemaError("event-record-owner-mismatch")
     if value["schema"] != "pikselzone-memory-event-v1":
         raise SchemaError("event-schema-name-invalid")
     if value["runtime"] not in RUNTIMES or value["source_runtime"] != value["runtime"]:

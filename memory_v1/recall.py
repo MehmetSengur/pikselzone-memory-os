@@ -42,6 +42,9 @@ from .core import (
     sha256_file,
 )
 from .events import parse_event_artifact
+from .critical_records import render_records
+from .memory_policy import config_policy
+from .recall_access import filter_items, source_reason
 from .graph_engine import _frontmatter_lines, _strip_optional_quotes
 
 logger = logging.getLogger("memory_v1.recall")
@@ -696,7 +699,7 @@ def _load_knowledge_index_entries(config: MemoryConfig, query: str = "") -> list
 
 def _load_recent_daily_tail(
     config: MemoryConfig, max_events: int = 3, query: str = "",
-    *, project_filter: str | None = None,
+    *, project_filter: str | None = None, diagnostics: list | None = None,
 ) -> list[RecallItem]:
     """Tier D: Load a small bounded tail of recent daily events.
 
@@ -712,7 +715,7 @@ def _load_recent_daily_tail(
 
     candidates: list[Path] = []
     try:
-        for day_dir in sorted(daily_root.glob("20*"), reverse=True)[:5]:
+        for day_dir in sorted(daily_root.glob("20*"), reverse=True)[:365 if query else 5]:
             if day_dir.is_dir():
                 files = [p for p in day_dir.glob("*.md") if p.is_file()]
                 files.sort(key=lambda p: (p.stat().st_mtime if p.exists() else 0), reverse=True)
@@ -721,13 +724,18 @@ def _load_recent_daily_tail(
         return []
 
     items: list[RecallItem] = []
-    for path in candidates[:10]:
+    for path in candidates[:256 if query else 10]:
         if len(items) >= max_events and not query:
             break
         try:
             reject_symlink_chain(path)
             content, digest = secure_read_text(path, root=config.vault_path, max_bytes=512 * 1024)
             event = parse_event_artifact(content)
+            reason = source_reason(config, str(path.relative_to(config.vault_path)), text=content, project=project_filter)
+            if reason:
+                if diagnostics is not None:
+                    diagnostics.append({'source':str(path.relative_to(config.vault_path)), 'reason':reason})
+                continue
             if project_filter is not None and event.get("project") != project_filter:
                 continue
             rel_path = str(path.relative_to(config.vault_path))
@@ -748,6 +756,24 @@ def _load_recent_daily_tail(
                 decisions_bullets = sections.get("decisions") or sections.get("Alınan Kararlar") or []
                 bullets = context_bullets[:2] + decisions_bullets[:2]
                 summary_text = "\n".join(f"- {b}" for b in bullets)
+            records = event.get("critical_records", [])
+            # Independent whole records survive irrelevant long summary text. Include
+            # linked predecessors alongside a correction so history remains visible.
+            selected_records = records
+            if query:
+                selected_records = [r for r in records if score_text_relevance(r['text'], query) > 0]
+                linked = {x for r in selected_records for x in r['supersedes'] + r['conflicts_with']}
+                selected_records = [r for r in records if r in selected_records or r['id'] in linked]
+            if selected_records:
+                preserved = render_records(selected_records)
+                record_text, _ = sanitize_untrusted_memory(preserved)
+                items.append(RecallItem(
+                    item_id=f"critical-{path.stem}", item_type="daily_event",
+                    title=f"Source-linked records ({event.get('created_at', '')[:10]})",
+                    content=record_text, source_file=rel_path, source_sha256=digest,
+                    relevance_score=score_text_relevance(preserved, query) + 5.0,
+                    derived=True, created_at=event.get('created_at'),
+                ))
             sanitized, _ = sanitize_untrusted_memory(summary_text)
 
             score = score_text_relevance(
@@ -770,7 +796,9 @@ def _load_recent_daily_tail(
                     created_at=event.get("created_at"),
                 ))
         except Exception as exc:
-            logger.warning("Error reading daily event %s: %s", path, exc)
+            if diagnostics is not None:
+                diagnostics.append({"source": str(path.relative_to(config.vault_path)), "reason":"invalid-source"})
+            logger.warning("Error reading daily event %s: %s", path, type(exc).__name__)
 
     return items
 
@@ -833,6 +861,8 @@ def build_startup_recall_bundle(
     (skills) always stay shared across the Pikselzone workspace.
     """
     limit = budget_chars or config.context_budget_chars or TARGET_BUDGET_CHARS
+    if limit >= MIN_MANDATORY_ENVELOPE_CHARS:
+        limit = max(MIN_MANDATORY_ENVELOPE_CHARS, int(limit * config_policy(config)["budget_scale"]))
     if limit < MIN_MANDATORY_ENVELOPE_CHARS:
         raise ValueError(
             f"Requested budget ({limit} chars) is below minimum mandatory authority envelope ({MIN_MANDATORY_ENVELOPE_CHARS} chars)"
@@ -848,6 +878,9 @@ def build_startup_recall_bundle(
     tier_e = _load_skills_summary(config)
 
     raw_items = tier_a + tier_b + tier_c + tier_d + tier_e
+    raw_items, scope_rejections = filter_items(config, raw_items, project=project_filter or continuity_scope)
+    if not config_policy(config)["recall"]:
+        raw_items = []
     deduped = deduplicate_memory_items(raw_items)
 
     # Group by category, strongest first; the allocator below decides what fits.
@@ -926,6 +959,7 @@ def build_startup_recall_bundle(
 
     trunc_label = "[TRUNCATED_DUE_TO_HARD_BUDGET_LIMIT]" if limit >= HARD_MAX_CHARS else "[TRUNCATED_TO_BUDGET]"
     audit: dict[str, Any] = {
+        "scope_rejections": scope_rejections,
         "target_chars": limit,
         "hard_max_chars": HARD_MAX_CHARS,
         "envelope_chars": len(render([])),
@@ -1009,7 +1043,7 @@ def build_startup_recall_bundle(
         for item in by_type.get(kind, []):
             if admit(kind, item, caps[kind]):
                 continue
-            if not chosen[kind] and caps[kind] > 400:
+            if not chosen[kind] and caps[kind] > 400 and not item.item_id.startswith("critical-"):
                 # A single oversized item: keep a shortened copy rather than
                 # lose the whole category.
                 if admit(kind, truncated(item, caps[kind] - 200), caps[kind]):
@@ -1039,15 +1073,13 @@ def build_startup_recall_bundle(
     active_items = assembled()
     bundle_text = render(active_items)
 
-    # If still over limit, clamp to limit
+    # Source receipts must describe text still present after budget enforcement.
+    while len(bundle_text) > limit and active_items:
+        removed = active_items.pop()
+        audit['notes'].append(f"{removed.item_id}:budget-excluded")
+        bundle_text = render(active_items)
     if len(bundle_text) > limit:
-        marker = "\n[TRUNCATED_DUE_TO_HARD_BUDGET_LIMIT]\n" if limit >= HARD_MAX_CHARS else "\n[TRUNCATED_DUE_TO_BUDGET_LIMIT]\n"
-        bundle_text = bundle_text[:limit - len(marker)] + marker
-
-    # Hard ceiling clamp
-    if len(bundle_text) > HARD_MAX_CHARS:
-        marker = "\n[TRUNCATED_DUE_TO_HARD_BUDGET_LIMIT]\n"
-        bundle_text = bundle_text[:HARD_MAX_CHARS - len(marker)] + marker
+        bundle_text = bundle_text[:limit]  # authority-only envelope; no selected sources
 
     source_files = sorted({it.source_file for it in active_items})
     source_shas = {it.source_file: it.source_sha256 for it in active_items}
@@ -1106,6 +1138,9 @@ def associative_recall_fast(
     ``connections/`` wholesale, never walks the graph, never writes.
     Read-only; failures are the caller's responsibility (fail-open).
     """
+    if not config_policy(config)["recall"]:
+        return ""
+    budget_chars = int(budget_chars * config_policy(config)["budget_scale"])
     normalized = " ".join((query or "").lower().split())
     if (
         not normalized
@@ -1166,6 +1201,7 @@ def associative_recall_fast(
         if len(picked) >= max_items:
             break
 
+    picked, _ = filter_items(config, picked)
     if not picked:
         return ""
 
@@ -1209,6 +1245,7 @@ def targeted_recall(
         raise PolicyError("empty-recall-query")
 
     candidates: list[RecallItem] = []
+    read_issues = []
 
     # 0. Search canonical docs.  A document's authority comes from its own
     #    ``status:`` frontmatter; the folder it sits in confers nothing.
@@ -1248,7 +1285,7 @@ def targeted_recall(
                     derived=not authority.authoritative,
                 ))
             except Exception:
-                pass
+                read_issues.append({'source':str(path.relative_to(config.vault_path)), 'reason':'invalid-source'})
 
     # 1. Search knowledge/index.md
     index_items = _load_knowledge_index_entries(config, query=query)
@@ -1277,7 +1314,7 @@ def targeted_recall(
                         derived=True,
                     ))
             except Exception:
-                pass
+                read_issues.append({'source':str(path.relative_to(config.vault_path)), 'reason':'invalid-source'})
 
     # 2.5 Search companion documents (Core, Kurallar, Last-Session, Threads, Journal)
     for parent in ("companion", "🔮 850-Companion", ""):
@@ -1305,7 +1342,7 @@ def targeted_recall(
                         derived=False if c_file.stem == "Core" else True,
                     ))
             except Exception:
-                pass
+                read_issues.append({'source':str(c_file.relative_to(config.vault_path)), 'reason':'invalid-source'})
 
     # 2.6 Search skills
     for skills_dir_name in ("skills", ".claude/skills", ".codex/skills"):
@@ -1330,50 +1367,49 @@ def targeted_recall(
                         derived=True,
                     ))
             except Exception:
-                pass
+                read_issues.append({'source':str(path.relative_to(config.vault_path)), 'reason':'invalid-source'})
 
     # 3. Search daily events
-    daily_items = _load_recent_daily_tail(config, max_events=20, query=query)
+    daily_items = _load_recent_daily_tail(config, max_events=20, query=query, diagnostics=read_issues)
     candidates.extend(daily_items)
 
     # Deduplicate, then rank deterministically: relevance first, declared
     # authority second, source path last.  Scan order -- i.e. which folder a
     # document happens to live in -- must never break a tie.
+    candidates, scope_rejections = filter_items(config, candidates)
     deduped = deduplicate_memory_items(candidates)
     ranked = sorted(
         deduped, key=lambda x: (-x.relevance_score, x.derived, x.source_file)
     )
 
-    selected = ranked[:max_items]
-
-    # Format result markdown
-    lines = [
-        f"=== TARGETED MEMORY RECALL ===",
-        f"Query: {query}",
-        f"Matches: {len(selected)}",
-        "",
-        AUTHORITY_NOTICE,
-        "",
-    ]
-
-    total_len = sum(len(it.content) for it in selected)
-    for it in selected:
-        label = (
-            "[DERIVED MEMORY — verify against operational truth]"
-            if it.derived
-            else "[AUTHORITATIVE SOURCE]"
-        )
-        lines.append(f"### [{it.relevance_score:.2f}] {it.title} {label}")
-        lines.append(f"Source: {it.source_file} (sha256: {it.source_sha256[:16]}...)")
-        lines.append(it.content)
-        lines.append("")
-
+    selected = []
+    audit = list(scope_rejections) + read_issues
+    policy = config_policy(config)
+    budget_chars = max(0, int(budget_chars * policy["budget_scale"]))
+    lines = ["=== TARGETED MEMORY RECALL ===", AUTHORITY_NOTICE, ""]
+    if not policy['recall']:
+        ranked = []
+        audit.append({'reason': 'automatic-recall-disabled'})
+    for it in ranked:
+        label = "DERIVED MEMORY — verify against operational truth" if it.derived else "AUTHORITATIVE SOURCE"
+        block = f"### [{it.relevance_score:.2f}] {it.title} [{label}]\nSource: {it.source_file} (sha256: {it.source_sha256})\n{it.content}\n"
+        if len(selected) >= max_items:
+            reason = 'rank-limit'
+        elif len("\n".join(lines)) + len(block) + 1 > budget_chars:
+            reason = 'budget-excluded'
+        else:
+            selected.append(it)
+            lines.append(block)
+            reason = 'selected-for-context'
+        audit.append({'id': it.item_id, 'source': it.source_file, 'sha256': it.source_sha256, 'reason': reason})
     rendered = "\n".join(lines)
     if len(rendered) > budget_chars:
-        rendered = rendered[:budget_chars - 60] + "\n[TRUNCATED_DUE_TO_TARGETED_BUDGET_LIMIT]\n"
-
+        rendered = ""
     return {
         "schema": "pikselzone-targeted-recall-v1",
+        "selection_audit": audit,
+        "delivery": "prepared-not-native-delivery",
+        "status": "partial" if any(x["reason"] == "invalid-source" for x in audit) else "ok",
         "query": query,
         "items_count": len(selected),
         "total_chars": len(rendered),

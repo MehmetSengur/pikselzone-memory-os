@@ -131,111 +131,113 @@ def publish_outbox(
                     "sha256": event_digest,
                 })
 
-                # Second Brain Pipeline for promoted Hermes event
-                try:
-                    from .companion import CompanionManager, LastSessionData
-                    from .rule_learner import RuleLearner
-                    from .skill_engine import SkillEngine, WorkflowObservation
+                scope = event.get('memory_scope', {})
+                if scope.get('visibility') == 'shared' or (not scope.get('owner') and scope.get('project', event.get('project')) in (None, '', 'unscoped')):
+                    # Second Brain Pipeline for promoted Hermes event
+                    try:
+                        from .companion import CompanionManager, LastSessionData
+                        from .rule_learner import RuleLearner
+                        from .skill_engine import SkillEngine, WorkflowObservation
 
-                    companion_mgr = CompanionManager(config.vault_path)
-                    from .learning_inbox import learning_sink, record_journal
-                    rule_learner = RuleLearner(companion_mgr, sink=learning_sink(config, "hermes"))
-                    skill_engine = SkillEngine(config.vault_path)
+                        companion_mgr = CompanionManager(config.vault_path)
+                        from .learning_inbox import learning_sink, record_journal
+                        rule_learner = RuleLearner(companion_mgr, sink=learning_sink(config, "hermes"))
+                        skill_engine = SkillEngine(config.vault_path)
 
-                    # 1. Learn rules from Hermes SessionDB turns or event context
-                    session_id_val = str(event.get("session_id", ""))
-                    raw_user_turns: list[tuple[str, str]] = []
-                    roots = config.transcript_roots.get("hermes", [])
-                    base_data = Path(roots[0]) if roots else config.state_path.parent / "hermes-data"
-                    prof_dir = base_data / "profiles"
-                    candidate_dbs: list[Path] = []
-                    if prof_dir.is_dir():
-                        try:
-                            candidate_dbs.extend([p / "state.db" for p in prof_dir.iterdir() if (p / "state.db").is_file()])
-                        except Exception:
-                            pass
-                    candidate_dbs.append(base_data / "state.db")
-                    for sdb in candidate_dbs:
-                        if sdb.is_file():
+                        # 1. Learn rules from Hermes SessionDB turns or event context
+                        session_id_val = str(event.get("session_id", ""))
+                        raw_user_turns: list[tuple[str, str]] = []
+                        roots = config.transcript_roots.get("hermes", [])
+                        base_data = Path(roots[0]) if roots else config.state_path.parent / "hermes-data"
+                        prof_dir = base_data / "profiles"
+                        candidate_dbs: list[Path] = []
+                        if prof_dir.is_dir():
                             try:
-                                import sqlite3
-                                with sqlite3.connect(f"file:{sdb}?immutable=1", uri=True) as con:
-                                    cur = con.cursor()
-                                    cur.execute("SELECT role, content FROM messages WHERE session_id=? ORDER BY id ASC", (session_id_val,))
-                                    rows = cur.fetchall()
-                                    if rows:
-                                        raw_user_turns = [(str(r[0]), str(r[1])) for r in rows if r[1]]
-                                        break
+                                candidate_dbs.extend([p / "state.db" for p in prof_dir.iterdir() if (p / "state.db").is_file()])
                             except Exception:
                                 pass
+                        candidate_dbs.append(base_data / "state.db")
+                        for sdb in candidate_dbs:
+                            if sdb.is_file():
+                                try:
+                                    import sqlite3
+                                    with sqlite3.connect(f"file:{sdb}?immutable=1", uri=True) as con:
+                                        cur = con.cursor()
+                                        cur.execute("SELECT role, content FROM messages WHERE session_id=? ORDER BY id ASC", (session_id_val,))
+                                        rows = cur.fetchall()
+                                        if rows:
+                                            raw_user_turns = [(str(r[0]), str(r[1])) for r in rows if r[1]]
+                                            break
+                                except Exception:
+                                    pass
 
-                    sections = event.get("sections", {}) if isinstance(event.get("sections"), dict) else {}
-                    context_items = [x for x in (sections.get("context") or event.get("context", [])) if x != "unknown"]
-                    decisions = [x for x in (sections.get("decisions") or event.get("decisions", [])) if x != "unknown"]
-                    learnings = [x for x in (sections.get("learnings") or event.get("learnings", [])) if x != "unknown"]
-                    conversations = [x for x in (sections.get("important_conversations") or event.get("important_conversations", [])) if x != "unknown"]
-                    open_items = [x for x in (sections.get("open_items") or event.get("open_items", [])) if x != "unknown"]
-                    evidence_items = [x for x in (sections.get("evidence") or event.get("evidence", [])) if x != "unknown"]
+                        sections = event.get("sections", {}) if isinstance(event.get("sections"), dict) else {}
+                        context_items = [x for x in (sections.get("context") or event.get("context", [])) if x != "unknown"]
+                        decisions = [x for x in (sections.get("decisions") or event.get("decisions", [])) if x != "unknown"]
+                        learnings = [x for x in (sections.get("learnings") or event.get("learnings", [])) if x != "unknown"]
+                        conversations = [x for x in (sections.get("important_conversations") or event.get("important_conversations", [])) if x != "unknown"]
+                        open_items = [x for x in (sections.get("open_items") or event.get("open_items", [])) if x != "unknown"]
+                        evidence_items = [x for x in (sections.get("evidence") or event.get("evidence", [])) if x != "unknown"]
 
-                    # Only what the user typed can teach a rule. When SessionDB
-                    # turns are unavailable, the summary is the model's account of
-                    # the session; feeding it in as ("user", ...) is how summarizer
-                    # phrasing became "Kullanıcının açık kalıcı direktifi" entries.
-                    turn_pairs = raw_user_turns
-                    if turn_pairs:
-                        rule_learner.learn_from_transcript(turn_pairs, source_session=f"hermes-{session_hash}")
+                        # Only what the user typed can teach a rule. When SessionDB
+                        # turns are unavailable, the summary is the model's account of
+                        # the session; feeding it in as ("user", ...) is how summarizer
+                        # phrasing became "Kullanıcının açık kalıcı direktifi" entries.
+                        turn_pairs = raw_user_turns
+                        if turn_pairs:
+                            rule_learner.learn_from_transcript(turn_pairs, source_session=f"hermes-{session_hash}")
 
-                    # 2. Update Last-Session continuity & Journal
-                    summary_context = context_items or conversations
-                    ls_data = LastSessionData(
-                        runtime="hermes",
-                        session_id=str(event.get("session_id", session_hash)),
-                        completed_items=summary_context[:5],
-                        decisions=decisions[:5],
-                        pending_items=open_items[:5],
-                        next_steps=open_items[:3],
-                        active_project=str(event.get("root_task_id", config.vault_path.name)),
-                        updated_at=created_at,
-                    )
-                    companion_mgr.write_last_session(ls_data)
-
-                    if decisions or learnings or context_items:
-                        narrative = " ".join((decisions or context_items)[:2] + learnings[:2])
-                        record_journal(
-                            config, companion_mgr,
-                            title=f"{str(event.get('event', 'session_end')).replace('_', ' ').capitalize()} Özeti",
-                            narrative=narrative, runtime="hermes",
-                            source_session=f"hermes-{session_hash}",
+                        # 2. Update Last-Session continuity & Journal
+                        summary_context = context_items or conversations
+                        ls_data = LastSessionData(
+                            runtime="hermes",
+                            session_id=str(event.get("session_id", session_hash)),
+                            completed_items=summary_context[:5],
+                            decisions=decisions[:5],
+                            pending_items=open_items[:5],
+                            next_steps=open_items[:3],
+                            active_project=str(event.get("root_task_id", config.vault_path.name)),
+                            updated_at=created_at,
                         )
+                        companion_mgr.write_last_session(ls_data)
 
-                    # 3. The shared knowledge/ graph is intentionally NOT
-                    #    written here.  concepts/, connections/, index.md and
-                    #    log.md have a single canonical writer (the VPS
-                    #    knowledge compiler + deterministic post-promotion
-                    #    rebuild in memory_v1.knowledge_index), because two
-                    #    hosts rewriting the same synced markdown produced
-                    #    unmergeable Obsidian Sync conflicts.
+                        if decisions or learnings or context_items:
+                            narrative = " ".join((decisions or context_items)[:2] + learnings[:2])
+                            record_journal(
+                                config, companion_mgr,
+                                title=f"{str(event.get('event', 'session_end')).replace('_', ' ').capitalize()} Özeti",
+                                narrative=narrative, runtime="hermes",
+                                source_session=f"hermes-{session_hash}",
+                            )
 
-                    # 4. Skill candidate observation
-                    workflow_candidates = []
-                    for item in event.get("important_conversations", []) + decisions:
-                        if any(marker in item.lower() for marker in ("adımlar", "komut", "workflow", "prosedür", "deploy", "build", "test", "kontrol", "kurulum", "ayarla", "görev")):
-                            workflow_candidates.append(item)
-                    for cand in workflow_candidates:
-                        w_name = cand.split(":", 1)[0].strip(" -:\n") if ":" in cand else cand[:40].strip(" -:\n")
-                        if ":" in w_name:
-                            w_name = w_name.split(":")[-1].strip()
-                        body = cand.split(":", 1)[1] if ":" in cand else cand
-                        w_steps = [s.strip() for s in re.split(r"(?:[0-9]+\.|\n|;|,)+", body) if len(s.strip()) > 5][:6]
-                        if len(w_steps) >= 2:
-                            skill_engine.record_workflow_observation(WorkflowObservation(
-                                workflow_name=w_name[:50],
-                                goal=cand[:120].strip(),
-                                steps=w_steps,
-                                session_id=f"hermes-{session_hash}",
-                            ))
-                except Exception as sb_exc:
-                    logger.warning("Second brain pipeline warning during event publish: %s", sb_exc)
+                        # 3. The shared knowledge/ graph is intentionally NOT
+                        #    written here.  concepts/, connections/, index.md and
+                        #    log.md have a single canonical writer (the VPS
+                        #    knowledge compiler + deterministic post-promotion
+                        #    rebuild in memory_v1.knowledge_index), because two
+                        #    hosts rewriting the same synced markdown produced
+                        #    unmergeable Obsidian Sync conflicts.
+
+                        # 4. Skill candidate observation
+                        workflow_candidates = []
+                        for item in event.get("important_conversations", []) + decisions:
+                            if any(marker in item.lower() for marker in ("adımlar", "komut", "workflow", "prosedür", "deploy", "build", "test", "kontrol", "kurulum", "ayarla", "görev")):
+                                workflow_candidates.append(item)
+                        for cand in workflow_candidates:
+                            w_name = cand.split(":", 1)[0].strip(" -:\n") if ":" in cand else cand[:40].strip(" -:\n")
+                            if ":" in w_name:
+                                w_name = w_name.split(":")[-1].strip()
+                            body = cand.split(":", 1)[1] if ":" in cand else cand
+                            w_steps = [s.strip() for s in re.split(r"(?:[0-9]+\.|\n|;|,)+", body) if len(s.strip()) > 5][:6]
+                            if len(w_steps) >= 2:
+                                skill_engine.record_workflow_observation(WorkflowObservation(
+                                    workflow_name=w_name[:50],
+                                    goal=cand[:120].strip(),
+                                    steps=w_steps,
+                                    session_id=f"hermes-{session_hash}",
+                                ))
+                    except Exception as sb_exc:
+                        logger.warning("Second brain pipeline warning during event publish: %s", sb_exc)
 
             # Check and promote corresponding evidence receipt if available
             evidence_file = evidence_dir / f"hermes-{session_hash}{source_suffix}.json"

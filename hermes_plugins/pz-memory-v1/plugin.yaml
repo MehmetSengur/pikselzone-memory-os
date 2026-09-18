@@ -1,5 +1,5 @@
 name: pz-memory-v1
-version: 1.0.0
+version: 1.1.0
 description: "Pikselzone Memory V1 native lifecycle adapter, outbox writer, and recall provider."
 author: PZ local operations
 kind: standalone

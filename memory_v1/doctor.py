@@ -252,6 +252,22 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
     else:
         checks.append(_row("backup_evidence", "unknown", "not-configured"))
 
+    from .profile_integration import profile_report
+    profiles = []
+    from .profile_integration import POLICY_ENV, load_policy
+    if os.environ.get(POLICY_ENV):
+        profiles.extend(profile_report(Path(load_policy()['base_dir'])))
+    else:
+        for root in config.transcript_roots.get('hermes', ()):
+            profiles.extend(profile_report(root / 'memory-v1'))
+    from .memory_policy import config_policy
+    policy = config_policy(config)
+    checks.append(_row('memory_consumption', 'pass',
+        f"mode={policy['mode']};capture={policy['capture']};summarize={policy['summarize']};compile={policy['compile']};recall={policy['recall']}"))
+    for profile in profiles:
+        checks.append(_row('hermes_profile_' + str(profile['owner'])[:16],
+            'warn' if profile['status'] == 'degraded' else 'pass',
+            f"{profile['status']};version={profile.get('version')};reason={profile['reason']};native evidence reported separately"))
     failures = sum(row["status"] == "fail" for row in checks)
     blocked = sum(row["status"] == "blocked" for row in checks)
     warnings = sum(row["status"] in {"warn", "unknown"} for row in checks)
@@ -260,6 +276,7 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
         "status": "fail" if failures else ("blocked" if blocked else "ok"),
         "summary": {"fail": failures, "blocked": blocked, "warning": warnings},
         "checks": checks,
+        "profiles": profiles,
     }
 
 
@@ -645,6 +662,9 @@ def _hermes_plugin_drift_rows(config: MemoryConfig) -> list[dict[str, str]]:
         global_gen_sha = sha256_file(global_gen) if global_gen.is_file() else None
     except OSError as exc:
         return [_row("hermes_plugin_drift", "fail", f"read-error:{exc}")]
+
+    if os.environ.get("PZ_MEMORY_PROFILE_POLICY"):
+        return [_row("hermes_plugin_drift", "pass", "central-source;legacy-profile-copies-not-loaded;native-evidence-separate")]
 
     profiles_dir = data_root / "profiles"
     if not profiles_dir.is_dir():

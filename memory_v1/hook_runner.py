@@ -38,6 +38,20 @@ def build_drain_command(
 
 
 def _spawn_drain(config_path: Path, queue_path: Path, log_path: Path) -> None:
+    from .memory_policy import config_policy
+    from .core import MemoryConfig
+    policy = config_policy(MemoryConfig.load(config_path))
+    if not policy['summarize']:
+        return
+    if policy['processing_interval']:
+        import datetime as dt
+        try:
+            value = json.loads(queue_path.read_text())
+            observed = dt.datetime.fromisoformat(value['hook_observed_at'])
+            if (dt.datetime.now(dt.timezone.utc) - observed).total_seconds() < policy['processing_interval']:
+                return
+        except (ValueError, KeyError, OSError):
+            return
     """Start a best-effort worker; lifecycle hooks themselves stay nonblocking."""
     repo_root = Path(__file__).resolve().parents[1]
     env = scrubbed_subprocess_env({"PYTHONPATH": str(repo_root)})
@@ -121,6 +135,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project-root", dest="project_root", default=None)
     args = parser.parse_args(argv)
     config = MemoryConfig.load(args.config)
+    from .memory_policy import config_policy
+    if not config_policy(config)["capture"]:
+        return 0
     try:
         raw_stdin = sys.stdin.read()
         try:
@@ -137,6 +154,9 @@ def main(argv: list[str] | None = None) -> int:
         capture_on, project, continuity_scope, off_reason = _resolve_scope(
             config, args, gate_payload
         )
+
+        import dataclasses
+        config = dataclasses.replace(config, memory={**config.memory, "project": project})
 
         if not capture_on:
             # Fail-closed: no transcript or vault content is read.

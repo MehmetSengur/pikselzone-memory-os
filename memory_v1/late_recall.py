@@ -159,6 +159,9 @@ def _promoted_artifact(
         artifact = parse_event_artifact(candidate.read_text(encoding="utf-8"))
     except Exception:
         return None
+    from .recall_access import source_reason
+    if source_reason(config, str(candidate.relative_to(config.vault_path)), project=project):
+        return None
     if artifact.get("project") != project:
         return None
     return candidate, artifact

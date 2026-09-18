@@ -5,55 +5,245 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema", "runtime", "agent_id", "session_id", "event", "events_seen",
-    "created_at", "source_runtime", "source_model", "root_task_id",
-    "kanban_ids", "source_sha256", "secret_redactions", "generated_by",
-    "authority", "sections"
+    "schema",
+    "runtime",
+    "agent_id",
+    "session_id",
+    "event",
+    "events_seen",
+    "created_at",
+    "source_runtime",
+    "source_model",
+    "root_task_id",
+    "kanban_ids",
+    "source_sha256",
+    "secret_redactions",
+    "generated_by",
+    "authority",
+    "sections"
   ],
   "properties": {
-    "schema": {"const": "pikselzone-memory-event-v1"},
-    "runtime": {"enum": ["codex", "claude", "hermes"]},
-    "agent_id": {"type": "string", "minLength": 1},
-    "session_id": {"type": "string", "minLength": 1},
+    "schema": {
+      "const": "pikselzone-memory-event-v1"
+    },
+    "runtime": {
+      "enum": [
+        "codex",
+        "claude",
+        "hermes"
+      ]
+    },
+    "agent_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
     "event": {
       "enum": [
-        "session_start", "session_end", "pre_compact", "post_compact",
-        "session_finalize", "session_reset", "subagent_start", "subagent_stop"
+        "session_start",
+        "session_end",
+        "pre_compact",
+        "post_compact",
+        "session_finalize",
+        "session_reset",
+        "subagent_start",
+        "subagent_stop",
+        "checkpoint_recovery"
       ]
     },
     "events_seen": {
       "type": "array",
       "items": {
         "enum": [
-          "session_start", "session_end", "pre_compact", "post_compact",
-          "session_finalize", "session_reset", "subagent_start", "subagent_stop"
+          "session_start",
+          "session_end",
+          "pre_compact",
+          "post_compact",
+          "session_finalize",
+          "session_reset",
+          "subagent_start",
+          "subagent_stop",
+          "checkpoint_recovery"
         ]
       },
       "uniqueItems": true
     },
-    "created_at": {"type": "string", "format": "date-time"},
-    "source_runtime": {"enum": ["codex", "claude", "hermes"]},
-    "source_model": {"type": "string", "minLength": 1},
-    "root_task_id": {"type": "string", "minLength": 1},
-    "kanban_ids": {"type": "array", "items": {"type": "string"}},
-    "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "secret_redactions": {"type": "integer", "minimum": 0},
-    "generated_by": {"const": "pikselzone-memory-v1"},
-    "authority": {"const": "derived-session-memory-not-operational-truth"},
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_runtime": {
+      "enum": [
+        "codex",
+        "claude",
+        "hermes"
+      ]
+    },
+    "source_model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "root_task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kanban_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "secret_redactions": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "generated_by": {
+      "const": "pikselzone-memory-v1"
+    },
+    "authority": {
+      "const": "derived-session-memory-not-operational-truth"
+    },
     "sections": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "context", "important_conversations", "decisions", "learnings",
-        "open_items", "evidence"
+        "context",
+        "important_conversations",
+        "decisions",
+        "learnings",
+        "open_items",
+        "evidence"
       ],
       "properties": {
-        "context": {"type": "array", "items": {"type": "string"}},
-        "important_conversations": {"type": "array", "items": {"type": "string"}},
-        "decisions": {"type": "array", "items": {"type": "string"}},
-        "learnings": {"type": "array", "items": {"type": "string"}},
-        "open_items": {"type": "array", "items": {"type": "string"}},
-        "evidence": {"type": "array", "items": {"type": "string"}}
+        "context": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "important_conversations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "learnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "open_items": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "source_provider": {
+      "type": "string"
+    },
+    "project": {
+      "type": "string"
+    },
+    "session_model": {
+      "type": "string"
+    },
+    "summarizer_model": {
+      "type": "string"
+    },
+    "memory_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "owner": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "visibility": {
+          "enum": [
+            "private",
+            "project",
+            "shared"
+          ]
+        }
+      }
+    },
+    "critical_records": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "required": [
+          "schema",
+          "id",
+          "text",
+          "claim",
+          "source_ref",
+          "source_sha256",
+          "text_sha256",
+          "runtime",
+          "session_id",
+          "owner",
+          "project",
+          "subject",
+          "supersedes",
+          "conflicts_with",
+          "authority"
+        ],
+        "properties": {
+          "schema": {
+            "const": "pikselzone-critical-record-v1"
+          },
+          "claim": {
+            "enum": [
+              "user-statement",
+              "tool-result",
+              "agent-inference"
+            ]
+          },
+          "authority": {
+            "const": "derived-claim-not-operational-truth"
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "source_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "text_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
       }
     }
   }

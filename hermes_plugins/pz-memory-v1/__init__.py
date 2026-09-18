@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("hermes.plugin.pz-memory-v1")
 
 PLUGIN_ID = "pz-memory-v1"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 
 # Filesystem layout inside Hermes container
 BASE_DIR = "/opt/data/memory-v1"
@@ -130,6 +130,9 @@ def _memory_base_dir() -> str:
     ``get_hermes_home()/state.db``.  Do not cache this value: tests and bounded
     canaries set ``PZ_MEMORY_BASE_DIR`` dynamically.
     """
+    if os.environ.get("PZ_MEMORY_PROFILE_POLICY"):
+        from memory_v1.profile_integration import load_policy
+        return load_policy()["base_dir"]
     override = os.environ.get("PZ_MEMORY_BASE_DIR", "").strip()
     return override or BASE_DIR
 
@@ -157,52 +160,24 @@ def redact_sensitive_text(text: str) -> tuple[str, int]:
     return redacted, count
 
 
-_INTERNAL_CALL_LOCK = threading.Lock()
-_INTERNAL_CALL_DEPTH = 0
-_INTERNAL_CALL_PREVIOUS: Optional[str] = None
-
-
 def _is_internal_call() -> bool:
-    return os.environ.get("PZ_MEMORY_INTERNAL_CALL") == "1"
+    from memory_v1.internal_calls import is_internal
+    return is_internal()
 
 
 def _enter_internal_call() -> None:
-    """Mark this process as being inside its own summarizer call.
-
-    Reference counted under a lock.  Saving and restoring the single process
-    flag per call interleaved badly: with two overlapping summaries the second
-    one saved the first one's "1" and put it back on the way out, so the flag
-    outlived both and every later lifecycle event in the process was treated as
-    a recursive internal call -- permanently.
-    """
-    global _INTERNAL_CALL_DEPTH, _INTERNAL_CALL_PREVIOUS
-
-    with _INTERNAL_CALL_LOCK:
-        if _INTERNAL_CALL_DEPTH == 0:
-            _INTERNAL_CALL_PREVIOUS = os.environ.get("PZ_MEMORY_INTERNAL_CALL")
-        _INTERNAL_CALL_DEPTH += 1
-        os.environ["PZ_MEMORY_INTERNAL_CALL"] = "1"
+    from memory_v1.internal_calls import enter
+    enter()
 
 
 def _exit_internal_call() -> None:
-    """Drop this call's claim, and clear the flag only when the last one ends."""
-    global _INTERNAL_CALL_DEPTH, _INTERNAL_CALL_PREVIOUS
-
-    with _INTERNAL_CALL_LOCK:
-        _INTERNAL_CALL_DEPTH = max(0, _INTERNAL_CALL_DEPTH - 1)
-        if _INTERNAL_CALL_DEPTH:
-            return
-        if _INTERNAL_CALL_PREVIOUS is None:
-            os.environ.pop("PZ_MEMORY_INTERNAL_CALL", None)
-        else:
-            # An outer caller (or the runtime) had already set it; leave theirs.
-            os.environ["PZ_MEMORY_INTERNAL_CALL"] = _INTERNAL_CALL_PREVIOUS
-        _INTERNAL_CALL_PREVIOUS = None
+    from memory_v1.internal_calls import leave
+    leave()
 
 
-_NATIVE_HOOK_FUNCTIONS = frozenset({"invoke_hook", "_invoke_hook_callback", "_run_hook_callback_bounded", "_plugin_hooks"})
-_NATIVE_HOOK_FILES = ("/hermes_cli/plugins.py", "/hermes_cli/plugins_dispatch.py", "/hermes_cli/lifecycle.py")
-_SESSION_FILE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+_NATIVE_HOOK_FUNCTIONS = frozenset({'invoke_hook', '_invoke_hook_callback', '_run_hook_callback_bounded', '_plugin_hooks'})
+_NATIVE_HOOK_FILES = ('/hermes_cli/plugins.py', '/hermes_cli/plugins_dispatch.py', '/hermes_cli/lifecycle.py')
+_SESSION_FILE_RE = re.compile(r'[^A-Za-z0-9_.-]+')
 
 
 def _record_lifecycle_receipt(
@@ -511,6 +486,9 @@ def _normalize_session_export(
     for msg in messages:
         if not isinstance(msg, dict):
             continue
+        from memory_v1.critical_records import native_tool_results
+        for tool_role, tool_text in native_tool_results(msg):
+            lines.append(f"{tool_role.upper()}: {tool_text}")
         role = str(msg.get("role") or "").lower()
         if role not in {"user", "assistant"}:
             continue
@@ -523,6 +501,8 @@ def _normalize_session_export(
         redacted_text, rcount = redact_sensitive_text(content_clean)
         total_redactions += rcount
         prefix = "USER: " if role == "user" else "ASSISTANT: "
+        # Embedded role labels are message data, never new native messages.
+        redacted_text = re.sub(r"(?m)^(USER|ASSISTANT|TOOL(?:\[[A-Fa-f0-9]+\])?):", r"> \1:", redacted_text)
         lines.append(f"{prefix}{redacted_text}")
 
     if not lines:
@@ -548,7 +528,22 @@ def _session_profile_home(session_id: str) -> Optional[Path]:
 # Where each session's transcript was last found, so finalize can summarize
 # inside the owning profile's home (its provider config and credentials)
 # rather than the gateway's root home.
-_SESSION_DB_PATHS: dict[str, Path] = {}
+class _SessionOwners(threading.local):
+    def __init__(self):
+        self.values = {}
+    def get(self, key, default=None):
+        return self.values.get(key, default)
+    def __setitem__(self, key, value):
+        self.values[key] = value
+    def __getitem__(self, key):
+        return self.values[key]
+    def clear(self):
+        self.values.clear()
+    def pop(self, key, default=None):
+        return self.values.pop(key, default)
+
+
+_SESSION_DB_PATHS = _SessionOwners()
 
 
 def _get_session_transcript(session_id: str) -> tuple[Optional[str], Optional[str], Optional[str], int]:
@@ -563,7 +558,9 @@ def _get_session_transcript(session_id: str) -> tuple[Optional[str], Optional[st
         # Dashboard (Desktop) and TUI gateways finalize from the root home while
         # the session lives in its profile's state.db. Looking only under the
         # legacy /opt/data layout made every such finalize find no conversation.
-        for profiles_dir in (hermes_home / "profiles", Path("/opt/data/profiles")):
+        if os.environ.get("PZ_MEMORY_PROFILE_POLICY"):
+            candidate_dbs = [hermes_home / "state.db"]
+        for profiles_dir in (() if os.environ.get("PZ_MEMORY_PROFILE_POLICY") else (hermes_home / "profiles", Path("/opt/data/profiles"))):
             if profiles_dir.is_dir():
                 for p in sorted(profiles_dir.glob("*/state.db")):
                     if p not in candidate_dbs:
@@ -651,10 +648,11 @@ def _checkpoint_paths(session_id: str, database: str = "") -> list[str]:
     ]
 
 
-def _checkpoint_destination(session_id: str, digest: str) -> str:
+def _checkpoint_destination(session_id: str, digest: str, database: str = "") -> str:
+    owner_prefix = (_owner_hash(database) + "-") if database else ""
     return posixpath.join(
         _checkpoint_root(),
-        f"hermes-{hashlib.sha256(session_id.encode('utf-8')).hexdigest()[:32]}-{digest[:16]}.json",
+        f"hermes-{hashlib.sha256(session_id.encode('utf-8')).hexdigest()[:32]}-{owner_prefix}{digest[:16]}.json",
     )
 
 
@@ -663,9 +661,18 @@ def _stage_completed_turn_checkpoint(
     database: str = "",
 ) -> bool:
     """Persist one canonical redacted final turn without invoking PluginLlm."""
+    if os.environ.get('PZ_MEMORY_PROFILE_POLICY'):
+        from memory_v1.profile_integration import settings_for_home
+        try:
+            settings = settings_for_home(Path(database).parent) if database else None
+            if not settings or settings['status'] != 'configured':
+                return False
+        except Exception as exc:
+            logger.warning('pz-memory: capture policy unavailable (%s)', type(exc).__name__)
+            return False
     digest = hashlib.sha256(turn.encode("utf-8")).hexdigest()
     existing = _checkpoint_paths(session_id, database)
-    destination = _checkpoint_destination(session_id, digest)
+    destination = _checkpoint_destination(session_id, digest, database)
     if os.path.isfile(destination):
         return True
     if len(existing) >= MAX_TURN_CHECKPOINTS_PER_SESSION:
@@ -713,7 +720,7 @@ def _stage_turn_checkpoint(session_id: str) -> bool:
     turn = _last_completed_turn(transcript)
     if not turn:
         return False
-    owning_db = _SESSION_DB_PATHS.get(session_id)
+    owning_db = _SESSION_DB_PATHS.get(session_id) or _active_session_db_path()
     return _stage_completed_turn_checkpoint(
         session_id, turn, model, task_id, redactions,
         database=str(owning_db) if owning_db is not None else "",
@@ -1011,7 +1018,7 @@ def _discover_final_turn_checkpoints(current_session_id: Optional[str] = None) -
                     sessions[identity] = entry
                     changed = True
                     continue
-                destination = _checkpoint_destination(session_id, digest)
+                destination = _checkpoint_destination(session_id, digest, database_id)
                 if os.path.isfile(destination) or _stage_completed_turn_checkpoint(
                     session_id, turn, model, task_id, redactions, database=str(db_path),
                 ):
@@ -1065,6 +1072,9 @@ def _recover_pending_turn_checkpoints() -> None:
     they provide raw durability only.  Hermes 0.19 exposes no reliable native
     whole-session finalizer, so this remains dormant in the deployed runtime.
     """
+    if os.environ.get("PZ_MEMORY_PROFILE_POLICY"):
+        run_due_finalize_retries()
+        return
     root = _checkpoint_root()
     try:
         names = sorted(name for name in os.listdir(root) if name.endswith(".json"))
@@ -1205,11 +1215,13 @@ def _render_and_stage_event(
     receipt: Optional[dict[str, Any]] = None,
     session_model: Optional[str] = None,
     provenance_override: Optional[str] = None,
+    critical_records: Optional[list] = None, memory_scope: Optional[dict] = None, database: str = "",
 ) -> Optional[str]:
     """Render canonical markdown event and atomically stage into outbox."""
+    hook_event = hook_event.removeprefix("on_")
     now = dt.datetime.now().astimezone()
     iso_created = now.isoformat(timespec="seconds")
-    session_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    session_hash = hashlib.sha256(((database + "\0") if database else "").encode() + session_id.encode()).hexdigest()[:32]
     date_str = now.strftime("%Y-%m-%d")
 
     section_titles = {
@@ -1255,7 +1267,16 @@ def _render_and_stage_event(
             body.append("- unknown")
         body.append("")
 
+    if critical_records is not None or memory_scope is not None:
+        boundary = frontmatter.index('---', 1)
+        frontmatter[boundary:boundary] = [
+            'critical_records: ' + json.dumps(critical_records or [], ensure_ascii=False),
+            'memory_scope: ' + json.dumps(memory_scope or {}, ensure_ascii=False),
+            'project: ' + json.dumps((memory_scope or {}).get('project', 'unscoped')),
+        ]
     event_text = "\n".join(frontmatter + body).rstrip() + "\n"
+    from memory_v1.events import parse_event_artifact
+    parse_event_artifact(event_text)
     event_sha = hashlib.sha256(event_text.encode("utf-8")).hexdigest()
 
     outbox_events_dir = _memory_path("outbox", "events")
@@ -1390,20 +1411,20 @@ def _record_flush_health(status: str, detail: str = "") -> None:
         logger.warning("pz-memory-v1: failed to stage flush health: %s", exc)
 
 
-def _staged_event_path(session_id: str, source_sha: str) -> Optional[str]:
+def _staged_event_path(session_id: str, source_sha: str, database: str = "") -> Optional[str]:
     """Return the already staged outbox artifact for this exact source, if any.
 
     A previous attempt can have staged the event and then failed to persist the
     settlement.  Re-summarizing would spend the provider again for a file that
     already exists, so the retry reuses it and only redoes the settlement.
     """
-    path = _deterministic_event_path(session_id, source_sha)
+    path = _deterministic_event_path(session_id, source_sha, database)
     return path if os.path.isfile(path) else None
 
 
-def _deterministic_event_path(session_id: str, source_sha: str) -> str:
+def _deterministic_event_path(session_id: str, source_sha: str, database: str = "") -> str:
     """The one outbox filename this (session, source) pair ever produces."""
-    session_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    session_hash = hashlib.sha256((((database + "\0") if database else "") + session_id).encode("utf-8")).hexdigest()[:32]
     return posixpath.join(
         _memory_path("outbox", "events"), f"hermes-{session_hash}-{source_sha[:16]}.md",
     )
@@ -1431,6 +1452,22 @@ def _settle_source(
     bounded retry instead of silently reporting success, and the caller holds
     the execution lock for the whole attempt.
     """
+    from memory_v1.critical_records import extract_records
+    from memory_v1.profile_integration import settings_for_home
+    settings = settings_for_home(Path(database).parent) if database else None
+    if settings and (settings['status'] != 'configured' or settings['mode'] == 'manual'):
+        return False
+    owner = hashlib.sha256(database.encode()).hexdigest() if database else ''
+    scope = {'owner': owner, 'project': settings['project'] if settings else 'unscoped',
+             'visibility': settings['visibility'] if settings else ('private' if owner else 'project')}
+    try:
+        records = extract_records(transcript, runtime='hermes', session_id=session_id,
+                                  owner=owner, project=scope['project'])
+    except Exception as exc:
+        _finalize_retry_module().record_failure(_memory_base_dir(), session_id=session_id,
+            source_sha=source_sha, profile=profile, database=database,
+            exc=exc, reason_code='schema')
+        return False
     retry = _finalize_retry_module()
     base_dir = _memory_base_dir()
 
@@ -1452,14 +1489,14 @@ def _settle_source(
         return False
 
     record = retry.load_record(base_dir, session_id, source_sha, database)
-    staged_path = _staged_event_path(session_id, source_sha)
+    staged_path = _staged_event_path(session_id, source_sha, database)
     if staged_path is None and record.get("artifact_produced"):
         # The publisher already promoted the artifact and removed the staged
         # copy.  Summarizing again would spend the provider a second time and
         # publish the same session twice, so this attempt only owes a
         # settlement for the artifact that already exists.
         staged_path = str(record.get("event_path") or "") or _deterministic_event_path(
-            session_id, source_sha,
+            session_id, source_sha, database,
         )
         logger.info(
             "pz-memory-v1: settling session %s against its already published artifact",
@@ -1472,6 +1509,8 @@ def _settle_source(
         )
         if summary is None:
             return _fail(None, error_sink.get("exc"), "summarizer-failed")
+        if summary.get("status") == "empty" and records:
+            summary["status"] = "ok"
         if summary.get("status") == "empty":
             if _mark_durable_settlement(
                 session_id, source_sha, status="validated-empty", database=database,
@@ -1493,6 +1532,7 @@ def _settle_source(
             session_model=model,
             receipt=receipt,
             provenance_override=provenance_override,
+            critical_records=records, memory_scope=scope, database=database,
         )
         if not staged_path:
             return _fail("stage-write", None, "event-stage-failed")
@@ -1558,6 +1598,16 @@ def _recover_one_finalize_retry(record: dict[str, Any]) -> str:
     database = str(record.get("database") or "")
     if not session_id or not source_sha:
         return "invalid-record"
+    from memory_v1.profile_integration import settings_for_home
+    settings = settings_for_home(Path(database).parent) if database else None
+    if settings and (settings['status'] != 'configured' or settings['mode'] == 'manual'):
+        return 'policy-paused'
+    if settings and settings['mode'] == 'economic':
+        first = record.get('first_failure_at') or record.get('created_at') or record.get('updated_at')
+        if first:
+            stamp = dt.datetime.fromisoformat(first)
+            if (dt.datetime.now(dt.timezone.utc) - stamp).total_seconds() < 900:
+                return 'economic-deferred'
     if _is_source_settled(session_id, source_sha, database=database):
         retry.clear_record(base_dir, session_id, source_sha, database)
         return "already-settled"
@@ -1744,7 +1794,7 @@ def _defer_lifecycle_event(event_name: str, session_id: str) -> None:
         if not transcript:
             return
         turn = _last_completed_turn(transcript)
-        owning_db = _SESSION_DB_PATHS.get(session_id)
+        owning_db = _SESSION_DB_PATHS.get(session_id) or _active_session_db_path()
         database = str(owning_db) if owning_db is not None else ""
         if turn:
             _stage_completed_turn_checkpoint(
@@ -1773,13 +1823,18 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
     if not session_id or not isinstance(session_id, str):
         return
 
+    from memory_v1.profile_integration import active_settings, record_status
+    settings = active_settings()
+    if settings and settings['status'] != 'configured':
+        return
     if _is_internal_call():
         logger.debug("pz-memory-v1: internal call in progress; deferring %s", event_name)
         _defer_lifecycle_event(event_name, session_id)
         return
 
     # Record unforgeable lifecycle receipt immediately at registered callback entry
-    receipt = _record_lifecycle_receipt(session_id, event_name)
+    receipt_dir = str(Path(settings['base_dir']) / 'state' / 'receipts' / 'profiles' / settings['owner'] / 'capture') if settings else None
+    receipt = _record_lifecycle_receipt(session_id, event_name, target_dir=receipt_dir)
 
     transcript, model, task_id, redactions = _get_session_transcript(session_id)
     if not transcript:
@@ -1791,11 +1846,17 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
         # interactive prompt returns.  Keep this boundary cheap and provider
         # free: one atomic canonical checkpoint is the durable handoff.
         turn = _last_completed_turn(transcript)
-        owning_db = _SESSION_DB_PATHS.get(session_id)
+        owning_db = _SESSION_DB_PATHS.get(session_id) or _active_session_db_path()
         if turn and _stage_completed_turn_checkpoint(
             session_id, turn, model, task_id, redactions,
             database=str(owning_db) if owning_db is not None else "",
         ):
+            if settings:
+                record_status(settings, evidence={'kind':'capture', 'session_id':session_id,
+                    'observed_at':dt.datetime.now().astimezone().isoformat(),
+                    'native_invoke': bool(receipt and receipt.get('native_invoke')),
+                    'event':event_name, 'state':'checkpoint-durable',
+                    'source_sha256':hashlib.sha256(turn.encode()).hexdigest()})
             logger.info("pz-memory-v1: durably staged completed turn for session %s", session_id)
         elif turn:
             logger.warning("pz-memory-v1: failed to stage completed turn for session %s", session_id)
@@ -1803,12 +1864,18 @@ def _handle_lifecycle_event(event_name: str, kwargs: dict[str, Any]) -> None:
 
     if event_name != "on_session_finalize":
         return
+    if settings and settings['mode'] in ('manual', 'economic'):
+        # Always retain raw data. Economic processing waits for the existing recovery tick.
+        _stage_turn_checkpoint(session_id)
+        if settings['mode'] == 'economic':
+            _defer_lifecycle_event(event_name, session_id)
+        return
 
     # Retain semantic settlement only for a future Hermes runtime that proves
     # this callback is a genuine terminal boundary.  Its identity is the
     # current normalized source digest, never the whole session ID.
     source_sha = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
-    owning_db = _SESSION_DB_PATHS.get(session_id)
+    owning_db = _SESSION_DB_PATHS.get(session_id) or _active_session_db_path()
     owning_database = str(owning_db) if owning_db is not None else ""
     if _is_source_settled(session_id, source_sha, database=owning_database):
         logger.debug("pz-memory-v1: source %s already settled", source_sha[:16])
@@ -1971,6 +2038,20 @@ def pre_llm_call(
     **kwargs: Any,
 ) -> dict[str, Any] | None:
     """Inject startup recall bundle on the first turn or provide targeted recall."""
+    from memory_v1.profile_integration import active_settings, profile_recall
+    try:
+        settings = active_settings()
+        if settings:
+            if settings['status'] != 'configured':
+                return None
+            if session_id:
+                _stage_turn_checkpoint(session_id)
+            return profile_recall(settings, session_id=session_id, query=user_message,
+                                  first=is_first_turn or not conversation_history,
+                                  receipt_factory=_record_lifecycle_receipt)
+    except Exception as exc:
+        logger.warning('pz-memory: central recall degraded (%s)', type(exc).__name__)
+        return {'context': '<!-- pz-memory: degraded; central policy or source unavailable -->'}
     try:
         # At the next prompt, SessionDB contains the prior assistant response.
         # Persist it cheaply before another generation begins; promotion stays
@@ -2067,6 +2148,10 @@ def on_kanban_dispatch_tick(**kwargs: Any) -> None:
 
 
 def register(ctx: Any) -> None:
+    from memory_v1.profile_integration import active_settings
+    settings = active_settings()
+    if settings and settings['status'] != 'configured':
+        return
     ctx.register_hook("on_session_start", on_session_start)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("on_session_end", on_session_end)

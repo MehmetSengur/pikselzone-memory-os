@@ -51,6 +51,9 @@ def select_and_stage_batch(
     max_input_chars: int = 300000,
 ) -> dict[str, Any] | None:
     """Discover uningested daily events and stage an untrusted batch payload into the inbox."""
+    from .memory_policy import config_policy
+    if not config_policy(config)["compile"]:
+        return None
     daily_root = config.vault_path / "daily"
     if not daily_root.exists() or not daily_root.is_dir():
         return None
@@ -79,15 +82,20 @@ def select_and_stage_batch(
         logger.debug("pz-memory-promoter: zero uningested daily events found")
         return None
 
-    selected = sorted(candidates)[:max_events]
+    selected = sorted(candidates)[:500]
     source_digests: dict[str, str] = {}
     event_chunks: list[str] = []
     used_chars = 0
     char_limit = max_input_chars // 2
 
     for path in selected:
+        if len(source_digests) >= max_events:
+            break
         text, digest = secure_read_text(path, root=daily_root, max_bytes=2 * 1024 * 1024)
-        parse_event_artifact(text)
+        artifact = parse_event_artifact(text)
+        scope = artifact.get('memory_scope', {'project':artifact.get('project','unscoped')})
+        if scope and scope.get('visibility') != 'shared' and (scope.get('owner') or scope.get('project') not in (None, '', 'unscoped')):
+            continue
         text_clean, _ = redact_sensitive_text(text)
         rel_name = path.relative_to(config.vault_path).as_posix()
         source_digests[rel_name] = digest
@@ -99,6 +107,9 @@ def select_and_stage_batch(
             break
         event_chunks.append(block)
         used_chars += len(block)
+
+    if not source_digests:
+        return None
 
     # Existing knowledge snapshot
     knowledge_root = config.vault_path / "knowledge"
@@ -117,6 +128,9 @@ def select_and_stage_batch(
             except PolicyError:
                 continue
             text, _ = secure_read_text(path, root=knowledge_root, max_bytes=2 * 1024 * 1024)
+            from .recall_access import source_reason
+            if source_reason(config, rel_name, text=text):
+                continue
             text_clean, _ = redact_sensitive_text(text)
             block = f"\n### FILE {rel_name}\n{text_clean}"
             if used_k_chars + len(block) <= char_limit:

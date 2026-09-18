@@ -390,6 +390,7 @@ class MemoryConfig:
     claude_smoke_evidence_path: Path | None = None
     codex_binary_path: Path | None = None
     transcript_roots: dict[str, tuple[Path, ...]] = dataclasses.field(default_factory=dict)
+    memory: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "MemoryConfig":
@@ -399,10 +400,15 @@ class MemoryConfig:
             "role", "vault_path", "state_path", "runtimes", "transcript_roots",
             "can_write_event_memory", "can_run_compiler", "models", "provider",
             "context_budget_chars", "backup_evidence_path", "sync_evidence_path",
-            "activation", "idle_finalize_minutes",
+            "activation", "idle_finalize_minutes", "memory",
         }
         if not set(raw).issubset(allowed_top_level):
             raise ConfigError("config-fields-invalid")
+        from .memory_policy import resolve_policy
+        memory = raw.get("memory", {})
+        if not isinstance(memory, dict):
+            raise ConfigError("memory-policy-invalid")
+        resolve_policy(memory)
         role = raw.get("role")
         if role not in {"workstation", "memory-engine"}:
             raise ConfigError("role-invalid")
@@ -516,6 +522,7 @@ class MemoryConfig:
             if value:
                 _require_absolute(Path(str(value)), label)
         return cls(
+            memory=memory,
             role=role,
             vault_path=vault,
             state_path=state,
@@ -1108,6 +1115,7 @@ def transcript_turns(
     allowed_roots: Sequence[Path] | None = None,
     state_path: Path | None = None,
     strict: bool = True,
+    include_tool_results: bool = False,
 ) -> list[tuple[str, str]]:
     """Extract chronological ``(role, text)`` prose turns.
 
@@ -1120,6 +1128,9 @@ def transcript_turns(
     turns: list[tuple[str, str]] = []
     candidates_count = 0
     for record in records:
+        if include_tool_results:
+            from .critical_records import native_tool_results
+            turns.extend(native_tool_results(record))
         role, content, is_candidate = _message_from_record(record)
         if is_candidate:
             candidates_count += 1
@@ -1160,11 +1171,12 @@ def normalize_transcript(
     max_turns: int = 200, max_chars: int = TRANSCRIPT_MAX_CHARS,
     allowed_roots: Sequence[Path] | None = None,
     state_path: Path | None = None,
+    include_tool_results: bool = False,
 ) -> tuple[str, int, str]:
     """Extract user/assistant prose only; tool results and reasoning are ignored."""
     turns = transcript_turns(
         source, max_turns=max_turns, allowed_roots=allowed_roots,
-        state_path=state_path, strict=True,
+        state_path=state_path, strict=True, include_tool_results=include_tool_results,
     )
     rendered = "\n".join(f"{role.upper()}: {text}" for role, text in turns)
     rendered = clamp_transcript(rendered, max_chars)

@@ -771,7 +771,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             plugin.on_session_start(session_id=current)
             turn = "USER: one user\nASSISTANT: one assistant"
             digest = hashlib.sha256(turn.encode("utf-8")).hexdigest()
-            self.assertTrue(Path(plugin._checkpoint_destination(current, digest)).is_file())
+            self.assertTrue(Path(plugin._checkpoint_destination(current, digest, str(self.root / "fake-hermes-profiles" / "default" / "state.db"))).is_file())
             cursor = json.loads(Path(plugin._discovery_cursor_path()).read_text(encoding="utf-8"))
             self.assertEqual(digest, next(iter(cursor["sessions"].values()))["last_turn_digest"])
             self.assertEqual([(calls["exports"][0][0], current)], calls["exports"])
@@ -800,7 +800,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             plugin.on_session_start(session_id=current)
             current_turn = "USER: new user\nASSISTANT: new assistant"
             current_digest = hashlib.sha256(current_turn.encode("utf-8")).hexdigest()
-            self.assertTrue(Path(plugin._checkpoint_destination(current, current_digest)).is_file())
+            self.assertTrue(Path(plugin._checkpoint_destination(current, current_digest, str(self.root / "fake-hermes-profiles" / "default" / "state.db"))).is_file())
             self.assertFalse(Path(plugin._checkpoint_destination(current, historical_digest)).exists())
 
     def test_current_arm_survives_profile_discovery_failure(self):
@@ -894,7 +894,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             plugin.on_session_start(session_id="tracked-crash")
             turn = "USER: start\nASSISTANT: completed"
             digest = hashlib.sha256(turn.encode("utf-8")).hexdigest()
-            self.assertTrue(Path(plugin._checkpoint_destination("tracked-crash", digest)).is_file())
+            self.assertTrue(Path(plugin._checkpoint_destination("tracked-crash", digest, str(self.root / "fake-hermes-profiles" / "default" / "state.db"))).is_file())
             self.assertEqual(2, len(calls["exports"]))
             summarize.assert_not_called()
 
@@ -919,7 +919,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             plugin.on_session_start(session_id="historic-resumed")
             turn = "USER: new user\nASSISTANT: new assistant"
             digest = hashlib.sha256(turn.encode("utf-8")).hexdigest()
-            self.assertTrue(Path(plugin._checkpoint_destination("historic-resumed", digest)).is_file())
+            self.assertTrue(Path(plugin._checkpoint_destination("historic-resumed", digest, str(self.root / "fake-hermes-profiles" / "default" / "state.db"))).is_file())
             summarize.assert_not_called()
 
     def test_current_session_outside_recent_window_can_be_baselined_directly(self):
@@ -970,7 +970,7 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
             digest = hashlib.sha256(
                 "USER: crashed user\nASSISTANT: durable assistant".encode("utf-8")
             ).hexdigest()
-            self.assertTrue(Path(plugin._checkpoint_destination("tracked-outside-window", digest)).is_file())
+            self.assertTrue(Path(plugin._checkpoint_destination("tracked-outside-window", digest, str(self.root / "fake-hermes-profiles" / "default" / "state.db"))).is_file())
             self.assertEqual([], calls["search"])
             self.assertEqual([(calls["exports"][0][0], "tracked-outside-window")], calls["exports"])
             self.assertFalse(any(session_id.startswith("recent-") for _, session_id in calls["exports"]))

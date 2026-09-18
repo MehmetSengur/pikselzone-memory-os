@@ -63,6 +63,9 @@ class TerraCompiler:
         self.provider = provider
 
     def compile(self, *, max_events: int = 50, max_input_chars: int = 300000) -> list[Path]:
+        from .memory_policy import config_policy
+        if not config_policy(self.config)['compile']:
+            return []
         if self.config.role != "memory-engine" or not self.config.can_run_compiler:
             raise PolicyError("compiler-role-forbidden")
         if max_events < 1 or max_events > 500:
@@ -79,6 +82,8 @@ class TerraCompiler:
             events_snapshot, source_digests = self._events_snapshot(
                 candidates, max_input_chars // 2
             )
+            if not source_digests:
+                return []
             prompt = (
                 "--- BEGIN UNTRUSTED EXISTING DERIVED KNOWLEDGE ---\n"
                 + knowledge_snapshot
@@ -163,6 +168,11 @@ class TerraCompiler:
                 relative = path.relative_to(self.config.vault_path).as_posix()
                 _, digest = secure_read_file(path, root=daily, max_bytes=2 * 1024 * 1024)
                 if state["ingested"].get(relative) != digest:
+                    text, _ = secure_read_text(path, root=daily, max_bytes=2*1024*1024)
+                    artifact = parse_event_artifact(text)
+                    scope = artifact.get('memory_scope', {'project':artifact.get('project','unscoped')})
+                    if scope.get('visibility') != 'shared' and (scope.get('owner') or scope.get('project') not in (None,'','unscoped')):
+                        continue
                     candidates.append(path)
         return sorted(candidates)[:max_events]
 
@@ -189,6 +199,9 @@ class TerraCompiler:
             text, digest = secure_read_text(
                 path, root=root, max_bytes=2 * 1024 * 1024
             )
+            from .recall_access import source_reason
+            if source_reason(self.config, relative, text=text):
+                continue
             text, _ = redact_sensitive_text(text)
             baseline[relative] = digest
             block = f"\n### FILE {relative}\n{text}"
@@ -207,7 +220,10 @@ class TerraCompiler:
             text, digest = secure_read_text(
                 path, root=daily_root, max_bytes=2 * 1024 * 1024
             )
-            parse_event_artifact(text)
+            artifact = parse_event_artifact(text)
+            scope = artifact.get('memory_scope', {'project':artifact.get('project','unscoped')})
+            if scope and scope.get('visibility') != 'shared' and (scope.get('owner') or scope.get('project') not in (None, '', 'unscoped')):
+                continue
             text, _ = redact_sensitive_text(text)
             digests[str(path)] = digest
             block = f"\n### EVENT {path.name}\n{text}"

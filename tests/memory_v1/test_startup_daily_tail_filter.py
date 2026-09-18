@@ -82,9 +82,9 @@ class StartupDailyTailFilterTest(unittest.TestCase):
         self.assertNotIn("hermes-x.md", blob)
         self.assertNotIn("claude-legacy.md", blob)  # no project key -> no match
 
-    def test_none_filter_is_legacy_behaviour(self) -> None:
+    def test_none_filter_does_not_grant_cross_project_access(self) -> None:
         items = _load_recent_daily_tail(self.cfg, max_events=10, project_filter=None)
-        self.assertGreaterEqual(len(items), 4)
+        self.assertEqual(len(items), 2)
 
     def test_bundle_tier_d_scoped_to_project(self) -> None:
         bundle = build_startup_recall_bundle(

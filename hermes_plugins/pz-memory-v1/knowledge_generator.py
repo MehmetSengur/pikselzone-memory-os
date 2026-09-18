@@ -130,8 +130,8 @@ Compile the updated knowledge base articles according to instructions.
     else:
         from agent.plugin_llm import PluginLlm, PluginLlmTextInput
         llm = PluginLlm(plugin_id=PLUGIN_ID)
-        prev_env = os.environ.get("PZ_MEMORY_INTERNAL_CALL")
-        os.environ["PZ_MEMORY_INTERNAL_CALL"] = "1"
+        from memory_v1.internal_calls import enter, leave
+        enter()
         try:
             res = llm.complete_structured(
                 instructions=COMPILER_INSTRUCTION,
@@ -142,10 +142,7 @@ Compile the updated knowledge base articles according to instructions.
                 purpose="knowledge-compilation",
             )
         finally:
-            if prev_env is None:
-                os.environ.pop("PZ_MEMORY_INTERNAL_CALL", None)
-            else:
-                os.environ["PZ_MEMORY_INTERNAL_CALL"] = prev_env
+            leave()
 
     parsed = getattr(res, "parsed", None)
     if not isinstance(parsed, dict):

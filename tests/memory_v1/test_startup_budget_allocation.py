@@ -164,12 +164,15 @@ class StartupBudgetAllocationTests(unittest.TestCase):
         self.assertNotIn("Synthesized Skills", bundle.text)
         self.assertNotIn("Recent Daily Event Tail", bundle.text)
 
-    def test_unscoped_session_gets_a_digest_of_recent_projects(self):
+    def test_unscoped_session_needs_explicit_project_grants(self):
         self._rules(2)
         self._projects(["alpha", "beta"])
         unscoped = build_startup_recall_bundle(self.config, runtime="hermes")
-        self.assertIn("Proje sürekliliği: beta", unscoped.text)
-        self.assertIn("beta ACIK-IS", unscoped.text)
+        self.assertNotIn("beta ACIK-IS", unscoped.text)
+        import dataclasses
+        permitted = dataclasses.replace(self.config, memory={'projects':['alpha','beta']})
+        granted = build_startup_recall_bundle(permitted, runtime='hermes')
+        self.assertIn('beta ACIK-IS', granted.text)
 
     def test_digest_is_capped_to_recent_projects(self):
         self._rules(2)
