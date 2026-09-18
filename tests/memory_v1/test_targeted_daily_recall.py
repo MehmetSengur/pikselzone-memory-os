@@ -58,3 +58,34 @@ class TargetedDailyRecallTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class NativeTransportBudgetTests(unittest.TestCase):
+    setUp = TargetedDailyRecallTests.setUp
+    tearDown = TargetedDailyRecallTests.tearDown
+
+    def test_startup_retains_targeted_fact_inside_native_spill_cap(self):
+        from unittest.mock import patch
+        from memory_v1.profile_integration import profile_recall
+        settings={'mode':'normal','owner':'','project':'unscoped','projects':[],
+                  'shared':True,'config_path':'/unused','base_dir':str(self.vault.parent)}
+        (self.vault/'companion/Core.md').write_text('# Core\n' + 'identity context '*1000)
+        with patch('memory_v1.core.MemoryConfig.load',return_value=self.config), \
+             patch('memory_v1.profile_integration._native_context_budget',return_value=10000), \
+             patch('memory_v1.profile_integration.record_status') as status:
+            result=profile_recall(settings,session_id='new',query='bakım penceresi iş emri',first=True,
+                                  receipt_factory=lambda *a,**kw:None)
+        self.assertLessEqual(len(result['context']),10000)
+        self.assertIn('WO-8820-7c485f',result['context'])
+        self.assertEqual(status.call_args.kwargs['evidence']['bundle_chars'],len(result['context']))
+
+    def test_native_cap_honors_custom_enabled_and_disabled_spill(self):
+        import sys,types
+        from unittest.mock import patch
+        from memory_v1.profile_integration import _native_context_budget
+        spill={'enabled':True,'max_chars':2500}
+        fake=types.SimpleNamespace(get_spill_config=lambda:spill)
+        with patch.dict(sys.modules,{'tools.hook_output_spill':fake}):
+            self.assertEqual(_native_context_budget(16000),2500)
+            self.assertEqual(_native_context_budget(1500),1500)
+            spill['enabled']=False
+            self.assertEqual(_native_context_budget(16000),16000)

@@ -240,13 +240,20 @@ def profile_recall(settings: dict, *, session_id: str, query: str, first: bool, 
     config = dataclasses.replace(config, memory={
         **config.memory, 'owner': settings['owner'], 'project': settings['project'],
         'projects': settings['projects'], 'shared': settings['shared'], 'mode': settings['mode']})
+    # Hermes spills oversized hook results into a head/tail preview before the
+    # provider sees them. Allocate inside that transport limit, not just our
+    # own larger context budget. Never claim the unabridged bundle was delivered.
+    budget = _native_context_budget(config.context_budget_chars)
+    if budget < 1000:
+        raise PolicyError('native-hook-budget-below-authority-envelope')
+    targeted_budget = min(4000, budget // 2)
     if first:
         bundle = build_startup_recall_bundle(config, runtime='hermes', session_key=session_id,
             continuity_scope=settings['project'] if settings['project'] != 'unscoped' else None,
-            budget_chars=config.context_budget_chars - 4002 if query.strip() and config.context_budget_chars >= 6000 else config.context_budget_chars)
+            budget_chars=budget - targeted_budget - 2 if query.strip() and budget >= 6000 else budget)
         text, audit, sources, digest = bundle.text, bundle.selection_audit, bundle.source_shas, bundle.bundle_sha256
-        if query.strip() and config.context_budget_chars >= 6000:
-            targeted = targeted_recall(config, query, budget_chars=4000, max_items=3)
+        if query.strip() and budget >= 6000:
+            targeted = targeted_recall(config, query, budget_chars=targeted_budget, max_items=3)
             if targeted['results']:
                 text += '\n' + targeted['markdown']
                 sources = {**sources, **{r['source']:r['sha256'] for r in targeted['results']}}
@@ -256,19 +263,28 @@ def profile_recall(settings: dict, *, session_id: str, query: str, first: bool, 
     else:
         if not query.strip():
             return None
-        result = targeted_recall(config, query, budget_chars=4000, max_items=3)
+        result = targeted_recall(config, query, budget_chars=min(4000, budget), max_items=3)
         if not result['results']:
             return None
         text, audit, digest = result['markdown'], result['selection_audit'], result['digest']
         sources = {r['source']: r['sha256'] for r in result['results']}
+    if len(text) > budget:
+        raise PolicyError('native-hook-budget-exceeded')
     receipt_dir = Path(settings['base_dir']) / 'state' / 'receipts' / 'profiles' / settings['owner']
     receipt = receipt_factory(session_id, 'pre_llm_call', target_dir=str(receipt_dir))
     evidence = {'kind': 'recall', 'session_id':session_id, 'observed_at':iso_now(),
         'native_invoke': bool(receipt and receipt.get('native_invoke')), 'bundle_sha256':digest,
         'delivery':'returned-to-native-pre-llm-hook', 'answer_verified':False,
+        'native_budget_chars':budget, 'bundle_chars':len(text),
         'sources': sources, 'selection_audit': _bounded_audit(audit)}
     record_status(settings, evidence=evidence)
     return {'context': text}
+
+
+def _native_context_budget(requested: int) -> int:
+    from tools.hook_output_spill import get_spill_config
+    spill = get_spill_config()
+    return min(requested, int(spill['max_chars'])) if spill['enabled'] else requested
 
 
 def reconcile_profiles(policy: dict | None = None) -> list[dict]:
