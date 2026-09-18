@@ -11,7 +11,9 @@ def main(argv=None):
     import hermes_cli.main
     install_native()
     from .hermes_guards import main as guarded_main
-    return guarded_main(args)
+    # Native import has already consumed global -p/--profile. Passing the
+    # original args would reintroduce it after Hermes has finished that phase.
+    return guarded_main(list(sys.argv[1:]))
 
 
 if __name__ == '__main__':

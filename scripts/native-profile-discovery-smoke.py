@@ -89,6 +89,11 @@ for label,profile in [('opt-out',create()),('service',create())]:
     finally:
         reset_hermes_home_override(token)
 
+# Exercise actual CLI parsing used by Telegram and dispatcher children.
+cli_env=dict(os.environ,HERMES_HOME=str(home),PZ_HERMES_USER_SURFACE='1')
+cli=subprocess.run([sys.executable,'-P','-m','memory_v1.hermes_entry','-p',new.name,'gateway','--help'],env=cli_env,capture_output=True,text=True,timeout=60)
+assert cli.returncode==0, 'native-profile-cli-argument-regression'
+
 # A fresh old-entry process does not install the central shim. Rollback does not
 # modify config, raw checkpoints or auth; old per-profile sources remain on disk.
 rollback_env=dict(os.environ,HERMES_HOME=str(new))
@@ -98,7 +103,7 @@ assert fingerprint(new)==new_baseline
 assert all(path.read_bytes()==body for path,body in preserved.items())
 report={'schema':'pz-native-profile-discovery-review-v1','status':'pass',
         'scope':'isolated-native-profile-creation-and-discovery-only',
-        'checks':checks,'repeat_reconciliation_preserved_settings':True,'raw_and_retry_retention_fixture_unchanged':True,'fresh_process_rollback':True,
+        'checks':checks,'repeat_reconciliation_preserved_settings':True,'raw_and_retry_retention_fixture_unchanged':True,'fresh_process_rollback':True,'native_profile_gateway_cli_parse':True,
         'source_sha256':hashlib.sha256((source/'memory_v1/profile_integration.py').read_bytes()).hexdigest(),
         'plugin_sha256':hashlib.sha256((source/'hermes_plugins/pz-memory-v1/__init__.py').read_bytes()).hexdigest(),
         'conversation_capture_publish_recall_verified':False,'production_modified':False,
