@@ -174,6 +174,38 @@ def install_native() -> bool:
     return True
 
 
+def install_desktop_lifecycle(server=None) -> bool:
+    """Restore the native session's home on background teardown threads.
+
+    The gateway already stores profile_home on each live session. Bind that
+    exact identity around the native finalizer, including hook discovery and
+    provider configuration; never infer ownership by scanning session IDs.
+    """
+    if not os.environ.get(POLICY_ENV):
+        return False
+    if server is None:
+        from tui_gateway import server
+    original = server._finalize_session
+    if getattr(original, '_pz_memory_profile_scope', False) is True:
+        return True
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    @functools.wraps(original)
+    def finalize(session, *args, **kwargs):
+        if not session:
+            return original(session, *args, **kwargs)
+        home = session.get('profile_home') or server._hermes_home
+        token = set_hermes_home_override(str(home))
+        try:
+            return original(session, *args, **kwargs)
+        finally:
+            reset_hermes_home_override(token)
+
+    finalize._pz_memory_profile_scope = True
+    server._finalize_session = finalize
+    return True
+
+
 def profile_report(base: Path) -> list[dict]:
     rows = []
     for p in sorted((base / 'state' / 'profiles').glob('*.json'))[:256]:

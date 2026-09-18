@@ -69,3 +69,59 @@ class ProfileIntegrationTests(unittest.TestCase):
 
     def test_profile_outside_trusted_root_is_not_enrolled(self):
         self.assertEqual(profile_settings(self.root.parent / 'outside', {}, self.policy)['status'], 'out-of-scope')
+
+class DesktopLifecycleScopeTests(unittest.TestCase):
+    def test_background_finalizers_keep_same_id_profiles_separate_and_reset_home(self):
+        import contextvars
+        import concurrent.futures
+        import threading
+        import sys
+        from unittest.mock import patch
+        from memory_v1.profile_integration import install_desktop_lifecycle
+        home = contextvars.ContextVar('home', default='/root-home')
+        constants = types.SimpleNamespace(set_hermes_home_override=home.set,
+                                          reset_hermes_home_override=home.reset)
+        barrier = threading.Barrier(2)
+        observed = []
+        def native(session, end_reason='tui_close'):
+            barrier.wait(timeout=5)
+            observed.append((session['session_key'], home.get(), end_reason))
+            if session.get('fail'):
+                raise RuntimeError('native failure')
+        server = types.SimpleNamespace(_finalize_session=native, _hermes_home='/root-home')
+        def run(profile, fail=False):
+            try:
+                server._finalize_session({'session_key':'same', 'profile_home':profile, 'fail':fail},
+                                         end_reason='ws_orphan_reap')
+            except RuntimeError:
+                pass
+            return home.get()
+        with patch.dict('os.environ', {'PZ_MEMORY_PROFILE_POLICY':'/operator/policy.json'}), \
+             patch.dict(sys.modules, {'hermes_constants':constants}):
+            install_desktop_lifecycle(server)
+            wrapper = server._finalize_session
+            install_desktop_lifecycle(server)
+            self.assertIs(wrapper, server._finalize_session)
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                jobs = [pool.submit(run, '/profiles/a'), pool.submit(run, '/profiles/b', True)]
+                self.assertEqual([j.result() for j in jobs], ['/root-home', '/root-home'])
+        self.assertCountEqual(observed, [('same','/profiles/a','ws_orphan_reap'),
+                                        ('same','/profiles/b','ws_orphan_reap')])
+
+    def test_root_session_uses_launch_home_not_callers_profile(self):
+        import contextvars
+        import sys
+        from unittest.mock import patch
+        from memory_v1.profile_integration import install_desktop_lifecycle
+        home = contextvars.ContextVar('home', default='/profiles/unrelated')
+        constants = types.SimpleNamespace(set_hermes_home_override=home.set,
+                                          reset_hermes_home_override=home.reset)
+        native = Mock(side_effect=lambda session: home.get())
+        server = types.SimpleNamespace(_finalize_session=native, _hermes_home='/root-home')
+        with patch.dict('os.environ', {'PZ_MEMORY_PROFILE_POLICY':'/operator/policy.json'}), \
+             patch.dict(sys.modules, {'hermes_constants':constants}):
+            install_desktop_lifecycle(server)
+            self.assertEqual(server._finalize_session({'session_key':'root'}), '/root-home')
+            self.assertEqual(home.get(), '/profiles/unrelated')
+            server._finalize_session(None)
+            native.assert_called_with(None)

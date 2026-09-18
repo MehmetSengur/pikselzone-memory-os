@@ -18,3 +18,17 @@ class EntrypointTests(unittest.TestCase):
         with patch.object(hermes_entry,'install_native'), patch('builtins.__import__',side_effect=importing), patch('memory_v1.hermes_guards.main',guarded), patch.object(sys,'argv',['test']):
             hermes_entry.main(['-p','random-profile','gateway','--help'])
             guarded.assert_called_once_with(['gateway','--help'])
+
+    def test_dashboard_binds_native_lifecycle_before_starting_server(self):
+        native=types.ModuleType('hermes_cli'); native.main=types.ModuleType('hermes_cli.main')
+        calls=[]
+        original_import=builtins.__import__
+        def importing(name,*args,**kw):
+            return native if name=='hermes_cli.main' else original_import(name,*args,**kw)
+        with patch.object(hermes_entry,'install_native'), \
+             patch.object(hermes_entry,'install_desktop_lifecycle',side_effect=lambda:calls.append('bind')), \
+             patch('builtins.__import__',side_effect=importing), \
+             patch('memory_v1.hermes_guards.main',side_effect=lambda args:calls.append('serve')), \
+             patch.object(sys,'argv',['test']):
+            hermes_entry.main(['dashboard','--no-open'])
+        self.assertEqual(calls,['bind','serve'])
