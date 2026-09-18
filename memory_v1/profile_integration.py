@@ -246,7 +246,7 @@ def profile_recall(settings: dict, *, session_id: str, query: str, first: bool, 
     budget = _native_context_budget(config.context_budget_chars)
     if budget < 1000:
         raise PolicyError('native-hook-budget-below-authority-envelope')
-    targeted_budget = min(4000, budget // 2)
+    targeted_budget = min(6000, budget * 3 // 5)
     if first:
         bundle = build_startup_recall_bundle(config, runtime='hermes', session_key=session_id,
             continuity_scope=settings['project'] if settings['project'] != 'unscoped' else None,
@@ -263,7 +263,7 @@ def profile_recall(settings: dict, *, session_id: str, query: str, first: bool, 
     else:
         if not query.strip():
             return None
-        result = targeted_recall(config, query, budget_chars=min(4000, budget), max_items=3)
+        result = targeted_recall(config, query, budget_chars=min(6000, budget), max_items=3)
         if not result['results']:
             return None
         text, audit, digest = result['markdown'], result['selection_audit'], result['digest']

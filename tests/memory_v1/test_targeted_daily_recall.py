@@ -69,6 +69,10 @@ class NativeTransportBudgetTests(unittest.TestCase):
         settings={'mode':'normal','owner':'','project':'unscoped','projects':[],
                   'shared':True,'config_path':'/unused','base_dir':str(self.vault.parent)}
         (self.vault/'companion/Core.md').write_text('# Core\n' + 'identity context '*1000)
+        (self.vault/'companion/Kurallar.md').write_text('# Kurallar\n' + 'bakım penceresi iş emri '*200)
+        event = next((self.vault/'daily/2026-09-14').glob('*.md'))
+        event.write_text(event.read_text().replace('Yedek geri okuma süresi ölçülmedi.',
+            'Yedek geri okuma süresi ölçülmedi. ' + 'Kontrol sonucu bekleniyor. '*35))
         with patch('memory_v1.core.MemoryConfig.load',return_value=self.config), \
              patch('memory_v1.profile_integration._native_context_budget',return_value=10000), \
              patch('memory_v1.profile_integration.record_status') as status:
