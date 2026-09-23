@@ -14,6 +14,28 @@ if str(_REPO_ROOT) not in sys.path:
 from memory_v1 import project_registry as pr
 
 
+def _filesystem_unifies_nfc_nfd() -> bool:
+    """Probe the filesystem instead of naming an OS.
+
+    macOS normalises path bytes, so an NFD directory answers to its NFC
+    spelling; ext4 on the VPS stores them as distinct names. Tests that need
+    one path to have two spellings cannot run where that is not true.
+    """
+    try:
+        with tempfile.TemporaryDirectory(prefix="pz-nfd-probe-") as tmp:
+            probe = Path(tmp) / unicodedata.normalize("NFD", "İç")
+            probe.mkdir()
+            return Path(unicodedata.normalize("NFC", str(probe))).is_dir()
+    except OSError:
+        return False
+
+
+_NFC_NFD_EQUIVALENT = _filesystem_unifies_nfc_nfd()
+_NEEDS_UNIFIED_FS = unittest.skipUnless(
+    _NFC_NFD_EQUIVALENT, "filesystem stores NFC and NFD spellings as distinct paths"
+)
+
+
 class TestProjectRegistry(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="pz-test-registry-")
@@ -120,6 +142,7 @@ class TestProjectRegistry(unittest.TestCase):
         path.mkdir()
         return path
 
+    @_NEEDS_UNIFIED_FS
     def test_resolve_capture_accepts_nfc_hook_root_for_nfd_registry_root(self) -> None:
         repo = self._unicode_repo("İçerik-Otomasyon")
         pr.register(self.state, repo, "icerik-otomasyon")
@@ -132,6 +155,7 @@ class TestProjectRegistry(unittest.TestCase):
         self.assertTrue(decision.capture)
         self.assertEqual(decision.reason, "ok")
 
+    @_NEEDS_UNIFIED_FS
     def test_resolve_capture_accepts_nfd_hook_root_for_nfc_registry_root(self) -> None:
         repo = self._unicode_repo("İçerik-Otomasyon")
         nfc_root = Path(unicodedata.normalize("NFC", str(repo)))
@@ -168,7 +192,13 @@ class TestProjectRegistry(unittest.TestCase):
                 self.state, cwd=cwd, project="icerik-otomasyon", project_root=nfc_root
             )
             self.assertFalse(decision.capture)
-            self.assertEqual(decision.reason, "cwd-outside-root")
+            # Rejection is the invariant on every filesystem. Where NFC and NFD
+            # are distinct names the root simply is not found, which rejects
+            # under a different reason code.
+            self.assertEqual(
+                decision.reason,
+                "cwd-outside-root" if _NFC_NFD_EQUIVALENT else "not-in-registry",
+            )
 
     def test_unicode_normalisation_preserves_symlink_escape_rejection(self) -> None:
         repo = self._unicode_repo("İçerik-Otomasyon")
@@ -183,7 +213,10 @@ class TestProjectRegistry(unittest.TestCase):
             self.state, cwd=escape, project="icerik-otomasyon", project_root=nfc_root
         )
         self.assertFalse(decision.capture)
-        self.assertEqual(decision.reason, "cwd-outside-root")
+        self.assertEqual(
+            decision.reason,
+            "cwd-outside-root" if _NFC_NFD_EQUIVALENT else "not-in-registry",
+        )
 
     # --- corrupt / missing registry ------------------------------------
     def test_missing_registry_is_empty_not_error(self) -> None:
