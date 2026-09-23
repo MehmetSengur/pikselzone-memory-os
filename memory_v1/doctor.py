@@ -24,8 +24,14 @@ from .graph_engine import KnowledgeGraphEngine, is_conflicted_copy_path
 from .provider import check_macos_keychain_presence
 
 
+# The leading \b is what keeps this from matching inside a longer word. Without
+# it, a systemd line quoted in a transcript --
+# "LoadCredential=supabase-service-role:/etc/..." -- matched on its *name* and
+# the doctor reported a FAIL for an artefact whose real values were already
+# redacted. core.SECRET_ASSIGNMENT has always carried the boundary; this is the
+# same rule, so the redactor and the reporter agree.
 VALUE_SHAPED_SECRET = re.compile(
-    r"(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
+    r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
     r"private[_-]?key|password|passwd|credential)\s*[:=]\s*[\"']?"
     r"[A-Za-z0-9_./+\-=]{12,}"
 )
