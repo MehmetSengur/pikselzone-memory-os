@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Set, Tuple
 
 from .core import (
-    is_noise_concept_slug, is_variable_dump, MemoryConfig, PolicyError, atomic_write, iso_now,
+    is_noise_concept_slug, is_variable_dump, is_inflected_concept_slug, _fold, MemoryConfig, PolicyError, atomic_write, iso_now,
     redact_sensitive_text, reject_symlink_chain, secure_read_text,
 )
 
@@ -136,6 +136,25 @@ class ConceptData:
 
 class KnowledgeGraphEngine:
     """Manages the living knowledge graph inside Obsidian vault's knowledge/ directory."""
+
+    def _attested_words(self) -> set[str]:
+        """Folded surface words the existing concepts use, read once per run.
+
+        Creating a concept is rare, so reading the concept bodies here is
+        affordable; this must never be called from a per-turn path.
+        """
+        cached = getattr(self, "_attested_cache", None)
+        if cached is not None:
+            return cached
+        words: set[str] = set()
+        try:
+            for path in sorted(self.concepts_dir.glob("*.md")):
+                text = path.read_text(encoding="utf-8", errors="replace")
+                words.update(w for w in re.findall(r"[a-z0-9]+", _fold(text)) if len(w) > 1)
+        except OSError:
+            words = set()  # no evidence rejects nothing
+        self._attested_cache = words
+        return words
 
     def __init__(self, vault_path: Path) -> None:
         self.vault_path = vault_path.resolve()
@@ -339,6 +358,9 @@ class KnowledgeGraphEngine:
                 # NAME=VALUE is a report variable, not a subject. Refusing it
                 # here is what stops the value becoming a concept of its own.
                 raise PolicyError(f"concept-variable-dump:{slug}")
+            if is_inflected_concept_slug(slug, self._attested_words()):
+                # A word taken mid-sentence, like "oturumun" for "oturum".
+                raise PolicyError(f"concept-inflected-slug:{slug}")
             target_path = self.concepts_dir / f"{slug}.md"
 
             aliases_fmt = ", ".join(f'"{a}"' for a in data.aliases)

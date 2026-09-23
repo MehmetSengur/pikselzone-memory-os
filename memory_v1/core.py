@@ -248,6 +248,47 @@ def is_variable_dump(text: str) -> bool:
     return all(_VARIABLE_DUMP_LINE.match(line) for line in lines)
 
 
+def _peel_once(word: str) -> list[str]:
+    """Every base form one valid suffix removal can produce."""
+    bases = []
+    for suffix, floor, gate in _SUFFIXES:
+        if not word.endswith(suffix):
+            continue
+        stem = word[: -len(suffix)]
+        if (len(stem) >= floor and _attaches(stem[-1], gate)
+                and _harmonizes(stem, suffix)):
+            bases.append(stem)
+    return bases
+
+
+def is_inflected_concept_slug(slug: str, attested: set[str]) -> bool:
+    """True when a one-word slug is an inflection of a word the vault uses.
+
+    The compiler sometimes titles a concept with a word taken mid-sentence:
+    the live vault grew `oturumun` ("of the session") and `tercihin` ("your
+    preference"). A concept name is the base form, or several words.
+
+    "The slug is not its own stem" was measured and rejected as the test: the
+    suffix table is Turkish and English words end in those letters, so 13 of 15
+    single-word English concepts would have gone with them. Attestation is what
+    separates the cases -- peeling one suffix from `oturumun` gives `oturum`,
+    which the corpus uses, while `claude` gives `clau`, which nothing uses.
+
+    One peel, not a fixpoint: stemming `oturumun` all the way reaches `otur`,
+    which is unattested, and the case would be missed.
+
+    ``attested`` holds folded surface words from the corpus. An empty set means
+    no evidence, so nothing is rejected.
+    """
+    slug = (slug or "").strip().casefold()
+    if not slug or "-" in slug or "_" in slug or len(slug) < 5:
+        return False
+    # No guard for "the slug is itself attested": a Turkish inflected form
+    # appears in the text, which is exactly why it got picked as a title. The
+    # base form's attestation is the evidence, not the slug's.
+    return any(base in attested for base in _peel_once(_fold(slug)))
+
+
 def is_noise_concept_slug(slug: str) -> bool:
     """True when a slug names no subject and must not become a concept.
 
