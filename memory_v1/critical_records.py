@@ -55,8 +55,14 @@ def extract_records(text: str, *, runtime: str, session_id: str, owner: str = ''
                 sentence = sentence.strip()
                 if not sentence or not CRITICAL.search(sentence):
                     continue
-                if len(sentence) > MAX_TEXT or len(records) >= MAX_RECORDS:
-                    raise SchemaError('critical-record-capacity-exceeded-source-retained')
+                # A capacity limit bounds what is kept; it does not discard the
+                # session. Raising here cost seven live threads their memory
+                # permanently: SchemaError is classified permanent, so the batch
+                # was never retried and the thread could never be promoted again.
+                if len(sentence) > MAX_TEXT:
+                    continue  # one oversized sentence, not a broken transcript
+                if len(records) >= MAX_RECORDS:
+                    break
                 reference = (source_ref or runtime + ':' + session_id + ':normalized-' + digest) + '#message-' + str((i-1)//2)
                 value_sha = sha256_bytes(sentence.encode())
                 identity = sha256_bytes((owner + '\0' + reference + '\0' + value_sha).encode())
@@ -71,7 +77,7 @@ def extract_records(text: str, *, runtime: str, session_id: str, owner: str = ''
                     'supersedes': prior if correction else [],
                     'conflicts_with': [] if correction else prior,
                     'authority': 'derived-claim-not-operational-truth'})
-    return records
+    return records[:MAX_RECORDS]
 
 
 def validate_records(records):
@@ -105,9 +111,9 @@ def merge_records(*groups):
         validate_records(group)
         for r in group:
             result[r['id']] = r
-    if len(result) > MAX_RECORDS:
-        raise SchemaError('critical-record-capacity-exceeded-source-retained')
-    return list(result.values())
+    # Later groups overwrite earlier ones by id, so the tail is the newest
+    # material. Keeping the newest bounded set beats failing the whole merge.
+    return list(result.values())[-MAX_RECORDS:]
 
 
 def render_records(records):
