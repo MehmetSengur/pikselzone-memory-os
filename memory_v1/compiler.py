@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import (
-    BARE_CONCEPT_DENYLIST, MemoryConfig, MemoryError, PolicyError, ProviderBlocked, SchemaError,
+    is_noise_concept_slug, MemoryConfig, MemoryError, PolicyError, ProviderBlocked, SchemaError,
     atomic_json, atomic_write, compiler_json_schema, compiler_write_relative_path,
     ensure_safe_directory,
     directive_shaped, exclusive_lock, iso_now, knowledge_relative_path, path_within,
@@ -260,7 +260,7 @@ class TerraCompiler:
             path = str(compiler_write_relative_path(str(item["path"])))
             if path.startswith("knowledge/concepts/"):
                 slug = path[len("knowledge/concepts/"):].removesuffix(".md")
-                if slug in BARE_CONCEPT_DENYLIST:
+                if is_noise_concept_slug(slug):
                     raise PolicyError(f"compiler-generic-bare-concept:{slug}")
             content = item["content"]
             if not isinstance(content, str) or not content.strip():

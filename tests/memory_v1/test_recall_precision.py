@@ -140,5 +140,58 @@ class AssociativeInjectionGateTest(unittest.TestCase):
         self.assertIn("concepts/kanban-karar-akisi.md", out)
 
 
+
+class NoiseConceptSlugTest(unittest.TestCase):
+    """An exact denylist only catches words someone already added to it."""
+
+    def test_rejects_what_the_live_vault_actually_grew(self) -> None:
+        from memory_v1.core import is_noise_concept_slug
+        for slug in ("bunu", "current", "for", "yeni", "yyyy-mm-dd",
+                     "pz-hc-20260830-3a172134f1", "pz-codex-canary-20260830-f3a9",
+                     "sb2-claude-canary-83b54d", "a", ""):
+            self.assertTrue(is_noise_concept_slug(slug), slug)
+
+    def test_keeps_real_subjects_including_short_proper_nouns(self) -> None:
+        from memory_v1.core import is_noise_concept_slug
+        for slug in ("redis", "obsidian", "avenox", "ga4", "capi", "atlas",
+                     "aura-cache-sync", "deploy-rollback", "hermes-vps-continuity"):
+            self.assertFalse(is_noise_concept_slug(slug), slug)
+
+
+class WeightedOverlapTest(unittest.TestCase):
+    """A shared word is worth less the more of the vault carries it."""
+
+    CORPUS = [
+        "Aura Cache Sync redis warmup by zone",
+        "Deploy Rollback sistem rollback after results",
+        "Meta Catalog Mismatch sistem feed parent id",
+        "Kanban Karar Akisi sistem karar kaydi",
+    ]
+
+    def test_a_rare_term_outweighs_a_common_one(self) -> None:
+        from memory_v1.recall import document_frequencies, weighted_overlap
+        frequencies, total = document_frequencies(self.CORPUS)
+        rare = weighted_overlap("redis", self.CORPUS[0], frequencies, total)
+        common = weighted_overlap("sistem", self.CORPUS[1], frequencies, total)
+        self.assertGreater(rare, common)
+
+    def test_no_shared_content_scores_zero(self) -> None:
+        from memory_v1.recall import document_frequencies, weighted_overlap
+        frequencies, total = document_frequencies(self.CORPUS)
+        self.assertEqual(
+            0.0, weighted_overlap("bunu bir de su", self.CORPUS[0], frequencies, total)
+        )
+
+    def test_length_does_not_penalise_a_relevant_document(self) -> None:
+        """The failure avenoxai/avenoxbeyin#83 reports: long notes lose."""
+        from memory_v1.recall import document_frequencies, weighted_overlap
+        frequencies, total = document_frequencies(self.CORPUS)
+        short = self.CORPUS[0]
+        long = self.CORPUS[0] + " " + ("ek detay satiri " * 200)
+        self.assertEqual(
+            weighted_overlap("redis warmup", short, frequencies, total),
+            weighted_overlap("redis warmup", long, frequencies, total),
+        )
+
 if __name__ == "__main__":
     unittest.main()

@@ -194,18 +194,20 @@ authority: "derived-session-memory-not-operational-truth"
         self.assertEqual("new\n", live.read_text())
 
     def test_partial_promotion_failure_rolls_back(self):
+        # Real concept slugs: this exercises rollback, and a one-character slug
+        # is rejected as noise before promotion is ever reached.
         concepts = self.vault / "knowledge/concepts"
         concepts.mkdir(parents=True)
-        first = concepts / "a.md"
-        second = concepts / "b.md"
+        first = concepts / "aura-cache.md"
+        second = concepts / "deploy-rollback.md"
         first.write_text("old-a\n")
         second.write_text("old-b\n")
         self.event()
         provider = FakeProvider({
             "status": "changes",
             "writes": [
-                {"path": "knowledge/concepts/a.md", "content": "new-a"},
-                {"path": "knowledge/concepts/b.md", "content": "new-b"},
+                {"path": "knowledge/concepts/aura-cache.md", "content": "new-a"},
+                {"path": "knowledge/concepts/deploy-rollback.md", "content": "new-b"},
             ],
         })
         original_atomic_write = compiler_module.atomic_write

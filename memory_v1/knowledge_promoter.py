@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import (
-    BARE_CONCEPT_DENYLIST, MemoryConfig, MemoryError, PolicyError, SchemaError,
+    is_noise_concept_slug, MemoryConfig, MemoryError, PolicyError, SchemaError,
     atomic_json, atomic_write, directive_shaped, ensure_safe_directory,
     KNOWLEDGE_DETERMINISTIC_FILES, exclusive_lock, iso_now, knowledge_relative_path,
     path_within,
@@ -240,7 +240,7 @@ def _validate_graph_candidate_integrity(
     # A bare status/artefact word is never a durable concept; refuse the batch
     # rather than promoting it into the shared graph.
     for slug in sorted(candidate_concepts):
-        if slug in BARE_CONCEPT_DENYLIST:
+        if is_noise_concept_slug(slug):
             raise PolicyError(f"candidate-generic-bare-concept:{slug}")
 
     for rel, _, content_bytes in validated_payloads:

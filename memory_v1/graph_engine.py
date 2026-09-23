@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Set, Tuple
 
 from .core import (
-    BARE_CONCEPT_DENYLIST, MemoryConfig, PolicyError, atomic_write, iso_now,
+    is_noise_concept_slug, MemoryConfig, PolicyError, atomic_write, iso_now,
     redact_sensitive_text, reject_symlink_chain, secure_read_text,
 )
 
@@ -331,8 +331,9 @@ class KnowledgeGraphEngine:
         else:
             # Create fresh concept file
             slug = slugify(clean_title)
-            if slug in BARE_CONCEPT_DENYLIST:
-                # A status/artefact word on its own is never a durable concept.
+            if is_noise_concept_slug(slug):
+                # A status word, a planted acceptance id or a format placeholder
+                # on its own is never a durable concept.
                 raise PolicyError(f"concept-generic-bare-slug:{slug}")
             target_path = self.concepts_dir / f"{slug}.md"
 
