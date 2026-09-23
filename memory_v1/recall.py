@@ -1150,6 +1150,25 @@ _TRIVIAL_PROMPTS = frozenset({
 })
 
 
+def _body_without_frontmatter(text: str) -> str:
+    """Drop the YAML header from text that will be injected.
+
+    Frontmatter is metadata about a note, not the note. It is worth searching
+    -- an alias is how a concept gets found -- but it is not worth sending.
+    On the live vault two concepts carry a ``sources:`` list longer than the
+    whole excerpt, so the prompt received 1400 characters of sha256 lines and
+    not one word of the concept, under a header that cited the file.
+
+    Scoring keeps the full text; only the delivered body is stripped.
+    """
+    if not text.startswith("---\n"):
+        return text
+    end = text.find("\n---", 4)
+    if end < 0:
+        return text
+    return text[end + 4 :].lstrip("\n")
+
+
 ASSOCIATIVE_TRUNCATION_MARKER = "[TRUNCATED_ASSOCIATIVE_RECALL]"
 # A section shorter than this says nothing its header did not already say, so
 # the slot is better given to a section that can carry an actual finding.
@@ -1303,7 +1322,7 @@ def associative_recall_fast(
             item_id=f"assoc-{slug}",
             item_type="knowledge_concept",
             title=slug.replace("-", " ").title(),
-            content=sanitized[:1400],
+            content=_body_without_frontmatter(sanitized)[:1400],
             source_file=f"knowledge/concepts/{slug}.md",
             source_sha256=digest,
             relevance_score=score,

@@ -294,3 +294,79 @@ class AssociativeBudgetTest(unittest.TestCase):
             body = body.replace("[TRUNCATED_ASSOCIATIVE_RECALL]", "")
             for word in body.split():
                 self.assertIn(word, vocabulary, f"fragment {word!r} in {header}")
+
+
+_HASH_HEAVY = """---
+title: "Hermes Vps Continuity"
+aliases:
+  - "Hermes Contabo deployment"
+tags: ["#concept", hermes, vps]
+sources:
+""" + "".join(
+    f'  - "codex-{i:02d}.md (sha256: {str(i) * 2}{"ab12cd34ef56" * 5})"\n' for i in range(9)
+) + """created: "2026-09-14"
+updated: "2026-09-14"
+authority: derived-memory-not-canonical
+---
+
+# Hermes Vps Continuity
+
+## Özet
+Hermes vps uzerinde ortak hafiza senkronizasyonu Obsidian sync ile yurur ve
+kanban karar kaydi ayrica tutulur. Bu cumle gercek icerik tasir.
+"""
+
+_HASH_INDEX = """# Knowledge Base Index
+
+| Article | Summary | Source | Updated |
+|---|---|---|---|
+| [Hermes Vps Continuity](concepts/hermes-vps-continuity.md) | Hermes vps ortak hafiza senkronizasyonu ve kanban karar kaydi | codex:a | 2026-09-14 |
+"""
+
+
+class ConceptBodyTest(unittest.TestCase):
+    """Frontmatter is metadata about the note, not the note.
+
+    Measured on the live vault, two concepts carry a `sources:` list longer
+    than the whole excerpt, so the injected text was 1400 characters of YAML
+    hashes and not one word of the concept. The budget was spent to deliver
+    nothing, under a header that cited the file.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="pz-test-body-")
+        self.root = Path(self._tmp.name).resolve()
+        self.vault = self.root / "vault"
+        concepts = self.vault / "knowledge" / "concepts"
+        concepts.mkdir(parents=True)
+        (self.vault / "knowledge" / "connections").mkdir(parents=True)
+        (self.vault / "knowledge" / "index.md").write_text(_HASH_INDEX, encoding="utf-8")
+        (concepts / "hermes-vps-continuity.md").write_text(_HASH_HEAVY, encoding="utf-8")
+        self.cfg = MemoryConfig.from_dict({
+            "role": "workstation",
+            "vault_path": str(self.vault),
+            "state_path": str(self.root / "state"),
+            "runtimes": ["codex", "claude"],
+            "transcript_roots": {"codex": [str(self.root)], "claude": [str(self.root)]},
+            "can_write_event_memory": True,
+            "can_run_compiler": False,
+            "provider": {"mode": "runtime-native"},
+        })
+        self.query = "hermes vps ortak hafiza senkronizasyonu ve kanban karar kaydi"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_the_injected_text_carries_the_concept_not_its_hashes(self) -> None:
+        out = associative_recall_fast(self.cfg, self.query)
+        self.assertIn("gercek icerik tasir", out)
+
+    def test_source_hashes_do_not_reach_the_prompt(self) -> None:
+        out = associative_recall_fast(self.cfg, self.query)
+        self.assertNotIn("sha256:", out)
+        self.assertNotIn("authority: derived-memory-not-canonical", out)
+
+    def test_an_alias_still_finds_the_concept(self) -> None:
+        """Frontmatter is dropped from the body, not from what is searched."""
+        out = associative_recall_fast(self.cfg, "hermes contabo deployment surekliligi")
+        self.assertIn("concepts/hermes-vps-continuity.md", out)
