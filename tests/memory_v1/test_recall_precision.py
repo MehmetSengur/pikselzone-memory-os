@@ -20,6 +20,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -192,9 +193,6 @@ class WeightedOverlapTest(unittest.TestCase):
             weighted_overlap("redis warmup", short, frequencies, total),
             weighted_overlap("redis warmup", long, frequencies, total),
         )
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 _LONG_A = """---
@@ -370,3 +368,90 @@ class ConceptBodyTest(unittest.TestCase):
         """Frontmatter is dropped from the body, not from what is searched."""
         out = associative_recall_fast(self.cfg, "hermes contabo deployment surekliligi")
         self.assertIn("concepts/hermes-vps-continuity.md", out)
+
+
+class RerankWiringTest(unittest.TestCase):
+    """The recall path must honour the config, and be unchanged when it is off."""
+
+    CONCEPT = """---
+title: "%s"
+---
+
+# %s
+
+## Özet
+Kanban karar kaydi ve sahiplik devri %s icin tutulur ve gozden gecirilir.
+"""
+    INDEX = """# Knowledge Base Index
+
+| Article | Summary | Source | Updated |
+|---|---|---|---|
+| [Alfa](concepts/alfa-kaydi.md) | Kanban karar kaydi ve sahiplik devri alfa | codex:a | 2026-09-01 |
+| [Beta](concepts/beta-kaydi.md) | Kanban karar kaydi ve sahiplik devri beta | codex:b | 2026-09-02 |
+"""
+
+    def _config(self, rerank=None):
+        raw = {
+            "role": "workstation",
+            "vault_path": str(self.vault),
+            "state_path": str(self.root / "state"),
+            "runtimes": ["codex", "claude"],
+            "transcript_roots": {"codex": [str(self.root)], "claude": [str(self.root)]},
+            "can_write_event_memory": True,
+            "can_run_compiler": False,
+            "provider": {"mode": "runtime-native"},
+        }
+        if rerank is not None:
+            raw["rerank"] = rerank
+        return MemoryConfig.from_dict(raw)
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="pz-test-rerank-wire-")
+        self.root = Path(self._tmp.name).resolve()
+        self.vault = self.root / "vault"
+        concepts = self.vault / "knowledge" / "concepts"
+        concepts.mkdir(parents=True)
+        (self.vault / "knowledge" / "connections").mkdir(parents=True)
+        (self.vault / "knowledge" / "index.md").write_text(self.INDEX, encoding="utf-8")
+        for slug, name in (("alfa-kaydi", "Alfa"), ("beta-kaydi", "Beta")):
+            (concepts / f"{slug}.md").write_text(
+                self.CONCEPT % (name, name, name), encoding="utf-8"
+            )
+        self.query = "kanban karar kaydi ve sahiplik devri gozden gecir"
+        self.enabled = {
+            "mode": "on", "model": "gpt-5.4-nano-2026-03-17",
+            "key_env": "PZ_TEST_RERANK_KEY", "min_score": 2,
+        }
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_default_config_does_not_rerank(self) -> None:
+        cfg = self._config()
+        self.assertEqual("off", cfg.rerank["mode"])
+        out = associative_recall_fast(cfg, self.query)
+        self.assertIn("concepts/alfa-kaydi.md", out)
+        self.assertIn("concepts/beta-kaydi.md", out)
+
+    def test_an_enabled_rerank_drops_what_it_scores_low(self) -> None:
+        def transport(payload, timeout):
+            keep = [c["id"] for c in payload["state"]["candidates"] if "Beta" in c["title"]]
+            return {c["id"]: (2 if c["id"] in keep else 0)
+                    for c in payload["state"]["candidates"]}
+
+        with mock.patch("memory_v1.reranker.build_transport", return_value=transport):
+            out = associative_recall_fast(self._config(self.enabled), self.query)
+        self.assertIn("concepts/beta-kaydi.md", out)
+        self.assertNotIn("concepts/alfa-kaydi.md", out)
+
+    def test_a_failing_rerank_leaves_the_lexical_result(self) -> None:
+        def boom(payload, timeout):
+            raise TimeoutError("slow")
+
+        with mock.patch("memory_v1.reranker.build_transport", return_value=boom):
+            out = associative_recall_fast(self._config(self.enabled), self.query)
+        self.assertIn("concepts/alfa-kaydi.md", out)
+        self.assertIn("concepts/beta-kaydi.md", out)
+
+if __name__ == "__main__":
+    unittest.main()

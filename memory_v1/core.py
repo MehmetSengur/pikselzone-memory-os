@@ -574,6 +574,8 @@ class MemoryConfig:
     provider_keychain_service: str | None = None
     provider_keychain_account: str | None = None
     context_budget_chars: int = 16000
+    #: Resolved ``rerank`` block; mode 'off' unless explicitly configured.
+    rerank: dict[str, Any] = dataclasses.field(default_factory=dict)
     idle_finalize_seconds: int = 45 * 60
     backup_evidence_path: Path | None = None
     sync_evidence_path: Path | None = None
@@ -600,7 +602,7 @@ class MemoryConfig:
             raise ConfigError("config-fields-invalid")
         from .memory_policy import resolve_policy
         from .reranker import validate_rerank_config
-        validate_rerank_config(raw.get("rerank"))
+        rerank = validate_rerank_config(raw.get("rerank"))
         memory = raw.get("memory", {})
         if not isinstance(memory, dict):
             raise ConfigError("memory-policy-invalid")
@@ -736,6 +738,7 @@ class MemoryConfig:
             provider_keychain_service=keychain_service,
             provider_keychain_account=keychain_account,
             context_budget_chars=budget,
+            rerank=rerank,
             idle_finalize_seconds=idle_raw * 60,
             backup_evidence_path=Path(backup) if backup else None,
             sync_evidence_path=Path(sync) if sync else None,

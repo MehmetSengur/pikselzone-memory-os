@@ -53,8 +53,17 @@ RERANK_INSTRUCTIONS = (
 )
 RERANK_SCHEMA = "pikselzone-memory-rerank-v1"
 
+# Only models small enough that judging candidates costs a fraction of what the
+# main agent would spend reading them. A larger model defeats the purpose.
+RERANK_MODELS = frozenset({
+    "gpt-5.4-nano-2026-03-17",
+    "gpt-5.4-mini-2026-03-17",
+})
+
 _DEFAULTS: dict[str, Any] = {
     "mode": "off",
+    "model": "",
+    "key_env": "",
     "max_candidates": 8,
     "excerpt_chars": 600,
     "timeout_seconds": 2.0,
@@ -83,6 +92,17 @@ def validate_rerank_config(raw: Any) -> dict[str, Any]:
     if type(timeout) not in (int, float) or not 0 < float(timeout) <= 5:
         raise ConfigError("rerank-timeout-invalid")
     resolved["timeout_seconds"] = float(timeout)
+    for field in ("model", "key_env"):
+        if not isinstance(resolved[field], str):
+            raise ConfigError(f"rerank-{field}-invalid")
+    if resolved["mode"] != "off":
+        # The summariser runs runtime-native on a subscription. Reranking is a
+        # separate, explicitly keyed spend, so it names its own model and its
+        # own credential and can never be reached by the flush path's config.
+        if resolved["model"] not in RERANK_MODELS:
+            raise ConfigError("rerank-model-forbidden")
+        if not resolved["key_env"].strip():
+            raise ConfigError("rerank-key-env-required")
     return resolved
 
 
@@ -217,3 +237,64 @@ def rerank(
 
     report["applied"] = True
     return kept + tail, report
+
+
+RERANK_ANSWER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["scores"],
+    "properties": {
+        "scores": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": len(RERANK_CRITERIA) - 1,
+            },
+        }
+    },
+}
+
+
+def build_transport(
+    settings: dict[str, Any], *, provider_factory: Callable[..., Any] | None = None
+) -> Callable[[dict, float], Any] | None:
+    """A transport, or None when this is not fully and explicitly configured.
+
+    None keeps the reranker off. Reaching a provider requires a mode, a model
+    from the small-model allowlist and a credential variable that actually
+    resolves, none of which is a default. The summariser's runtime-native
+    routing is untouched: this builds its own client against its own key.
+    """
+    if settings.get("mode", "off") == "off":
+        return None
+    model = settings.get("model", "")
+    key_env = settings.get("key_env", "")
+    if model not in RERANK_MODELS or not key_env:
+        return None
+
+    def call(payload: dict, timeout: float) -> Any:
+        if provider_factory is not None:
+            provider = provider_factory(key_env=key_env, timeout=timeout)
+        else:
+            import os
+
+            from .provider import StructuredResponsesProvider
+
+            if not os.environ.get(key_env, "").strip():
+                raise ConfigError("rerank-credential-missing")
+            provider = StructuredResponsesProvider(
+                api_base="https://api.openai.com/v1", key_env=key_env
+            )
+        instruction = payload["instructions"] + "\nLevels: " + json.dumps(
+            payload["criteria"], ensure_ascii=False
+        )
+        return provider.request(
+            model=model,
+            instruction=instruction,
+            untrusted_input=json.dumps(payload["state"], ensure_ascii=False),
+            schema_name=RERANK_SCHEMA,
+            schema=RERANK_ANSWER_SCHEMA,
+        )
+
+    return call

@@ -25,7 +25,13 @@ def items(*titles: str) -> list[Item]:
 
 
 def settings(**overrides) -> dict:
-    return rr.validate_rerank_config({"mode": "on", **overrides})
+    """A fully configured block: a mode alone is not enough to reach a provider."""
+    return rr.validate_rerank_config({
+        "mode": "on",
+        "model": "gpt-5.4-nano-2026-03-17",
+        "key_env": "PZ_TEST_RERANK_KEY",
+        **overrides,
+    })
 
 
 class ConfigTest(unittest.TestCase):
@@ -37,15 +43,33 @@ class ConfigTest(unittest.TestCase):
             rr.validate_rerank_config({"mode": "on", "temperature": 0.7})
 
     def test_bounds_are_enforced(self) -> None:
+        base = {"mode": "on", "model": "gpt-5.4-nano-2026-03-17", "key_env": "K"}
         for bad in ({"max_candidates": 0}, {"max_candidates": 33},
                     {"excerpt_chars": 10}, {"timeout_seconds": 0},
                     {"timeout_seconds": 6}, {"min_score": 5}):
             with self.assertRaises(ConfigError, msg=str(bad)):
-                rr.validate_rerank_config({"mode": "on", **bad})
+                rr.validate_rerank_config({**base, **bad})
+
+    def test_enabling_requires_its_own_small_model_and_credential(self) -> None:
+        """The summariser's subscription routing can never be reached from here."""
+        for bad in ({"mode": "on"},
+                    {"mode": "on", "model": "gpt-5.6-luna", "key_env": "K"},
+                    {"mode": "on", "model": "gpt-5.4-nano-2026-03-17"},
+                    {"mode": "shadow", "model": "gpt-5.4-nano-2026-03-17", "key_env": " "}):
+            with self.assertRaises(ConfigError, msg=str(bad)):
+                rr.validate_rerank_config(bad)
+
+    def test_no_transport_without_full_configuration(self) -> None:
+        self.assertIsNone(rr.build_transport(rr.validate_rerank_config(None)))
+        self.assertIsNotNone(rr.build_transport(rr.validate_rerank_config(
+            {"mode": "shadow", "model": "gpt-5.4-nano-2026-03-17", "key_env": "K"})))
 
     def test_a_boolean_is_not_an_integer_score(self) -> None:
         with self.assertRaises(ConfigError):
-            rr.validate_rerank_config({"mode": "on", "min_score": True})
+            rr.validate_rerank_config({
+                "mode": "on", "model": "gpt-5.4-nano-2026-03-17",
+                "key_env": "K", "min_score": True,
+            })
 
 
 class DefaultsAndFailureTest(unittest.TestCase):

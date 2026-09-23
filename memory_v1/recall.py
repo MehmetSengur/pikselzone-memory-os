@@ -1335,6 +1335,22 @@ def associative_recall_fast(
     if not picked:
         return ""
 
+    # Optional and off unless explicitly configured. A failure, a timeout or an
+    # unusable answer leaves the lexical order exactly as it was.
+    rerank_settings = getattr(config, "rerank", None) or {}
+    if rerank_settings.get("mode", "off") != "off":
+        from .reranker import build_transport, rerank as rerank_items
+        try:
+            picked, _ = rerank_items(
+                picked, query, rerank_settings,
+                transport=build_transport(rerank_settings),
+            )
+        except Exception:  # advice must never cost the session its memory
+            logger.warning("rerank skipped", exc_info=False)
+        if not picked:
+            return ""
+
+
     picked.sort(key=lambda it: -it.relevance_score)
     lines = [
         "=== PIKSELZONE ASSOCIATIVE RECALL (cross-project) ===",
