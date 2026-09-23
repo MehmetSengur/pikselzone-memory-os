@@ -594,11 +594,13 @@ class MemoryConfig:
             "role", "vault_path", "state_path", "runtimes", "transcript_roots",
             "can_write_event_memory", "can_run_compiler", "models", "provider",
             "context_budget_chars", "backup_evidence_path", "sync_evidence_path",
-            "activation", "idle_finalize_minutes", "memory",
+            "activation", "idle_finalize_minutes", "memory", "rerank",
         }
         if not set(raw).issubset(allowed_top_level):
             raise ConfigError("config-fields-invalid")
         from .memory_policy import resolve_policy
+        from .reranker import validate_rerank_config
+        validate_rerank_config(raw.get("rerank"))
         memory = raw.get("memory", {})
         if not isinstance(memory, dict):
             raise ConfigError("memory-policy-invalid")
