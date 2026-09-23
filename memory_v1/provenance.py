@@ -73,6 +73,12 @@ _RELAY_FRAMING = re.compile(
 _TEST_FIXTURE_MARKER = re.compile(
     r"(?i)(?:PZ-HARNESS-TESTVALUE|\bPZ-(?:CH|HC|CW)-\d{8}|\bPZ-[A-Z]+-CANARY-[\w-]+"
     r"|\bSB2-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9a-f]{6}\b|\btest notu\b|\btest tercihim\b"
+    # Applied directly on the VPS engine and never carried back here, so a
+    # deploy of this file would have silently dropped it. The two phrasings are
+    # the acceptance scripts' own wording; without them a lifecycle-test turn
+    # and an installation check value were learned as real user rules.
+    r"|\btest\s*\([^)]*(?:hafiza|hafıza)\s+yasam\s+dongusu"
+    r"|\bkurulum\s+testinin\s+kontrol\s+degeri\b"
     r"|hafızana kaydettiğini doğrula|tercihi kısa biçimde onayla)"
 )
 # A sentence that mentions a test artifact is about the test, never a rule.

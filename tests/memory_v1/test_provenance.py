@@ -81,6 +81,17 @@ class TestMentionTests(unittest.TestCase):
         ))
         self.assertEqual("", pv.find_test_marker("Canary koşusunu yarın tekrarlayalım."))
 
+    def test_acceptance_script_phrasings_are_fixtures(self):
+        """Recovered from a VPS-only hotfix; without these both turns became rules."""
+        self.assertTrue(pv.find_test_marker(
+            "test (memory os hafiza yasam dongusu) icin bu degeri sakla."
+        ))
+        self.assertTrue(pv.find_test_marker(
+            "Bu kurulum testinin kontrol degeri: 4821."
+        ))
+        # A real sentence that merely mentions an installation is not a fixture.
+        self.assertEqual("", pv.find_test_marker("Kurulum adımlarını yarın gözden geçirelim."))
+
 
 class SentenceIntentTests(unittest.TestCase):
     def assertIntent(self, sentence, intent, **kwargs):
