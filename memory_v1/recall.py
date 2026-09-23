@@ -1150,6 +1150,74 @@ _TRIVIAL_PROMPTS = frozenset({
 })
 
 
+ASSOCIATIVE_TRUNCATION_MARKER = "[TRUNCATED_ASSOCIATIVE_RECALL]"
+# A section shorter than this says nothing its header did not already say, so
+# the slot is better given to a section that can carry an actual finding.
+ASSOCIATIVE_MIN_BODY_CHARS = 180
+
+
+def _clip_body(body: str, allowance: int) -> str:
+    """Cut at a line, else a word, never inside one. Empty if nothing fits."""
+    body = body.rstrip()
+    if allowance <= 0:
+        return ""
+    if len(body) <= allowance:
+        return body
+    room = allowance - len(ASSOCIATIVE_TRUNCATION_MARKER) - 1
+    if room <= 0:
+        return ""
+    head = body[:room]
+    cut = head.rfind("\n")
+    if cut < room // 2:  # one very long line: fall back to a word boundary
+        cut = head.rfind(" ")
+    if cut <= 0:
+        return ""
+    return head[:cut].rstrip() + "\n" + ASSOCIATIVE_TRUNCATION_MARKER
+
+
+def _fit_sections(envelope: str, sections: Sequence[tuple[str, str]], budget: int) -> str:
+    """Render header/body sections inside a budget, each with a fair share.
+
+    Joining everything and slicing the tail cost three things at once, all of
+    them seen in live hook output: a body cut mid-word, a header whose body was
+    cut to nothing -- a citation pointing at text the reader never received --
+    and a long first section that left no room for the rest.
+
+    Each section gets an equal share of what the envelope leaves; a section
+    needing less than its share releases the remainder to the others, which is
+    repeated until nothing more is freed. A share too small to carry a real
+    body drops that section rather than emitting a bare header.
+    """
+    available = budget - len(envelope)
+    costs = [len(header) + len(body) + 2 for header, body in sections]
+    live = list(range(len(sections)))
+    shares: dict[int, int] = {}
+    while live:
+        share = available // len(live)
+        settled = [i for i in live if costs[i] <= share]
+        if not settled:
+            for i in live:
+                shares[i] = share
+            break
+        for i in settled:
+            shares[i] = costs[i]
+            available -= costs[i]
+        live = [i for i in live if i not in set(settled)]
+
+    rendered: list[str] = []
+    for index, (header, body) in enumerate(sections):
+        allowance = shares.get(index, 0) - len(header) - 2
+        if allowance < ASSOCIATIVE_MIN_BODY_CHARS and len(body) > allowance:
+            continue
+        clipped = _clip_body(body, allowance)
+        if not clipped:
+            continue
+        rendered.append(header + "\n" + clipped + "\n")
+    if not rendered:
+        return ""
+    return envelope + "\n".join(rendered)
+
+
 def _concept_slug_from_index_article(article: str) -> str | None:
     """Pull the concept slug out of an index article cell in any of the link
     styles the vault has produced ([t](concepts/slug.md), [[concepts/slug|t]],
@@ -1258,14 +1326,15 @@ def associative_recall_fast(
         "operational truth ile doğrula]:",
         "",
     ]
-    for it in picked:
-        lines.append(f"### [{it.relevance_score:.1f}] {it.title} (Source: {it.source_file})")
-        lines.append(it.content)
-        lines.append("")
-    rendered = "\n".join(lines)
-    if len(rendered) > budget_chars:
-        rendered = rendered[: budget_chars - 40] + "\n[TRUNCATED_ASSOCIATIVE_RECALL]\n"
-    return rendered
+    envelope = "\n".join(lines)
+    sections = [
+        (
+            f"### [{it.relevance_score:.1f}] {it.title} (Source: {it.source_file})",
+            it.content,
+        )
+        for it in picked
+    ]
+    return _fit_sections(envelope, sections, budget_chars)
 
 
 def targeted_recall(

@@ -195,3 +195,102 @@ class WeightedOverlapTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_LONG_A = """---
+title: "Aura Cache Sync"
+---
+
+# Aura Cache Sync
+
+## Özet
+""" + ("Redis onbellek zonu isinma sirasi ve kanban karar kaydi ayrintisi. " * 40)
+
+_LONG_B = """---
+title: "Deploy Rollback Akisi"
+---
+
+# Deploy Rollback Akisi
+
+## Özet
+""" + ("Kanban karar kaydi sonrasi rollback sirasi ve sahiplik devri. " * 40)
+
+_LONG_INDEX = """# Knowledge Base Index
+
+| Article | Summary | Source | Updated |
+|---|---|---|---|
+| [Aura Cache Sync](concepts/aura-cache-sync.md) | Redis onbellek zonu isinma ve kanban karar kaydi | codex:a | 2026-08-31 |
+| [Deploy Rollback Akisi](concepts/deploy-rollback-akisi.md) | Kanban karar kaydi sonrasi rollback ve sahiplik devri | codex:b | 2026-08-30 |
+"""
+
+
+class AssociativeBudgetTest(unittest.TestCase):
+    """A budget must cut whole sections, never a word or a body away from its header.
+
+    Both shapes below were observed in live hook output: a body severed
+    mid-word ("...router/instruction deği") and a header whose body was cut to
+    nothing, leaving a citation that pointed at text the reader never got.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="pz-test-budget-")
+        self.root = Path(self._tmp.name).resolve()
+        self.vault = self.root / "vault"
+        concepts = self.vault / "knowledge" / "concepts"
+        concepts.mkdir(parents=True)
+        (self.vault / "knowledge" / "connections").mkdir(parents=True)
+        (self.vault / "knowledge" / "index.md").write_text(_LONG_INDEX, encoding="utf-8")
+        (concepts / "aura-cache-sync.md").write_text(_LONG_A, encoding="utf-8")
+        (concepts / "deploy-rollback-akisi.md").write_text(_LONG_B, encoding="utf-8")
+        self.cfg = MemoryConfig.from_dict({
+            "role": "workstation",
+            "vault_path": str(self.vault),
+            "state_path": str(self.root / "state"),
+            "runtimes": ["codex", "claude"],
+            "transcript_roots": {"codex": [str(self.root)], "claude": [str(self.root)]},
+            "can_write_event_memory": True,
+            "can_run_compiler": False,
+            "provider": {"mode": "runtime-native"},
+        })
+        self.query = "kanban karar kaydi ve rollback sirasi sahiplik devri"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_output_stays_within_budget(self) -> None:
+        out = associative_recall_fast(self.cfg, self.query, budget_chars=2400)
+        self.assertLessEqual(len(out), 2400)
+
+    @staticmethod
+    def _sections(out: str) -> list[tuple[str, str]]:
+        """Concept sections only; the authority notice also starts with '### '."""
+        import re as _re
+        parts = _re.split(r"(?m)^### \[", out)[1:]
+        return [(p.split("\n", 1)[0], p.split("\n", 1)[1] if "\n" in p else "") for p in parts]
+
+    def test_no_header_is_left_without_a_body(self) -> None:
+        out = associative_recall_fast(self.cfg, self.query, budget_chars=2400)
+        sections = self._sections(out)
+        self.assertTrue(sections, "expected at least one concept in the output")
+        for header, body in sections:
+            body = body.replace("[TRUNCATED_ASSOCIATIVE_RECALL]", "").strip()
+            self.assertTrue(body, f"header with no body: {header}")
+
+    def test_a_long_first_concept_does_not_starve_the_second(self) -> None:
+        out = associative_recall_fast(self.cfg, self.query, budget_chars=2400, max_items=2)
+        self.assertEqual(2, len(self._sections(out)),
+                         f"one concept ate the budget:\n{out[:400]}")
+
+    def test_a_body_is_not_cut_mid_word(self) -> None:
+        """Every word emitted must be a whole word of the source vocabulary.
+
+        A cut at a word boundary legitimately ends in a letter, so the last
+        character says nothing. A cut inside a word produces a fragment that
+        the source never contained.
+        """
+        vocabulary = set((_LONG_A + " " + _LONG_B).split())
+        out = associative_recall_fast(self.cfg, self.query, budget_chars=2400)
+        for header, body in self._sections(out):
+            body = body.replace("[TRUNCATED_ASSOCIATIVE_RECALL]", "")
+            for word in body.split():
+                self.assertIn(word, vocabulary, f"fragment {word!r} in {header}")
