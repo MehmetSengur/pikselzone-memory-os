@@ -232,10 +232,14 @@ class TestTargetedRecallAuthority(CanonicalAuthorityTestCase):
         self.assertIn("non-authoritative", hit["title"])
 
     def test_6_active_canonical_outranks_derived_knowledge_on_equal_text(self):
+        # "Equal text" has to mean equal *scored* text, titles included. The
+        # concept filename is deliberately free of query words: a slug that
+        # carries them earns a title match the canonical stem does not, and the
+        # comparison would then measure titles rather than authority.
         shared = "TwoBerries Meta Ads catalog campaign operations.\n"
         self._canonical("Active Ops", f"# Ops\n{shared}", status="active")
-        (self.vault / "knowledge" / "concepts" / "twoberries-catalog.md").write_text(
-            f"# TwoBerries Catalog\n{shared}", encoding="utf-8"
+        (self.vault / "knowledge" / "concepts" / "derived-note.md").write_text(
+            f"# Derived Note\n{shared}", encoding="utf-8"
         )
         res = targeted_recall(self.config, "TwoBerries Meta Ads catalog campaign")
         sources = [r["source"] for r in res["results"]]
@@ -250,13 +254,17 @@ class TestTargetedRecallAuthority(CanonicalAuthorityTestCase):
 
         In production the legacy brand doc scored 6.0 against 4.0 for live
         concepts -- and that entire 2.0 gap was the folder bonus.  Here both
-        documents carry the same body, so any surviving gap would be folder
-        precedence.  It must be exactly zero, and declaring ``status: active``
-        must be the only thing that opens one.
+        documents carry the same body *and* an equally unmatching title, so any
+        surviving gap would be folder precedence.  It must be exactly zero, and
+        declaring ``status: active`` must be the only thing that opens one.
+
+        The concept filename must stay free of query words: a slug that carries
+        them earns a title match the canonical stem does not, which would show
+        up as a gap that has nothing to do with the folder.
         """
         body = "TwoBerries Meta Ads catalog campaign operations.\n"
-        (self.vault / "knowledge" / "concepts" / "twoberries-catalog.md").write_text(
-            f"# TwoBerries Catalog\n{body}", encoding="utf-8"
+        (self.vault / "knowledge" / "concepts" / "derived-note.md").write_text(
+            f"# Derived Note\n{body}", encoding="utf-8"
         )
         query = "TwoBerries Meta Ads catalog campaign"
 

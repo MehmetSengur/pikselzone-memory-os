@@ -24,6 +24,8 @@ import os
 import posixpath
 import re
 import stat
+import unicodedata
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -241,10 +243,138 @@ def sanitize_untrusted_memory(text: str) -> tuple[str, int]:
     return "\n".join(lines), count
 
 
+# Turkish letters are outside [a-z0-9], so matching on that class alone shreds a
+# word at every one of them: "üzerinde" became "zerinde", "aldığımız" became
+# "ald" + "ir", "için" became "in".  That costs twice.  A word stops matching
+# itself across inflections, and the leftover fragments are short junk tokens
+# that match across unrelated documents.  Fold first, then tokenize.
+_TR_FOLD = str.maketrans({
+    "ı": "i", "İ": "i", "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g",
+    "ü": "u", "Ü": "u", "ö": "o", "Ö": "o", "ç": "c", "Ç": "c",
+    "â": "a", "Â": "a", "î": "i", "Î": "i", "û": "u", "Û": "u",
+})
+
+
+def _fold(text: str) -> str:
+    """Case-fold and strip diacritics so one spelling reaches one token."""
+    folded = text.translate(_TR_FOLD).casefold()
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", folded) if not unicodedata.combining(c)
+    )
+
+
+# Turkish is agglutinative, so exact token equality loses "kararları" against
+# "karar" and "notlar" against "not".  Each token is replaced by ONE canonical
+# stem, by the same function on both the query and the document side, so the
+# score stays "how many query words matched".  Suffixes are longest-first and
+# peeled to a fixpoint: a fixed pass count breaks query/document symmetry,
+# because "kütüphanesi" needs one more pass than "kütüphane" to reach the same
+# stem.  Input arrives already folded, so the table is written folded too.
+# Entry: (suffix, minimum stem length, what the character before it must be).
+# Adapted from avenoxai/avenoxbeyin (MIT), beyin_v3.py.
+_VOWELS = frozenset("aeiou")
+_VOICELESS = frozenset("cfhkpst")
+_SUFFIXES = (
+    ("imiz", 4, "consonant"), ("umuz", 4, "consonant"),
+    ("iniz", 4, "consonant"), ("unuz", 4, "consonant"),
+    ("nden", 5, "vowel"), ("ndan", 5, "vowel"),
+    ("ten", 4, "voiceless"), ("tan", 4, "voiceless"),
+    ("den", 4, "voiced"), ("dan", 4, "voiced"),
+    ("nin", 5, "vowel"), ("nun", 5, "vowel"),
+    ("nde", 5, "vowel"), ("nda", 5, "vowel"),
+    ("miz", 4, "vowel"), ("muz", 4, "vowel"),
+    ("niz", 4, "vowel"), ("nuz", 4, "vowel"),
+    ("yla", 4, "vowel"), ("yle", 4, "vowel"),
+    ("ler", 3, "any"), ("lar", 3, "any"),
+    ("te", 4, "voiceless"), ("ta", 4, "voiceless"),
+    ("de", 4, "voiced"), ("da", 4, "voiced"),
+    ("si", 4, "vowel"), ("su", 4, "vowel"),
+    ("ya", 4, "vowel"), ("ye", 4, "vowel"),
+    ("yi", 4, "vowel"), ("yu", 4, "vowel"),
+    ("in", 4, "consonant"), ("un", 4, "consonant"),
+    ("im", 4, "consonant"), ("um", 4, "consonant"),
+    ("le", 4, "consonant"), ("la", 4, "consonant"),
+    ("i", 4, "consonant"), ("u", 4, "consonant"),
+    ("e", 4, "consonant"), ("a", 4, "consonant"),
+)
+
+
+def _attaches(previous: str, gate: str) -> bool:
+    if gate == "vowel":
+        return previous in _VOWELS
+    if gate == "consonant":
+        return previous not in _VOWELS
+    if gate == "voiceless":
+        return previous in _VOICELESS
+    if gate == "voiced":
+        return previous not in _VOICELESS
+    return True
+
+
+def _harmonizes(stem: str, suffix: str) -> bool:
+    """Weak vowel harmony: folding hides o/u/i fronting, so only a and e decide."""
+    tone = next((c for c in suffix if c in _VOWELS), "")
+    if tone not in ("a", "e"):
+        return True
+    for character in reversed(stem):
+        if character in _VOWELS:
+            return character not in ("a", "e") or character == tone
+    return True
+
+
+@lru_cache(maxsize=16384)
+def _stem(word: str) -> str:
+    word = _fold(word)
+    # Words under 5 characters are already stems; peeling them merges roots.
+    while len(word) >= 5:
+        for suffix, floor, gate in _SUFFIXES:
+            if not word.endswith(suffix):
+                continue
+            stem = word[: -len(suffix)]
+            if (
+                len(stem) < floor
+                or not _attaches(stem[-1], gate)
+                or not _harmonizes(stem, suffix)
+            ):
+                continue
+            word = stem
+            break
+        else:
+            break
+    return word
+
+
 def _tokenize(text: str) -> set[str]:
-    """Normalize and tokenize text into lowercase alphanumeric words."""
-    words = re.findall(r"[a-z0-9_\-]+", text.lower())
-    return {w for w in words if len(w) > 1}
+    """Fold, split on non-alphanumerics, and reduce each word to one stem."""
+    words = re.findall(r"[a-z0-9]+", _fold(text))
+    return {_stem(w) for w in words if len(w) > 1}
+
+
+# Function words only.  A content word must never appear here: stemming folds
+# "notlar" onto "not", "kararları" onto "karar", "projede" onto "proje" and
+# "durumu" onto "durum", so listing any of those would empty a real query
+# instead of narrowing it.  English "not" is deliberately absent for that
+# reason -- it collides with the Turkish noun.  "su" is the one accepted
+# collision: folding maps the filler "şu" onto the noun "su" (water), and the
+# filler is common in this vault while the noun does not appear in it.
+_STOPWORDS = _tokenize(
+    "bu bunu buna bunlar su sunu onu onlar ve veya ile icin de da ki mi mu ya "
+    "ama fakat ancak yani eger ise iste gibi kadar daha cok az en her hic "
+    "bazi tum butun bir biraz sey seyler olarak olan oldu olur var yok "
+    "benim bizim senin sizin bana bize sana size ben biz sen siz "
+    "simdi sonra once artik hala yine tekrar acaba lutfen tamam evet hayir "
+    "nasil hangi kim nerede nedir neydi soyle getir bul "
+    "the an is are was were be been being of to in on at for from with and "
+    "or but if then than that this these those it its as by we you he she "
+    "they them do does did done have has had can could should would will "
+    "shall may might must about into over under out up down what which who "
+    "when where how why please tell show find get latest current my our"
+)
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Stems that carry topic, with function words removed."""
+    return _tokenize(text) - _STOPWORDS
 
 
 def score_text_relevance(
@@ -1186,7 +1316,13 @@ def associative_recall_fast(
         # in any language -- it is how a bare generic slug sneaks in. Require the
         # same overlap the acceptance harness uses to call an injection
         # defensible, so the runtime and the gate agree by construction.
-        if len(_tokenize(query) & _tokenize(sanitized)) < MIN_ASSOCIATIVE_SHARED_TOKENS:
+        # Shared *function* words are not evidence either: on the live vault the
+        # filler slug "bunu" reached a prompt sharing only {bir, bunu}, which
+        # satisfied a gate that counted any two tokens. Content words only.
+        if (
+            len(_content_tokens(query) & _content_tokens(sanitized))
+            < MIN_ASSOCIATIVE_SHARED_TOKENS
+        ):
             continue
         picked.append(RecallItem(
             item_id=f"assoc-{slug}",
