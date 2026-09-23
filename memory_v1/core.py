@@ -216,6 +216,38 @@ _PLACEHOLDER_SLUG = re.compile(
 )
 
 
+#: A summary line that is only ``NAME=VALUE``. The compiler reads these out of
+#: a transcript's report variables and they carry no subject: the live vault
+#: grew ``NATIVE_TO_MEMORY_OS_PROMOTION=NOT_FOUND.`` as a concept, plus ``yes``
+#: and ``not_found`` as separate concepts holding the same line.
+_VARIABLE_DUMP_LINE = re.compile(r"^\s*[A-Za-z][A-Za-z0-9_]{3,}\s*=\s*\S[^\n]*$")
+_SUMMARY_SECTION = re.compile(
+    r"(?im)^##\s*(?:özet|ozet|core summary|summary)\s*$\n(.*?)(?=^##\s|\Z)", re.S
+)
+
+
+def concept_summary(text: str) -> str:
+    """The concept's summary section, or the whole body when it has none."""
+    match = _SUMMARY_SECTION.search(text or "")
+    return (match.group(1) if match else (text or "")).strip()
+
+
+def is_variable_dump(text: str) -> bool:
+    """True when a concept says nothing but ``NAME=VALUE``.
+
+    This is the shape the compiler produces when a transcript reported its
+    outcome as report variables. Rejecting it at the source is what stops the
+    values themselves -- ``yes``, ``not_found`` -- from becoming concepts too.
+    """
+    summary = concept_summary(text)
+    if not summary:
+        return False
+    lines = [line for line in summary.splitlines() if line.strip()]
+    if not lines or len(lines) > 4:
+        return False
+    return all(_VARIABLE_DUMP_LINE.match(line) for line in lines)
+
+
 def is_noise_concept_slug(slug: str) -> bool:
     """True when a slug names no subject and must not become a concept.
 
@@ -240,7 +272,12 @@ def is_noise_concept_slug(slug: str) -> bool:
         return True
     if _CANARY_SLUG.match(slug) or _PLACEHOLDER_SLUG.match(slug):
         return True
-    if "-" not in slug and "_" not in slug:
+    if "_" in slug:
+        # slugify keeps underscores, because \w matches them, so one here means
+        # the source title was a machine identifier. All eight underscore slugs
+        # on the live vault were exactly that, with no real concept among them.
+        return True
+    if "-" not in slug:
         return not _content_tokens(slug)
     return False
 

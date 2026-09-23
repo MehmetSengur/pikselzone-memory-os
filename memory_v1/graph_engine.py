@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Set, Tuple
 
 from .core import (
-    is_noise_concept_slug, MemoryConfig, PolicyError, atomic_write, iso_now,
+    is_noise_concept_slug, is_variable_dump, MemoryConfig, PolicyError, atomic_write, iso_now,
     redact_sensitive_text, reject_symlink_chain, secure_read_text,
 )
 
@@ -332,9 +332,13 @@ class KnowledgeGraphEngine:
             # Create fresh concept file
             slug = slugify(clean_title)
             if is_noise_concept_slug(slug):
-                # A status word, a planted acceptance id or a format placeholder
-                # on its own is never a durable concept.
+                # A status word, a planted acceptance id, a machine identifier
+                # or a format placeholder is never a durable concept.
                 raise PolicyError(f"concept-generic-bare-slug:{slug}")
+            if is_variable_dump(clean_summary):
+                # NAME=VALUE is a report variable, not a subject. Refusing it
+                # here is what stops the value becoming a concept of its own.
+                raise PolicyError(f"concept-variable-dump:{slug}")
             target_path = self.concepts_dir / f"{slug}.md"
 
             aliases_fmt = ", ".join(f'"{a}"' for a in data.aliases)

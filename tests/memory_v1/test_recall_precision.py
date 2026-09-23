@@ -453,5 +453,56 @@ Kanban karar kaydi ve sahiplik devri %s icin tutulur ve gozden gecirilir.
         self.assertIn("concepts/alfa-kaydi.md", out)
         self.assertIn("concepts/beta-kaydi.md", out)
 
+
+class VariableDumpTest(unittest.TestCase):
+    """A report variable is not a subject, and its value is not one either.
+
+    The live vault grew NATIVE_TO_MEMORY_OS_PROMOTION=NOT_FOUND. as a concept,
+    and then `not_found` and `yes` as separate concepts carrying the same line,
+    because the compiler read a transcript's report variables as knowledge.
+    """
+
+    def test_a_bare_name_value_summary_is_a_dump(self) -> None:
+        from memory_v1.core import is_variable_dump
+        for text in (
+            "# X\n\n## Özet\nCODEX_NATIVE_MEMORY_SEPARATE=YES.\n",
+            "# X\n\n## Core summary\nNATIVE_TO_MEMORY_OS_PROMOTION=NOT_FOUND.\n",
+            "V2_2_NEEDED_NOW=YES.",
+        ):
+            self.assertTrue(is_variable_dump(text), text[:40])
+
+    def test_a_sentence_mentioning_an_assignment_is_not_a_dump(self) -> None:
+        from memory_v1.core import is_variable_dump
+        for text in (
+            "# X\n\n## Özet\nHermes vps uzerinde ortak hafiza senkronizasyonu yurur.\n",
+            "# X\n\n## Özet\nAyar A=B olarak degistirildi cunku eski deger yanlisti.\n",
+            "",
+        ):
+            self.assertFalse(is_variable_dump(text), text[:40])
+
+    def test_machine_identifier_slugs_are_noise(self) -> None:
+        """slugify keeps underscores, so one means the title was an identifier."""
+        from memory_v1.core import is_noise_concept_slug
+        for slug in ("not_found", "native_to_memory_os_promotion", "final_decision",
+                     "v2_2_needed_now", "codex_native_memory_separate",
+                     "recommended_user_workflow"):
+            self.assertTrue(is_noise_concept_slug(slug), slug)
+
+    def test_hyphenated_and_proper_noun_slugs_survive(self) -> None:
+        from memory_v1.core import is_noise_concept_slug
+        for slug in ("aura-cache-sync", "hermes-vps-continuity", "trendyol-api",
+                     "redis", "ga4", "capi", "claude"):
+            self.assertFalse(is_noise_concept_slug(slug), slug)
+
+
+class GraphEngineRefusalTest(unittest.TestCase):
+    """The writer refuses at the source, not just the reader at injection."""
+
+    def test_graph_engine_refuses_a_variable_dump_concept(self) -> None:
+        from memory_v1.core import is_variable_dump, is_noise_concept_slug
+        # The two gates graph_engine applies before creating a concept file.
+        self.assertTrue(is_variable_dump("NATIVE_TO_MEMORY_OS_PROMOTION=NOT_FOUND."))
+        self.assertTrue(is_noise_concept_slug("native_to_memory_os_promotion"))
+
 if __name__ == "__main__":
     unittest.main()
