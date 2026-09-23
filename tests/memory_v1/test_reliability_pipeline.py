@@ -32,6 +32,9 @@ class ReliabilityPipelineTests(MemoryFixture):
         self.assertTrue(any(r['reason']=='budget-excluded' for r in result['selection_audit']))
         self.assertNotIn('18,75 TL', result['markdown'])
     def test_corrupt_source_does_not_hide_good_source(self):
-        self.event()
-        (self.vault/'daily'/'2026-09-18'/'broken.md').write_text('---\nbad\n')
+        # Next to the good event, not in a hardcoded day directory that the
+        # writer never creates: the corrupt file has to be a sibling for this
+        # to test anything, and writing into a missing directory only raised.
+        good = self.event()
+        (good.parent/'broken.md').write_text('---\nbad\n')
         self.assertIn('18,75 TL', targeted_recall(self.config(), 'SKU 949 paket')['markdown'])
