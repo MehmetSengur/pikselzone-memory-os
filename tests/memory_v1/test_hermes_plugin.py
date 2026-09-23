@@ -11,6 +11,7 @@ import sys
 import tempfile
 import types
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -235,9 +236,14 @@ class HermesPluginAndPublisherTests(unittest.TestCase):
     def test_double_flush_prevention(self):
         plugin = load_hermes_plugin()
         plugin._IN_MEMORY_EXECUTING.clear()
-        sess_id = "sess-test-double-flush-1"
-        self.assertTrue(plugin._claim_session(sess_id))
-        self.assertFalse(plugin._claim_session(sess_id))
+        # Without an explicit locks_dir this wrote into the engine's live lock
+        # directory, so on the VPS a leftover file from an earlier run made the
+        # first claim fail. A fixed session id in a shared directory can also
+        # collide with a real session; keep both inside the test.
+        sess_id = "sess-test-double-flush-" + uuid.uuid4().hex
+        with tempfile.TemporaryDirectory(prefix="pz-test-locks-") as locks:
+            self.assertTrue(plugin._claim_session(sess_id, locks_dir=locks))
+            self.assertFalse(plugin._claim_session(sess_id, locks_dir=locks))
 
     def test_recursion_guard(self):
         plugin = load_hermes_plugin()
