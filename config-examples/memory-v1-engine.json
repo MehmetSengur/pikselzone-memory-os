@@ -9,8 +9,8 @@
   "can_write_event_memory": true,
   "can_run_compiler": true,
   "models": {
-    "flush": "gpt-5.6-luna",
-    "compiler": "gpt-5.6-terra"
+    "flush": "gpt-6-luna",
+    "compiler": "gpt-6-sol"
   },
   "provider": {
     "api_base": "https://api.openai.com/v1",

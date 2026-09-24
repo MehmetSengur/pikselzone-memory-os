@@ -722,6 +722,7 @@ class MemoryConfig:
             raise ConfigError("provider-mode-invalid")
         ALLOWED_MODELS = {
             "runtime-native", "vps-hermes-runtime",
+            "gpt-6-luna", "gpt-6-sol",
             "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol",
             "gpt-5.4-mini-2026-03-17", "gpt-5.4-nano-2026-03-17", "gpt-5.4-2026-03-05",
         }

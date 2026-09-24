@@ -155,7 +155,8 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
     if config.provider_mode == "runtime-native":
         checks.append(_row("model_routing", "pass", "runtime-native (claude=haiku, codex=subscription, compiler=vps-hermes)"))
     else:
-        valid_routing = config.flush_model == "gpt-5.6-luna" and config.compiler_model == "gpt-5.6-terra"
+        valid_routing = (config.flush_model, config.compiler_model) in {
+            ("gpt-6-luna", "gpt-6-sol"), ("gpt-5.6-luna", "gpt-5.6-terra")}
         checks.append(_row(
             "model_routing",
             "pass" if valid_routing else "fail",
