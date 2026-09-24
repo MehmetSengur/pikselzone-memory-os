@@ -832,6 +832,26 @@ def _activation_evidence_row(
     )
 
 
+def _event_session_keys(config: MemoryConfig, runtime: str, event: dict[str, Any]) -> set[str]:
+    """Session keys an event may be filed under.
+
+    A Hermes profile session is keyed by its SessionDB path as well as its id, so the
+    same id in two profiles cannot collide. The event carries only the owner hash of
+    that path, so match it against the runtime's own profile databases.
+    """
+    session_id = str(event["session_id"])
+    keys = {session_key(session_id)}
+    owner = (event.get("memory_scope") or {}).get("owner") if isinstance(event.get("memory_scope"), dict) else None
+    if not owner:
+        return keys
+    for root in config.transcript_roots.get(runtime, ()):
+        for database in (root / "state.db", *sorted(root.glob("profiles/*/state.db"))):
+            name = str(database)
+            if sha256_bytes(name.encode("utf-8")) == owner:
+                keys.add(sha256_bytes((name + "\0" + session_id).encode("utf-8"))[:32])
+    return keys
+
+
 def _activation_evidence_valid(
     config: MemoryConfig, runtime: str, path: Path,
     hook_config: Path | None,
@@ -890,7 +910,7 @@ def _activation_evidence_valid(
         if (
             event_digest != value["event_sha256"]
             or event["runtime"] != runtime
-            or session_key(event["session_id"]) != value["smoke_session_key"]
+            or value["smoke_session_key"] not in _event_session_keys(config, runtime, event)
             or event.get("source_provider") != value["source_provider"]
             or not {"session_end", "session_finalize", "session_reset"}.intersection(
                 event["events_seen"]

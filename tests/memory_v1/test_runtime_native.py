@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import datetime as dt
 import json
 import os
 import shutil
@@ -607,6 +608,54 @@ class RuntimeNativeTests(unittest.TestCase):
         # 4. Mismatched source_provider rejected
         valid_evidence["source_provider"] = "different-provider"
         evidence_file.write_text(json.dumps(valid_evidence))
+        self.assertFalse(_activation_evidence_valid(cfg, "hermes", evidence_file, None))
+
+    # 25b. A Hermes profile session is keyed by its SessionDB as well as its id
+    def test_doctor_accepts_profile_scoped_hermes_evidence(self):
+        import hashlib
+        from memory_v1.doctor import _activation_evidence_valid
+        from memory_v1.events import EventWriter
+        cfg = self._make_config(role="memory-engine")
+        evidence_dir = self.state / "evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        evidence_file = evidence_dir / "hermes-lifecycle-smoke.json"
+        database = cfg.transcript_roots["hermes"][0] / "profiles" / "pz-sengur" / "state.db"
+        database.parent.mkdir(parents=True)
+        database.write_bytes(b"")
+        owner = hashlib.sha256(str(database).encode()).hexdigest()
+        profile_key = hashlib.sha256((str(database) + "\0sess-profile").encode()).hexdigest()[:32]
+        rendered = EventWriter._render(
+            runtime="hermes", agent_id="hermes-main", session_id="sess-profile",
+            event="session_finalize", events_seen=["session_finalize"],
+            created_at="2026-09-24T23:20:48+03:00", source_model="gpt-6-luna",
+            source_provider="openai-codex", root_task_id="unknown", kanban_ids=[],
+            source_digest="0" * 64,
+            summary={"context": ["Test."], "important_conversations": [], "decisions": [],
+                     "learnings": [], "open_items": [], "evidence": []},
+            redaction_count=0,
+        )
+        head, _, body = rendered.partition("\n---\n")
+        scope = json.dumps({"owner": owner, "project": "unscoped", "visibility": "private"})
+        event_dir = self.vault / "daily" / "2026-09-24"
+        event_dir.mkdir(parents=True, exist_ok=True)
+        event_file = event_dir / ("hermes-" + profile_key + "-" + "0" * 16 + ".md")
+        event_file.write_text(head + "\nmemory_scope: " + scope + "\n---\n" + body, encoding="utf-8")
+        evidence = {
+            "schema": "pikselzone-memory-activation-evidence-v1", "runtime": "hermes",
+            "status": "pass", "runtime_version": "0.19.0", "hook_config_sha256": "0" * 64,
+            "smoke_session_key": profile_key, "checkpoint_id": event_file.name,
+            "provenance": "automatic-lifecycle-drain", "source_provider": "openai-codex",
+            "checkpoint_mode": "0600", "event_path": str(event_file),
+            "event_sha256": hashlib.sha256(event_file.read_bytes()).hexdigest(),
+            "duplicate_files": 0,
+            "observed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        evidence_file.write_text(json.dumps(evidence))
+        self.assertTrue(_activation_evidence_valid(cfg, "hermes", evidence_file, None))
+
+        # A key from a SessionDB this runtime does not own is still refused.
+        evidence["smoke_session_key"] = hashlib.sha256(b"/elsewhere/state.db\0sess-profile").hexdigest()[:32]
+        evidence_file.write_text(json.dumps(evidence))
         self.assertFalse(_activation_evidence_valid(cfg, "hermes", evidence_file, None))
 
     # 32. Detached worker invocation construction
