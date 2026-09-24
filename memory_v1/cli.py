@@ -100,6 +100,16 @@ def _parser() -> argparse.ArgumentParser:
     register_cmd.add_argument("--project", required=True)
     unregister_cmd = commands.add_parser("unregister")
     unregister_cmd.add_argument("root", type=Path)
+    requeue_cmd = commands.add_parser(
+        "requeue-hermes-finalize",
+        help="Put permanent Hermes finalize verdicts back on the bounded retry path",
+    )
+    requeue_cmd.add_argument("--plan-out", type=Path, help="Write a reviewable plan here; changes nothing.")
+    requeue_cmd.add_argument("--apply", type=Path, help="Apply a previously reviewed plan file.")
+    requeue_cmd.add_argument("--revert", help="Restore the records of this requeue id.")
+    requeue_cmd.add_argument("--reason", action="append", default=[],
+                             help="Reason code to include (default: schema and trust-denied).")
+    requeue_cmd.add_argument("--force", action="store_true", help="With --revert: restore even changed records.")
     repair_cmd = commands.add_parser(
         "repair-memory",
         help="Source-verified maintenance of learned rules and skills (plan, apply, revert).",
@@ -312,6 +322,21 @@ def main(argv: list[str] | None = None) -> int:
             mgr = SharedBrainParityManager(config.vault_path)
             report = mgr.align_shared_brain()
             print(json.dumps(dataclasses.asdict(report), ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "requeue-hermes-finalize":
+            from .hermes_requeue import (
+                DEFAULT_REASONS, apply_requeue_plan, build_requeue_plan, revert_requeue,
+            )
+            if args.revert:
+                result = revert_requeue(config, args.revert, force=args.force)
+            elif args.apply:
+                result = apply_requeue_plan(config, json.loads(args.apply.read_text(encoding="utf-8")))
+            else:
+                result = build_requeue_plan(config, reasons=tuple(args.reason) or DEFAULT_REASONS)
+                if args.plan_out:
+                    args.plan_out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                    result = {"status": "planned", "plan": str(args.plan_out), "summary": result["summary"]}
+            print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
         if args.command == "repair-memory":
             from .memory_repair import apply_repair_plan, build_repair_plan, retire_rule_candidate, revert_repair
