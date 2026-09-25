@@ -126,6 +126,10 @@ class CompileEligibilityTest(unittest.TestCase):
         self.assertEqual(compile_reason({"owner": "o", "project": "x", "visibility": "private"}, p),
                          "scope-excluded")
 
+    def test_a_legacy_project_event_follows_the_same_grant(self) -> None:
+        self.assertEqual(compile_reason({"project": "x"}, resolve_policy({})), "scope-excluded")
+        self.assertIsNone(compile_reason({"project": "x"}, resolve_policy({"projects": ["x"]})))
+
 
 class CompilerStagingTest(_Vault):
     def _stage(self, projects):

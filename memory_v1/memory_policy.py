@@ -61,7 +61,9 @@ def compile_reason(scope: dict, policy: dict) -> str | None:
         return None
     if not scope.get('owner') and scope.get('project') in (None, '', 'unscoped'):
         return None
-    if scope.get('visibility') == 'project':
+    # A legacy event names its project but no scope; the event schema reads a
+    # missing visibility as 'project', and so does this.
+    if scope.get('visibility', 'project') == 'project':
         return access_reason(scope, policy)
     return 'scope-excluded'
 
