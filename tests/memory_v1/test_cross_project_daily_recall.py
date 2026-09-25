@@ -178,3 +178,32 @@ class CrossProjectDailyRecallTest(_Vault):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompilerIgnoresProfilePolicyTest(_Vault):
+    """On the VPS the root Hermes home's empty profile grants replaced the
+    operator's grants, so a granted project still never reached the compiler."""
+
+    def test_stage_uses_the_config_grants_not_the_profile(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from memory_v1 import cli
+
+        config_path = self.root / "memory-config.json"
+        config_path.write_text(json.dumps({
+            "role": "memory-engine", "vault_path": str(self.vault),
+            "state_path": str(self.root / "state"), "runtimes": ["hermes"],
+            "transcript_roots": {"hermes": [str(self.root / "hermes-data")]},
+            "can_write_event_memory": True, "can_run_compiler": True,
+            "provider": {"mode": "runtime-native"},
+            "memory": {"projects": ["pikselzone-memory-os"]},
+        }), encoding="utf-8")
+        profile = {"owner": "root-home", "project": "unscoped", "projects": [],
+                   "shared": True, "mode": "normal", "status": "configured"}
+        out = io.StringIO()
+        with mock.patch("memory_v1.profile_integration.active_settings", return_value=profile), \
+                redirect_stdout(out):
+            cli.main(["--config", str(config_path), "stage-knowledge-batch",
+                      "--outbox", str(self.root / "outbox"), "--max-events", "5"])
+        self.assertIn('"staged"', out.getvalue())
