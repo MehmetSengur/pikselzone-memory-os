@@ -17,6 +17,11 @@
     "mode": "runtime-native"
   },
   "context_budget_chars": 16000,
+  "memory": {
+    "projects": ["claude-antigravity", "icerik-otomasyon", "luvaa", "operations-repo",
+                 "pikselzone-memory-os", "pikselzone-orchestrator", "sengur-ambalaj",
+                 "sengur-seo-geo", "twoberries", "yeni-marka"]
+  },
   "activation": {
     "codex_hooks_path": "/Users/mehmeteminsengur/Documents/Pikselzone-Hermes-AI-OS/operations-repo/.codex/hooks.json",
     "claude_settings_path": "/Users/mehmeteminsengur/Documents/Pikselzone-Hermes-AI-OS/operations-repo/.claude/settings.local.json",
