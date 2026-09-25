@@ -9,9 +9,16 @@ Single authority rule (see V2.3 plan 1c) applied on every claude/codex hook call
 
     hook --project=<slug> --project-root=<root>
       AND registry has an exact {project: <slug>, root: <root>} entry
-      AND cwd is within <root>
+      AND (cwd is within <root>
+           OR cwd is inside a linked git worktree of <root>)
           -> CAPTURE ON
     otherwise -> CAPTURE OFF (fail-closed; no warn-and-continue)
+
+A linked worktree (``git worktree add``) lives outside <root> but is the same
+repository, so it captures under the root's slug.  The link must hold in both
+directions -- the worktree's ``.git`` file names ``<root>/.git/worktrees/<x>``
+and that directory's ``gitdir`` names the worktree back -- so a hand-written
+``.git`` file cannot borrow a registered identity.
 """
 from __future__ import annotations
 
@@ -180,6 +187,68 @@ def verify_under_root(cwd: Path | str, project_root: Path | str) -> bool:
         return False
 
 
+_GITDIR_LINE_MAX = 4096
+
+
+def _read_link_line(path: Path, prefix: str = "") -> str | None:
+    """The single path line of a git link file, or None if it is not one."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        with path.open("r", encoding="utf-8") as handle:
+            text = handle.read(_GITDIR_LINE_MAX + 1)
+    except (OSError, UnicodeDecodeError):
+        return None
+    if len(text) > _GITDIR_LINE_MAX:
+        return None
+    lines = text.splitlines()
+    if len(lines) != 1 or not lines[0].startswith(prefix):
+        return None
+    value = lines[0][len(prefix):].strip()
+    return value or None
+
+
+def verify_linked_worktree(cwd: Path | str, project_root: Path | str) -> bool:
+    """True iff ``cwd`` is inside a linked git worktree of ``project_root``.
+
+    The nearest ``.git`` above ``cwd`` must be a file (a linked worktree, not a
+    repository of its own) whose ``gitdir:`` is a direct child of
+    ``<root>/.git/worktrees``, and that entry's ``gitdir`` must point back at
+    this worktree's ``.git``.  Anything else is False.
+    """
+    try:
+        root = Path(_normalize_root(project_root))
+        current = Path(_normalize_root(cwd))
+        worktrees = (root / ".git" / "worktrees").resolve(strict=True)
+        if not (root / ".git").is_dir():
+            return False
+        while True:
+            marker = current / ".git"
+            if marker.exists() or marker.is_symlink():
+                break
+            if current.parent == current:
+                return False
+            current = current.parent
+        target = _read_link_line(marker, "gitdir: ")
+        if target is None:
+            return False
+        entry = Path(target)
+        if not entry.is_absolute():
+            entry = current / entry
+        entry = entry.resolve(strict=True)
+        if entry.parent != worktrees or not entry.is_dir():
+            return False
+        back = _read_link_line(entry / "gitdir")
+        if back is None:
+            return False
+        back_path = Path(back)
+        if not back_path.is_absolute():
+            back_path = entry / back_path
+        return back_path.resolve(strict=False) == marker.resolve(strict=False)
+    except (OSError, ValueError, RuntimeError, RegistryError):
+        return False
+
+
 @dataclasses.dataclass(frozen=True)
 class CaptureDecision:
     capture: bool
@@ -215,9 +284,11 @@ def resolve_capture(
         return CaptureDecision(False, "not-in-registry", project=slug, root=norm_root)
     if entry.project != slug:
         return CaptureDecision(False, "project-mismatch", project=slug, root=norm_root)
-    if not verify_under_root(cwd, norm_root):
-        return CaptureDecision(False, "cwd-outside-root", project=slug, root=norm_root)
-    return CaptureDecision(True, "ok", project=slug, root=norm_root)
+    if verify_under_root(cwd, norm_root):
+        return CaptureDecision(True, "ok", project=slug, root=norm_root)
+    if verify_linked_worktree(cwd, norm_root):
+        return CaptureDecision(True, "ok-linked-worktree", project=slug, root=norm_root)
+    return CaptureDecision(False, "cwd-outside-root", project=slug, root=norm_root)
 
 
 __all__ = [
@@ -233,5 +304,6 @@ __all__ = [
     "lookup",
     "lookup_root",
     "verify_under_root",
+    "verify_linked_worktree",
     "resolve_capture",
 ]

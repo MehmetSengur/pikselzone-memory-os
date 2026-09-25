@@ -1,6 +1,8 @@
 """Unit tests for memory_v1.project_registry (V2.3 authority record + capture gate)."""
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -228,6 +230,88 @@ class TestProjectRegistry(unittest.TestCase):
         p.write_text('{"schema": "wrong", "projects": []}', encoding="utf-8")
         with self.assertRaises(pr.RegistryError):
             pr.load_registry(self.state)
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class TestLinkedWorktreeCapture(unittest.TestCase):
+    """A linked worktree of a registered root captures under the root's slug."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="pz-test-worktree-")
+        self.base = Path(self._tmp.name).resolve()
+        self.state = self.base / "state"
+        self.repo = self.base / "repo"
+        self.other = self.base / "other"
+        for repo in (self.repo, self.other):
+            repo.mkdir()
+            self._git(repo, "init", "-q")
+            self._git(repo, "commit", "-q", "--allow-empty", "-m", "init")
+        self.wt = self.base / "wt-feature"
+        self._git(self.repo, "worktree", "add", "-q", "-b", "feature", str(self.wt))
+        (self.wt / "src").mkdir()
+        pr.register(self.state, self.repo, "operations-repo")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _git(cwd: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            cwd=cwd, check=True, capture_output=True,
+        )
+
+    def _capture(self, cwd: Path, root: Path | None = None) -> pr.CaptureDecision:
+        return pr.resolve_capture(
+            self.state, cwd=cwd, project="operations-repo",
+            project_root=root or self.repo,
+        )
+
+    def test_worktree_top_and_subdir_capture_under_root_slug(self) -> None:
+        for cwd in (self.wt, self.wt / "src"):
+            decision = self._capture(cwd)
+            self.assertTrue(decision.capture, cwd)
+            self.assertEqual(decision.reason, "ok-linked-worktree")
+            self.assertEqual(decision.project, "operations-repo")
+            self.assertEqual(decision.root, str(self.repo))
+
+    def test_root_itself_still_reports_plain_ok(self) -> None:
+        self.assertEqual(self._capture(self.repo).reason, "ok")
+
+    def test_worktree_of_another_repository_is_refused(self) -> None:
+        foreign = self.base / "wt-foreign"
+        self._git(self.other, "worktree", "add", "-q", "-b", "x", str(foreign))
+        self.assertEqual(self._capture(foreign).reason, "cwd-outside-root")
+
+    def test_independent_repository_is_refused(self) -> None:
+        self.assertEqual(self._capture(self.other).reason, "cwd-outside-root")
+
+    def test_forged_git_file_without_back_link_is_refused(self) -> None:
+        forged = self.base / "forged"
+        forged.mkdir()
+        entry = self.repo / ".git" / "worktrees" / "wt-feature"
+        (forged / ".git").write_text(f"gitdir: {entry}\n", encoding="utf-8")
+        self.assertFalse(pr.verify_linked_worktree(forged, self.repo))
+        self.assertEqual(self._capture(forged).reason, "cwd-outside-root")
+
+    def test_git_file_naming_the_root_git_dir_is_refused(self) -> None:
+        forged = self.base / "forged-root"
+        forged.mkdir()
+        (forged / ".git").write_text(f"gitdir: {self.repo / '.git'}\n", encoding="utf-8")
+        self.assertFalse(pr.verify_linked_worktree(forged, self.repo))
+
+    def test_symlinked_git_file_is_refused(self) -> None:
+        linked = self.base / "linked"
+        linked.mkdir()
+        (linked / ".git").symlink_to(self.wt / ".git")
+        self.assertFalse(pr.verify_linked_worktree(linked, self.repo))
+
+    def test_worktree_does_not_widen_to_its_parent(self) -> None:
+        self.assertEqual(self._capture(self.base).reason, "cwd-outside-root")
+
+    def test_unregistered_root_still_refuses_its_worktree(self) -> None:
+        pr.unregister(self.state, self.repo)
+        self.assertEqual(self._capture(self.wt).reason, "not-in-registry")
 
 
 if __name__ == "__main__":
