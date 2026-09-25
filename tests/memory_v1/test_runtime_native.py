@@ -192,7 +192,7 @@ class RuntimeNativeTests(unittest.TestCase):
             runner=mock_runner,
         )
         self.assertEqual(SAMPLE_SUMMARY, summary)
-        self.assertEqual("gpt-5.6-luna", model_used)
+        self.assertEqual("gpt-6-luna", model_used)
         self.assertEqual("chatgpt-subscription", provider_name)
         self.assertIn("exec", captured_cmd)
         self.assertIn("--ephemeral", captured_cmd)

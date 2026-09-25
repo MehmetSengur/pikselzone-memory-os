@@ -26,7 +26,7 @@ os.environ.pop('PZ_MEMORY_TEST_MODE',None)
 source=Path(__file__).resolve().parents[1]
 policy={'schema':'pz-memory-profiles-v1','plugin_path':str(source/'hermes_plugins/pz-memory-v1'),
         'base_dir':str(root/'memory'),'profile_root':str(home),'config_path':str(root/'memory-config.json'),
-        'plugin_defaults':{'llm':{'allow_model_override':True,'allowed_models':['gpt-5.6-luna']}},'grants':{}}
+        'plugin_defaults':{'llm':{'allow_model_override':True,'allowed_models':['gpt-6-luna']}},'grants':{}}
 policy_path=root/'policy.json';policy_path.write_text(json.dumps(policy));policy_path.chmod(0o600)
 os.environ['PZ_MEMORY_PROFILE_POLICY']=str(policy_path)
 from hermes_cli import profiles, plugins
@@ -54,7 +54,7 @@ for label,profile in [('existing',existing),('new',new)]:
         assert Path(loaded.manifest.path)==source/'hermes_plugins/pz-memory-v1'
         assert all(len(callbacks)==1 for callbacks in manager._hooks.values())
         trust=_resolve_trust_policy('pz-memory-v1')
-        assert trust.allow_model_override and 'gpt-5.6-luna' in trust.allowed_models
+        assert trust.allow_model_override and 'gpt-6-luna' in trust.allowed_models
         assert not (profile/'plugins/pz-memory-v1').exists()
         assert not (profile/'auth.json').exists()
         assert (profile/'.env').read_text()==profiles._PLACEHOLDER_ENV

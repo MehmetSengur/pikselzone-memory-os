@@ -419,7 +419,7 @@ def summarize_with_codex(
                 "--json",
                 "--output-schema", str(schema_path),
             ]
-            codex_model = model if (model and model != "runtime-native") else "gpt-5.6-luna"
+            codex_model = model if (model and model != "runtime-native") else "gpt-6-luna"
             cmd.extend(["-m", codex_model])
             cmd.append(prompt)
 

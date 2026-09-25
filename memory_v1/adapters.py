@@ -774,7 +774,7 @@ def _drain_locked_checkpoint(
     # the flush model made every valid drain fail activation verification.
     flush_model = (
         getattr(active_provider, "last_source_model", None)
-        or ("gpt-5.6-luna" if runtime == "codex" else ("haiku" if runtime == "claude" else "unknown"))
+        or ("gpt-6-luna" if runtime == "codex" else ("haiku" if runtime == "claude" else "unknown"))
     )
     model_name = event_artifact.get("source_model") or flush_model
 

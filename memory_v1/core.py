@@ -643,8 +643,8 @@ class MemoryConfig:
     can_run_compiler: bool
     flush_model: str = "runtime-native"
     compiler_model: str = "vps-hermes-runtime"
-    luna_model: str = "gpt-5.6-luna"
-    terra_model: str = "gpt-5.6-terra"
+    luna_model: str = "gpt-6-luna"
+    terra_model: str = "gpt-6-sol"
     provider_mode: str = "runtime-native"
     provider_api_base: str = "https://api.openai.com/v1"
     provider_key_env: str = "OPENAI_API_KEY"
@@ -732,8 +732,8 @@ class MemoryConfig:
             if flush_model not in ALLOWED_MODELS or compiler_model not in ALLOWED_MODELS:
                 raise ConfigError("memory-model-routing-forbidden")
         else:
-            flush_model = str(models.get("flush", "gpt-5.6-luna"))
-            compiler_model = str(models.get("compiler", "gpt-5.6-terra"))
+            flush_model = str(models.get("flush", "gpt-6-luna"))
+            compiler_model = str(models.get("compiler", "gpt-6-sol"))
             if flush_model not in ALLOWED_MODELS or compiler_model not in ALLOWED_MODELS:
                 raise ConfigError("memory-model-routing-forbidden")
         luna_model = flush_model

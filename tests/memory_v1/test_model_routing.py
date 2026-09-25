@@ -35,6 +35,16 @@ class ModelRoutingTests(unittest.TestCase):
         config = self._config("gpt-5.6-luna", "gpt-5.6-terra")
         self.assertEqual("gpt-5.6-terra", config.compiler_model)
 
+    def test_unnamed_models_default_to_gpt6_luna_and_sol(self):
+        config = MemoryConfig.from_dict({
+            "role": "memory-engine", "vault_path": str(self.root / "vault"),
+            "state_path": str(self.root / "state"), "runtimes": ["hermes"],
+            "transcript_roots": {"hermes": [str(self.root)]},
+            "can_write_event_memory": True, "can_run_compiler": True,
+            "provider": {"mode": "external-openai-api"},
+        })
+        self.assertEqual(("gpt-6-luna", "gpt-6-sol"), (config.flush_model, config.compiler_model))
+
     def test_unknown_model_is_refused(self):
         with self.assertRaisesRegex(ConfigError, "memory-model-routing-forbidden"):
             self._config("gpt-6-astra", "gpt-6-sol")
