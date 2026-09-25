@@ -24,12 +24,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .companion import CompanionManager
-from .core import MemoryConfig, PolicyError, atomic_json, atomic_write, iso_now, sha256_bytes
-from .graph_engine import ConceptData, KnowledgeGraphEngine
+from .core import (
+    MemoryConfig, PolicyError, atomic_json, atomic_write, iso_now, sha256_bytes,
+    transcript_turns,
+)
 from .rule_learner import RuleLearner
 from .skill_engine import SkillEngine, WorkflowObservation
 
 logger = logging.getLogger("memory_v1.importers")
+
+# Live capture keeps only the recent tail; an archived transcript is imported whole.
+IMPORT_MAX_TURNS = 100_000
 
 SECRET_REGEX = re.compile(
     r"(?i)(sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{36,}|"
@@ -56,6 +61,8 @@ class ImportReceipt:
     schema: str = "pikselzone-history-import-receipt-v1"
     source_format: str = ""
     source_path: str = ""
+    project: str = "unscoped"
+    dry_run: bool = False
     timestamp: str = ""
     total_sessions_found: int = 0
     sessions_imported: int = 0
@@ -73,12 +80,21 @@ class HistoryImportEngine:
         self.vault_path = config.vault_path
         self.state_path = config.state_path
         self.companion = CompanionManager(self.vault_path)
-        self.graph = KnowledgeGraphEngine(self.vault_path)
-        self.rules = RuleLearner(self.companion)
+        from .learning_inbox import learning_sink
+        self.rules = RuleLearner(self.companion, sink=learning_sink(config, "import"))
         self.skills = SkillEngine(self.vault_path)
 
-    def import_file(self, file_path: Path, source_format: Optional[str] = None) -> ImportReceipt:
-        """Auto-detect format (or use specified) and import into the second brain."""
+    def import_file(
+        self, file_path: Path, source_format: Optional[str] = None, *,
+        project: Optional[str] = None, dry_run: bool = False,
+    ) -> ImportReceipt:
+        """Auto-detect format (or use specified) and import into the second brain.
+
+        ``project`` records which registered project the history belongs to, so
+        a backfill cannot land as unattributable global state the way live
+        capture never would.  ``dry_run`` reports what an import would extract
+        without writing rules, skills, or a receipt.
+        """
         path = file_path.resolve()
         if not path.is_file():
             raise PolicyError(f"import-source-not-found:{path}")
@@ -86,12 +102,15 @@ class HistoryImportEngine:
         fmt = source_format or self._detect_format(path)
         sessions = self._parse_file(path, fmt)
 
-        return self._distill_and_commit(sessions, source_format=fmt, source_path=str(path))
+        return self._distill_and_commit(
+            sessions, source_format=fmt, source_path=str(path),
+            project=project or "unscoped", dry_run=dry_run,
+        )
 
     def _detect_format(self, path: Path) -> str:
         name = path.name.lower()
         if name.endswith(".jsonl"):
-            return "codex"
+            return self._detect_jsonl_runtime(path)
         if name.endswith(".md"):
             return "markdown"
         if name == "conversations.json":
@@ -111,15 +130,36 @@ class HistoryImportEngine:
 
         return "markdown"
 
+    def _detect_jsonl_runtime(self, path: Path) -> str:
+        """Both runtimes write .jsonl, so the extension alone cannot decide."""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                head = handle.read(8192)
+        except OSError:
+            return "codex"
+        if '"item_completed"' in head or '"rollout' in head or "rollout-" in path.name:
+            return "codex"
+        if '"parentUuid"' in head or '"sessionId"' in head or '"cwd"' in head:
+            return "claude-code"
+        return "codex"
+
     def _parse_file(self, path: Path, fmt: str) -> list[ImportedSession]:
         content = path.read_text(encoding="utf-8", errors="replace")
 
         if fmt == "chatgpt":
             return self._parse_chatgpt(content)
         elif fmt == "claude":
-            return self._parse_claude(content)
+            # "claude" historically meant the claude.ai web export.  A Claude
+            # Code transcript is also legitimately "claude" to a caller, so
+            # fall back rather than silently returning zero sessions.
+            sessions = self._parse_claude(content)
+            if sessions:
+                return sessions
+            return self._parse_claude_code(content, source_id=path.stem)
+        elif fmt == "claude-code":
+            return self._parse_claude_code(content, source_id=path.stem)
         elif fmt == "codex":
-            return self._parse_codex(content)
+            return self._parse_codex(content, source_id=path.stem)
         elif fmt == "gemini":
             return self._parse_gemini(content)
         elif fmt == "markdown":
@@ -195,13 +235,35 @@ class HistoryImportEngine:
                 sessions.append(ImportedSession(source_format="claude", source_id=sess_id, title=title, turns=turns))
         return sessions
 
-    def _parse_codex(self, content: str) -> list[ImportedSession]:
-        from .transcripts import parse_codex_transcript
-        turns_data = parse_codex_transcript(content)
-        turns = [ConversationTurn(role=t.role, text=t.text) for t in turns_data]
+    def _parse_transcript_jsonl(
+        self, content: str, *, source_format: str, source_id: str, title: str
+    ) -> list[ImportedSession]:
+        """Read a runtime transcript through the same extractor live capture uses.
+
+        Codex rollouts and Claude Code sessions differ only in record shape,
+        which ``_message_from_record`` already resolves, so import and capture
+        must not keep separate readers that can drift apart.  ``strict=False``
+        tolerates a truncated trailing line in an archived transcript.
+        """
+        pairs = transcript_turns(content, max_turns=IMPORT_MAX_TURNS, strict=False)
+        turns = [ConversationTurn(role=role, text=text) for role, text in pairs]
         if not turns:
             return []
-        return [ImportedSession(source_format="codex", source_id="codex-import", title="Codex Rollout Session", turns=turns)]
+        return [ImportedSession(
+            source_format=source_format, source_id=source_id, title=title, turns=turns,
+        )]
+
+    def _parse_codex(self, content: str, source_id: str = "codex-import") -> list[ImportedSession]:
+        return self._parse_transcript_jsonl(
+            content, source_format="codex", source_id=source_id,
+            title="Codex Rollout Session",
+        )
+
+    def _parse_claude_code(self, content: str, source_id: str = "claude-code-import") -> list[ImportedSession]:
+        return self._parse_transcript_jsonl(
+            content, source_format="claude-code", source_id=source_id,
+            title="Claude Code Session",
+        )
 
     def _parse_gemini(self, content: str) -> list[ImportedSession]:
         sessions: list[ImportedSession] = []
@@ -272,7 +334,8 @@ class HistoryImportEngine:
         return [ImportedSession(source_format="markdown", source_id=source_id, title="Markdown Transcript", turns=turns)]
 
     def _distill_and_commit(
-        self, sessions: list[ImportedSession], source_format: str, source_path: str
+        self, sessions: list[ImportedSession], source_format: str, source_path: str,
+        project: str = "unscoped", dry_run: bool = False,
     ) -> ImportReceipt:
         now_str = iso_now()
         rules_count = 0
@@ -296,8 +359,14 @@ class HistoryImportEngine:
             asst_texts = [t.text for t in clean_turns if t.role == "assistant"]
 
             # 2. Extract rules from user directives
+            rule_source = f"import:{source_format}:{project}:{sess.source_id}"
             for u_text in user_texts:
-                learned = self.rules.learn_from_user_message(u_text, source=f"import:{source_format}:{sess.source_id}")
+                if dry_run:
+                    # Candidate count only: dedup and conflict reconciliation
+                    # happen inside learn_from_user_message, which writes.
+                    rules_count += len(self.rules.extract_rules_from_text(u_text))
+                    continue
+                learned = self.rules.learn_from_user_message(u_text, source=rule_source)
                 if learned:
                     rules_count += len(learned)
 
@@ -311,24 +380,21 @@ class HistoryImportEngine:
             }
             valid_techs = {e for e in detected_entities if e in tech_whitelist}
 
-            for tech in valid_techs:
-                # Add concept note
-                self.graph.add_or_update_concept(ConceptData(
-                    title=tech,
-                    summary=f"Teknik bileşen: {tech} mimarisi ve kullanımı.",
-                    details=[f"Geçmiş sohbetten aktarıldı: {sess.title}"],
-                    sources=[f"import:{source_format}:{sess.source_id}"],
-                ))
-                concepts_count += 1
+            # Imported history lands in daily/ only.  The shared knowledge/
+            # graph has one canonical writer (the VPS compiler), which picks
+            # these events up on its next batch -- see the import runbook and
+            # memory_v1.knowledge_index.
+            concepts_count += len(valid_techs)
 
             # 4. Extract repeated workflow patterns for skill candidates
             for u_text in user_texts:
                 if any(kw in u_text.lower() for kw in ["nasıl yapılır", "adımlar", "süreci çalıştır", "deploy et"]):
-                    self.skills.record_workflow(WorkflowObservation(
-                        workflow_name=sess.title[:40],
-                        trigger=u_text[:80],
-                        steps=[t.text[:120] for t in asst_texts[:3]],
-                    ))
+                    if not dry_run:
+                        self.skills.record_workflow(WorkflowObservation(
+                            workflow_name=sess.title[:40],
+                            trigger=u_text[:80],
+                            steps=[t.text[:120] for t in asst_texts[:3]],
+                        ))
                     skills_count += 1
 
             imported_sessions += 1
@@ -338,6 +404,8 @@ class HistoryImportEngine:
             "schema": "pikselzone-history-import-receipt-v1",
             "source_format": source_format,
             "source_path": source_path,
+            "project": project,
+            "dry_run": dry_run,
             "timestamp": now_str,
             "total_sessions_found": len(sessions),
             "sessions_imported": imported_sessions,
@@ -349,20 +417,25 @@ class HistoryImportEngine:
         receipt_sha = sha256_bytes(encoded)
         receipt_data["receipt_sha256"] = receipt_sha
 
-        imports_dir = self.state_path / "imports"
-        imports_dir.mkdir(parents=True, exist_ok=True)
-        ts_slug = re.sub(r"[^\w]", "-", now_str)
-        receipt_file = imports_dir / f"import-receipt-{ts_slug}.json"
-        atomic_json(receipt_file, receipt_data)
+        if not dry_run:
+            imports_dir = self.state_path / "imports"
+            imports_dir.mkdir(parents=True, exist_ok=True)
+            ts_slug = re.sub(r"[^\w]", "-", now_str)
+            receipt_file = imports_dir / f"import-receipt-{ts_slug}.json"
+            atomic_json(receipt_file, receipt_data)
 
         logger.info(
-            "Imported %d/%d sessions from %s (rules=%d, concepts=%d, skills=%d)",
-            imported_sessions, len(sessions), source_format, rules_count, concepts_count, skills_count
+            "Imported %d/%d sessions from %s into %s%s (rules=%d, concepts=%d, skills=%d)",
+            imported_sessions, len(sessions), source_format, project,
+            " [dry-run]" if dry_run else "",
+            rules_count, concepts_count, skills_count,
         )
 
         return ImportReceipt(
             source_format=source_format,
             source_path=source_path,
+            project=project,
+            dry_run=dry_run,
             timestamp=now_str,
             total_sessions_found=len(sessions),
             sessions_imported=imported_sessions,

@@ -10,7 +10,9 @@ import os
 import re
 import secrets
 import stat
+import unicodedata
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 import platform
 import shutil
@@ -23,12 +25,304 @@ RUNTIMES = {"codex", "claude", "hermes"}
 EVENTS = {
     "session_start", "session_end", "pre_compact", "post_compact",
     "session_finalize", "session_reset", "subagent_start", "subagent_stop",
+    # A turn checkpoint is raw, local state.  It becomes an event only when a
+    # bounded recovery drain has to promote it after a crash.
+    "turn_complete", "checkpoint_recovery",
 }
+#: A workstation thread with no new turn for this long is finalized at the next
+#: registered SessionStart when no SessionEnd arrived (Codex Desktop/App).
+DEFAULT_IDLE_FINALIZE_MINUTES = 45
 SUMMARY_FIELDS = (
     "context", "important_conversations", "decisions", "learnings",
     "open_items", "evidence",
 )
 ALLOWED_KNOWLEDGE_ROOTS = {"concepts", "connections"}
+# Bare, non-referential slugs that are status/artefact words, never durable
+# concepts.  A concept file whose *slug* is exactly one of these is rejected at
+# creation (graph_engine) and heavily down-weighted in retrieval (recall).
+# Multi-word slugs like "trendyol-api" or short proper nouns like "ga4"/"capi"
+# are unaffected -- this is an exact-match denylist, not a stopword filter.
+BARE_CONCEPT_DENYLIST = frozenset({
+    "pass", "fail", "failed", "test", "tests", "error", "errors", "app", "api",
+    "always", "never", "unknown", "success", "result", "results", "status",
+    "done", "todo", "note", "notes", "value", "data", "item", "items", "thing",
+    "step", "steps", "phase", "task", "tasks", "owner", "true", "false", "null",
+    # Turkish generics: the vault is bilingual, so an English-only denylist left
+    # the same defect class open (a live noise run matched the bare slug "yeni").
+    "yeni", "aktif", "mevcut", "durum", "sonuc", "sonuç", "adim", "adım",
+    "kural", "kurallar", "deger", "değer", "islem", "işlem", "genel", "ozet",
+    "özet", "not", "notlar", "veri", "bilgi", "dosya", "hata", "test-notu",
+})
+# Turkish letters are outside [a-z0-9], so matching on that class alone shreds a
+# word at every one of them: "üzerinde" became "zerinde", "aldığımız" became
+# "ald" + "ir", "için" became "in".  That costs twice.  A word stops matching
+# itself across inflections, and the leftover fragments are short junk tokens
+# that match across unrelated documents.  Fold first, then tokenize.
+_TR_FOLD = str.maketrans({
+    "ı": "i", "İ": "i", "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g",
+    "ü": "u", "Ü": "u", "ö": "o", "Ö": "o", "ç": "c", "Ç": "c",
+    "â": "a", "Â": "a", "î": "i", "Î": "i", "û": "u", "Û": "u",
+})
+
+
+def _fold(text: str) -> str:
+    """Case-fold and strip diacritics so one spelling reaches one token."""
+    folded = text.translate(_TR_FOLD).casefold()
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", folded) if not unicodedata.combining(c)
+    )
+
+
+# Turkish is agglutinative, so exact token equality loses "kararları" against
+# "karar" and "notlar" against "not".  Each token is replaced by ONE canonical
+# stem, by the same function on both the query and the document side, so the
+# score stays "how many query words matched".  Suffixes are longest-first and
+# peeled to a fixpoint: a fixed pass count breaks query/document symmetry,
+# because "kütüphanesi" needs one more pass than "kütüphane" to reach the same
+# stem.  Input arrives already folded, so the table is written folded too.
+# Entry: (suffix, minimum stem length, what the character before it must be).
+# Adapted from avenoxai/avenoxbeyin (MIT), beyin_v3.py.
+_VOWELS = frozenset("aeiou")
+_VOICELESS = frozenset("cfhkpst")
+_SUFFIXES = (
+    ("imiz", 4, "consonant"), ("umuz", 4, "consonant"),
+    ("iniz", 4, "consonant"), ("unuz", 4, "consonant"),
+    ("nden", 5, "vowel"), ("ndan", 5, "vowel"),
+    ("ten", 4, "voiceless"), ("tan", 4, "voiceless"),
+    ("den", 4, "voiced"), ("dan", 4, "voiced"),
+    ("nin", 5, "vowel"), ("nun", 5, "vowel"),
+    ("nde", 5, "vowel"), ("nda", 5, "vowel"),
+    ("miz", 4, "vowel"), ("muz", 4, "vowel"),
+    ("niz", 4, "vowel"), ("nuz", 4, "vowel"),
+    ("yla", 4, "vowel"), ("yle", 4, "vowel"),
+    ("ler", 3, "any"), ("lar", 3, "any"),
+    ("te", 4, "voiceless"), ("ta", 4, "voiceless"),
+    ("de", 4, "voiced"), ("da", 4, "voiced"),
+    ("si", 4, "vowel"), ("su", 4, "vowel"),
+    ("ya", 4, "vowel"), ("ye", 4, "vowel"),
+    ("yi", 4, "vowel"), ("yu", 4, "vowel"),
+    ("in", 4, "consonant"), ("un", 4, "consonant"),
+    ("im", 4, "consonant"), ("um", 4, "consonant"),
+    ("le", 4, "consonant"), ("la", 4, "consonant"),
+    ("i", 4, "consonant"), ("u", 4, "consonant"),
+    ("e", 4, "consonant"), ("a", 4, "consonant"),
+)
+
+
+def _attaches(previous: str, gate: str) -> bool:
+    if gate == "vowel":
+        return previous in _VOWELS
+    if gate == "consonant":
+        return previous not in _VOWELS
+    if gate == "voiceless":
+        return previous in _VOICELESS
+    if gate == "voiced":
+        return previous not in _VOICELESS
+    return True
+
+
+def _harmonizes(stem: str, suffix: str) -> bool:
+    """Weak vowel harmony: folding hides o/u/i fronting, so only a and e decide."""
+    tone = next((c for c in suffix if c in _VOWELS), "")
+    if tone not in ("a", "e"):
+        return True
+    for character in reversed(stem):
+        if character in _VOWELS:
+            return character not in ("a", "e") or character == tone
+    return True
+
+
+@lru_cache(maxsize=16384)
+def _stem(word: str) -> str:
+    word = _fold(word)
+    # Words under 5 characters are already stems; peeling them merges roots.
+    while len(word) >= 5:
+        for suffix, floor, gate in _SUFFIXES:
+            if not word.endswith(suffix):
+                continue
+            stem = word[: -len(suffix)]
+            if (
+                len(stem) < floor
+                or not _attaches(stem[-1], gate)
+                or not _harmonizes(stem, suffix)
+            ):
+                continue
+            word = stem
+            break
+        else:
+            break
+    return word
+
+
+def _tokenize(text: str) -> set[str]:
+    """Fold, split on non-alphanumerics, and keep both the word and its stem.
+
+    The stem alone is not enough in a bilingual vault. The suffix table is
+    Turkish, and English words happen to end in those letters, so it cuts
+    "compiler" to "comp" and "claude" to "clau" while "compile" becomes
+    "compil" -- two spellings of one English word stop matching each other,
+    and a measurement over the live vault's concept slugs showed 13 of 15
+    single-word English concepts mangled this way.
+
+    Keeping the surface form as well costs one extra token per inflected word
+    and is applied identically to the query and the document, so an English
+    word matches on its surface form and a Turkish one on its stem.
+    """
+    tokens: set[str] = set()
+    for word in re.findall(r"[a-z0-9]+", _fold(text)):
+        if len(word) > 1:
+            tokens.add(word)
+            tokens.add(_stem(word))
+    return tokens
+
+
+# Function words only.  A content word must never appear here: stemming folds
+# "notlar" onto "not", "kararları" onto "karar", "projede" onto "proje" and
+# "durumu" onto "durum", so listing any of those would empty a real query
+# instead of narrowing it.  English "not" is deliberately absent for that
+# reason -- it collides with the Turkish noun.  "su" is the one accepted
+# collision: folding maps the filler "şu" onto the noun "su" (water), and the
+# filler is common in this vault while the noun does not appear in it.
+_STOPWORDS = _tokenize(
+    "bu bunu buna bunlar su sunu onu onlar ve veya ile icin de da ki mi mu ya "
+    "ama fakat ancak yani eger ise iste gibi kadar daha cok az en her hic "
+    "bazi tum butun bir biraz sey seyler olarak olan oldu olur var yok "
+    "benim bizim senin sizin bana bize sana size ben biz sen siz "
+    "simdi sonra once artik hala yine tekrar acaba lutfen tamam evet hayir "
+    "nasil hangi kim nerede nedir neydi soyle getir bul "
+    "the an is are was were be been being of to in on at for from with and "
+    "or but if then than that this these those it its as by we you he she "
+    "they them do does did done have has had can could should would will "
+    "shall may might must about into over under out up down what which who "
+    "when where how why please tell show find get latest current my our"
+)
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Stems that carry topic, with function words removed."""
+    return _tokenize(text) - _STOPWORDS
+
+
+# Planted acceptance identifiers, which name a test run and never a subject.
+_CANARY_SLUG = re.compile(
+    r"(?i)^(?:pz-[a-z]+-\d{8}(?:-[0-9a-f]+)?"
+    r"|pz-[a-z]+-canary(?:-[\w-]+)?"
+    r"|sb2-[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6}"
+    r"|[0-9a-f]{12,})$"
+)
+# Template leftovers: a format string or a filled-in nothing.
+_PLACEHOLDER_SLUG = re.compile(
+    r"(?i)^(?:y{2,4}-?m{2,2}-?d{2,2}|hh-?mm(?:-?ss)?|n-?a|tbd|todo|none|null|[\d-]+)$"
+)
+
+
+#: A summary line that is only ``NAME=VALUE``. The compiler reads these out of
+#: a transcript's report variables and they carry no subject: the live vault
+#: grew ``NATIVE_TO_MEMORY_OS_PROMOTION=NOT_FOUND.`` as a concept, plus ``yes``
+#: and ``not_found`` as separate concepts holding the same line.
+_VARIABLE_DUMP_LINE = re.compile(r"^\s*[A-Za-z][A-Za-z0-9_]{3,}\s*=\s*\S[^\n]*$")
+_SUMMARY_SECTION = re.compile(
+    r"(?im)^##\s*(?:özet|ozet|core summary|summary)\s*$\n(.*?)(?=^##\s|\Z)", re.S
+)
+
+
+def concept_summary(text: str) -> str:
+    """The concept's summary section, or the whole body when it has none."""
+    match = _SUMMARY_SECTION.search(text or "")
+    return (match.group(1) if match else (text or "")).strip()
+
+
+def is_variable_dump(text: str) -> bool:
+    """True when a concept says nothing but ``NAME=VALUE``.
+
+    This is the shape the compiler produces when a transcript reported its
+    outcome as report variables. Rejecting it at the source is what stops the
+    values themselves -- ``yes``, ``not_found`` -- from becoming concepts too.
+    """
+    summary = concept_summary(text)
+    if not summary:
+        return False
+    lines = [line for line in summary.splitlines() if line.strip()]
+    if not lines or len(lines) > 4:
+        return False
+    return all(_VARIABLE_DUMP_LINE.match(line) for line in lines)
+
+
+def _peel_once(word: str) -> list[str]:
+    """Every base form one valid suffix removal can produce."""
+    bases = []
+    for suffix, floor, gate in _SUFFIXES:
+        if not word.endswith(suffix):
+            continue
+        stem = word[: -len(suffix)]
+        if (len(stem) >= floor and _attaches(stem[-1], gate)
+                and _harmonizes(stem, suffix)):
+            bases.append(stem)
+    return bases
+
+
+def is_inflected_concept_slug(slug: str, attested: set[str]) -> bool:
+    """True when a one-word slug is an inflection of a word the vault uses.
+
+    The compiler sometimes titles a concept with a word taken mid-sentence:
+    the live vault grew `oturumun` ("of the session") and `tercihin` ("your
+    preference"). A concept name is the base form, or several words.
+
+    "The slug is not its own stem" was measured and rejected as the test: the
+    suffix table is Turkish and English words end in those letters, so 13 of 15
+    single-word English concepts would have gone with them. Attestation is what
+    separates the cases -- peeling one suffix from `oturumun` gives `oturum`,
+    which the corpus uses, while `claude` gives `clau`, which nothing uses.
+
+    One peel, not a fixpoint: stemming `oturumun` all the way reaches `otur`,
+    which is unattested, and the case would be missed.
+
+    ``attested`` holds folded surface words from the corpus. An empty set means
+    no evidence, so nothing is rejected.
+    """
+    slug = (slug or "").strip().casefold()
+    if not slug or "-" in slug or "_" in slug or len(slug) < 5:
+        return False
+    # No guard for "the slug is itself attested": a Turkish inflected form
+    # appears in the text, which is exactly why it got picked as a title. The
+    # base form's attestation is the evidence, not the slug's.
+    return any(base in attested for base in _peel_once(_fold(slug)))
+
+
+def is_noise_concept_slug(slug: str) -> bool:
+    """True when a slug names no subject and must not become a concept.
+
+    ``BARE_CONCEPT_DENYLIST`` catches only the exact words someone already
+    added to it, so every new filler word and every new acceptance identifier
+    got through until a human noticed: the live vault grew ``bunu``, ``for``,
+    ``yyyy-mm-dd`` and six planted canary ids as concepts, and one of them was
+    injected into an unrelated prompt. These rules generalise instead:
+
+    * a one-word slug whose stem is a function word carries no subject;
+    * a planted acceptance identifier names a test run;
+    * a format placeholder is a template leftover.
+
+    A multi-word slug is left alone. ``aura-cache-sync`` and
+    ``deploy-rollback`` are real subjects even though each part is common, and
+    short proper nouns like ``ga4`` or ``redis`` must keep working.
+    """
+    slug = (slug or "").strip().casefold()
+    if not slug:
+        return True
+    if slug in BARE_CONCEPT_DENYLIST:
+        return True
+    if _CANARY_SLUG.match(slug) or _PLACEHOLDER_SLUG.match(slug):
+        return True
+    if "_" in slug:
+        # slugify keeps underscores, because \w matches them, so one here means
+        # the source title was a machine identifier. All eight underscore slugs
+        # on the live vault were exactly that, with no real concept among them.
+        return True
+    if "-" not in slug:
+        return not _content_tokens(slug)
+    return False
+
+
 SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
     r"private[_-]?key|password|passwd|credential)\b(\s*[:=]\s*[\"']?)"
@@ -232,9 +526,18 @@ def _open_directory_nofollow(path: Path, *, create: bool = False) -> int:
 
 
 def secure_read_file(
-    path: Path, *, root: Path | None = None, max_bytes: int | None = None
+    path: Path, *, root: Path | None = None, max_bytes: int | None = None,
+    tail: bool = False,
 ) -> tuple[bytes, str]:
-    """Read stable bytes below a pinned, no-follow directory descriptor."""
+    """Read stable bytes below a pinned, no-follow directory descriptor.
+
+    ``tail`` changes only what happens when the file is larger than
+    ``max_bytes``: instead of failing, the newest ``max_bytes`` are read and
+    everything up to and including the first line break is dropped, unless the
+    window already starts on a line boundary.  Every other guarantee is
+    unchanged: no-follow traversal, a single regular file, and an unchanged
+    stat across the read.  A window without any line break raises.
+    """
     if not path.is_absolute():
         raise PolicyError("secure-read-path-not-absolute")
     active_root = root or Path(path.anchor)
@@ -263,6 +566,13 @@ def secure_read_file(
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             raise PolicyError("secure-read-not-single-regular-file")
+        tail_start = 0
+        drop_leading_partial_line = False
+        if tail and max_bytes is not None and before.st_size > max_bytes:
+            tail_start = before.st_size - max_bytes
+            # The byte before the window tells whether it starts mid-line.
+            os.lseek(descriptor, tail_start - 1, os.SEEK_SET)
+            drop_leading_partial_line = os.read(descriptor, 1) != b"\n"
         chunks: list[bytes] = []
         total = 0
         while True:
@@ -271,7 +581,9 @@ def secure_read_file(
                 break
             total += len(chunk)
             if max_bytes is not None and total > max_bytes:
-                raise PolicyError("secure-read-too-large")
+                # In tail mode the window is exactly max_bytes; more means the
+                # file grew during the read.
+                raise PolicyError("secure-read-changed" if tail_start else "secure-read-too-large")
             chunks.append(chunk)
         after = os.fstat(descriptor)
         if (
@@ -288,13 +600,21 @@ def secure_read_file(
         if directory_descriptor is not None:
             os.close(directory_descriptor)
     data = b"".join(chunks)
+    if drop_leading_partial_line:
+        boundary = data.find(b"\n")
+        if boundary < 0 or boundary + 1 >= len(data):
+            # No complete line inside the window: returning nothing would make
+            # a truncated transcript look empty.
+            raise PolicyError("secure-read-tail-without-line-boundary")
+        data = data[boundary + 1:]
     return data, sha256_bytes(data)
 
 
 def secure_read_text(
-    path: Path, *, root: Path | None = None, max_bytes: int | None = None
+    path: Path, *, root: Path | None = None, max_bytes: int | None = None,
+    tail: bool = False,
 ) -> tuple[str, str]:
-    data, digest = secure_read_file(path, root=root, max_bytes=max_bytes)
+    data, digest = secure_read_file(path, root=root, max_bytes=max_bytes, tail=tail)
     try:
         return data.decode("utf-8"), digest
     except UnicodeDecodeError as exc:
@@ -332,6 +652,9 @@ class MemoryConfig:
     provider_keychain_service: str | None = None
     provider_keychain_account: str | None = None
     context_budget_chars: int = 16000
+    #: Resolved ``rerank`` block; mode 'off' unless explicitly configured.
+    rerank: dict[str, Any] = dataclasses.field(default_factory=dict)
+    idle_finalize_seconds: int = 45 * 60
     backup_evidence_path: Path | None = None
     sync_evidence_path: Path | None = None
     codex_hooks_path: Path | None = None
@@ -341,6 +664,7 @@ class MemoryConfig:
     claude_smoke_evidence_path: Path | None = None
     codex_binary_path: Path | None = None
     transcript_roots: dict[str, tuple[Path, ...]] = dataclasses.field(default_factory=dict)
+    memory: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "MemoryConfig":
@@ -350,10 +674,17 @@ class MemoryConfig:
             "role", "vault_path", "state_path", "runtimes", "transcript_roots",
             "can_write_event_memory", "can_run_compiler", "models", "provider",
             "context_budget_chars", "backup_evidence_path", "sync_evidence_path",
-            "activation",
+            "activation", "idle_finalize_minutes", "memory", "rerank",
         }
         if not set(raw).issubset(allowed_top_level):
             raise ConfigError("config-fields-invalid")
+        from .memory_policy import resolve_policy
+        from .reranker import validate_rerank_config
+        rerank = validate_rerank_config(raw.get("rerank"))
+        memory = raw.get("memory", {})
+        if not isinstance(memory, dict):
+            raise ConfigError("memory-policy-invalid")
+        resolve_policy(memory)
         role = raw.get("role")
         if role not in {"workstation", "memory-engine"}:
             raise ConfigError("role-invalid")
@@ -391,6 +722,7 @@ class MemoryConfig:
             raise ConfigError("provider-mode-invalid")
         ALLOWED_MODELS = {
             "runtime-native", "vps-hermes-runtime",
+            "gpt-6-luna", "gpt-6-sol",
             "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol",
             "gpt-5.4-mini-2026-03-17", "gpt-5.4-nano-2026-03-17", "gpt-5.4-2026-03-05",
         }
@@ -409,6 +741,13 @@ class MemoryConfig:
         budget = int(raw.get("context_budget_chars", 16000))
         if budget < 1000 or budget > 100000:
             raise ConfigError("context-budget-invalid")
+        # 0 disables idle finalize; otherwise a thread must be quiet at least
+        # this long before its pending turns are promoted as one batch.
+        idle_raw = raw.get("idle_finalize_minutes", DEFAULT_IDLE_FINALIZE_MINUTES)
+        if isinstance(idle_raw, bool) or not isinstance(idle_raw, int):
+            raise ConfigError("idle-finalize-minutes-invalid")
+        if idle_raw != 0 and not 10 <= idle_raw <= 1440:
+            raise ConfigError("idle-finalize-minutes-invalid")
         backup = raw.get("backup_evidence_path")
         sync = raw.get("sync_evidence_path")
         activation = raw.get("activation") or {}
@@ -460,6 +799,7 @@ class MemoryConfig:
             if value:
                 _require_absolute(Path(str(value)), label)
         return cls(
+            memory=memory,
             role=role,
             vault_path=vault,
             state_path=state,
@@ -477,6 +817,8 @@ class MemoryConfig:
             provider_keychain_service=keychain_service,
             provider_keychain_account=keychain_account,
             context_budget_chars=budget,
+            rerank=rerank,
+            idle_finalize_seconds=idle_raw * 60,
             backup_evidence_path=Path(backup) if backup else None,
             sync_evidence_path=Path(sync) if sync else None,
             codex_hooks_path=(
@@ -720,12 +1062,49 @@ def exclusive_lock(path: Path, *, nonblocking: bool = False) -> Iterator[None]:
         yield
 
 
-def write_health(state_path: Path, component: str, status: str, detail: str = "") -> None:
+CODEX_AGENT_MESSAGE_TYPES = {"agent_message", "assistant_message"}
+
+
+def codex_final_agent_message(stdout_text: str) -> str:
+    """Return the last agent message from a `codex exec --json` stream.
+
+    Matching against the whole stream is not the same thing: tool events carry
+    `aggregated_output`, so a grep that happened to print the value would
+    satisfy the check even when the model's final answer said it found nothing.
+    """
+    final = ""
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("item_type") or item.get("type")
+        if kind in CODEX_AGENT_MESSAGE_TYPES and isinstance(item.get("text"), str):
+            final = item["text"]
+    return final
+
+
+def write_health(
+    state_path: Path, component: str, status: str, detail: str = "",
+    observed_at: str = "",
+) -> None:
+    """Record a component's health.
+
+    ``observed_at`` carries the time the state was actually observed, for
+    health that is promoted from elsewhere: stamping promotion time would
+    present a stale observation as current.
+    """
     payload = {
         "schema": "pikselzone-memory-health-v1",
         "component": component,
         "status": status,
-        "updated_at": iso_now(),
+        "updated_at": observed_at or iso_now(),
     }
     if detail:
         payload["detail"] = detail[:500]
@@ -905,14 +1284,60 @@ def _message_from_record(record: dict[str, Any]) -> tuple[str, Any, bool]:
     return "", None, False
 
 
-def normalize_transcript(
+#: Ceiling on any transcript handed to a summarizer, and so also on a single
+#: captured turn (``MAX_TURN_CHECKPOINT_CHARS``).  Raised from 120,000 once
+#: 80k+ character turns turned out to be ordinary: pasted task briefs run well
+#: past the old ceiling, and a turn refused at capture is lost outright in a
+#: thread that never reaches a terminal boundary.  256 KiB is ~65k tokens,
+#: comfortably inside every summarizer's context window; the subprocess timeout
+#: scales with the prompt and its cap is set so this size does not reach it.
+TRANSCRIPT_MAX_CHARS = 256 * 1024
+#: Bytes of a transcript file read for capture: the whole file when smaller,
+#: otherwise its newest window (see ``_transcript_records``).
+TRANSCRIPT_READ_MAX_BYTES = 20 * 1024 * 1024
+
+
+def clamp_transcript(rendered: str, max_chars: int = TRANSCRIPT_MAX_CHARS) -> str:
+    """Keep the most recent ``max_chars`` and drop the partial leading turn.
+
+    The summarizer ceiling is enforced wherever a transcript is assembled, not
+    only at capture time: a recovery drain concatenates several already-capped
+    checkpoints, and without re-clamping the combined text the prompt can grow
+    past the model's context window.  A prompt that does exceed it makes the
+    runtime exit non-zero with empty stderr, which surfaces as an
+    undiagnosable ``claude-process-failed:1``.
+    """
+    if len(rendered) <= max_chars:
+        return rendered
+    rendered = rendered[-max_chars:]
+    boundary = rendered.find("\n")
+    if boundary >= 0:
+        rendered = rendered[boundary + 1:]
+    return rendered
+
+
+def _transcript_records(
     source: Path | str | Sequence[dict[str, Any]], *,
-    max_turns: int = 200, max_chars: int = 120000,
     allowed_roots: Sequence[Path] | None = None,
-    state_path: Path | None = None,
-) -> tuple[str, int, str]:
-    """Extract user/assistant prose only; tool results and reasoning are ignored."""
+    strict: bool = True,
+) -> list[dict[str, Any]]:
+    """Decode a transcript into raw records.
+
+    ``strict`` is the live capture path: a malformed JSONL line means the
+    runtime handed us a truncated transcript and the flush must fail loudly.
+    History import passes ``strict=False`` because an archived export is
+    allowed to carry a partial trailing line.
+    """
     records: list[dict[str, Any]] = []
+
+    def _absorb(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        if "messages" in value and isinstance(value["messages"], list):
+            records.extend(item for item in value["messages"] if isinstance(item, dict))
+        else:
+            records.append(value)
+
     if isinstance(source, Path):
         roots = tuple(allowed_roots or ())
         matching_root = next(
@@ -920,23 +1345,23 @@ def normalize_transcript(
         )
         if matching_root is None:
             raise PolicyError("transcript-path-outside-allowed-roots")
+        # A resumed Codex thread keeps appending to its original rollout, so a
+        # live transcript can outgrow any fixed ceiling.  The normalizer keeps
+        # at most the newest 200 turns / 120k characters and a Stop checkpoint
+        # only the last completed turn, so the newest window is what capture
+        # needs.  Rollout and Claude records are self-contained lines; nothing
+        # from the dropped head (e.g. session_meta) is used to extract turns.
         source_text, _ = secure_read_text(
-            source, root=matching_root, max_bytes=20 * 1024 * 1024
+            source, root=matching_root, max_bytes=TRANSCRIPT_READ_MAX_BYTES, tail=True,
         )
-        for line_number, raw_line in enumerate(
-            source_text.splitlines(), start=1
-        ):
+        for line_number, raw_line in enumerate(source_text.splitlines(), start=1):
             if not raw_line.strip():
                 continue
             try:
-                value = json.loads(raw_line)
+                _absorb(json.loads(raw_line))
             except json.JSONDecodeError as exc:
-                raise SchemaError(f"transcript-jsonl-invalid:{line_number}") from exc
-            if isinstance(value, dict):
-                if "messages" in value and isinstance(value["messages"], list):
-                    records.extend(item for item in value["messages"] if isinstance(item, dict))
-                else:
-                    records.append(value)
+                if strict:
+                    raise SchemaError(f"transcript-jsonl-invalid:{line_number}") from exc
     elif isinstance(source, str):
         try:
             value = json.loads(source)
@@ -952,20 +1377,38 @@ def normalize_transcript(
                 if not raw_line.strip():
                     continue
                 try:
-                    val = json.loads(raw_line)
-                    if isinstance(val, dict):
-                        if "messages" in val and isinstance(val["messages"], list):
-                            records.extend(item for item in val["messages"] if isinstance(item, dict))
-                        else:
-                            records.append(val)
+                    _absorb(json.loads(raw_line))
                 except json.JSONDecodeError as exc:
-                    raise SchemaError("transcript-jsonl-invalid") from exc
+                    if strict:
+                        raise SchemaError("transcript-jsonl-invalid") from exc
     else:
         records = [item for item in source if isinstance(item, dict)]
+
+    return records
+
+
+def transcript_turns(
+    source: Path | str | Sequence[dict[str, Any]], *,
+    max_turns: int = 200,
+    allowed_roots: Sequence[Path] | None = None,
+    state_path: Path | None = None,
+    strict: bool = True,
+    include_tool_results: bool = False,
+) -> list[tuple[str, str]]:
+    """Extract chronological ``(role, text)`` prose turns.
+
+    Tool results and reasoning blocks are ignored.  This is the single record
+    reader shared by live capture and history import, so a transcript shape
+    that one of them understands is never silently unreadable to the other.
+    """
+    records = _transcript_records(source, allowed_roots=allowed_roots, strict=strict)
 
     turns: list[tuple[str, str]] = []
     candidates_count = 0
     for record in records:
+        if include_tool_results:
+            from .critical_records import native_tool_results
+            turns.extend(native_tool_results(record))
         role, content, is_candidate = _message_from_record(record)
         if is_candidate:
             candidates_count += 1
@@ -977,6 +1420,16 @@ def normalize_transcript(
         if flattened:
             turns.append((role, flattened))
 
+    if strict and not turns and isinstance(source, Path):
+        # A windowed read proves nothing about turns before the window, so a
+        # window without turns is a failed read, never an empty session.
+        try:
+            windowed = source.stat().st_size > TRANSCRIPT_READ_MAX_BYTES
+        except OSError:
+            windowed = False
+        if windowed:
+            raise SchemaError("transcript-window-without-turns")
+
     if candidates_count > 0 and not turns:
         if state_path:
             write_health(
@@ -985,15 +1438,26 @@ def normalize_transcript(
                 "warn",
                 f"0 turns extracted from {candidates_count} conversation-shaped candidate records",
             )
-        raise SchemaError(f"transcript-zero-turns-from-{candidates_count}-candidates")
+        if strict:
+            raise SchemaError(f"transcript-zero-turns-from-{candidates_count}-candidates")
 
-    turns = turns[-max_turns:]
+    return turns[-max_turns:]
+
+
+def normalize_transcript(
+    source: Path | str | Sequence[dict[str, Any]], *,
+    max_turns: int = 200, max_chars: int = TRANSCRIPT_MAX_CHARS,
+    allowed_roots: Sequence[Path] | None = None,
+    state_path: Path | None = None,
+    include_tool_results: bool = False,
+) -> tuple[str, int, str]:
+    """Extract user/assistant prose only; tool results and reasoning are ignored."""
+    turns = transcript_turns(
+        source, max_turns=max_turns, allowed_roots=allowed_roots,
+        state_path=state_path, strict=True, include_tool_results=include_tool_results,
+    )
     rendered = "\n".join(f"{role.upper()}: {text}" for role, text in turns)
-    if len(rendered) > max_chars:
-        rendered = rendered[-max_chars:]
-        boundary = rendered.find("\n")
-        if boundary >= 0:
-            rendered = rendered[boundary + 1:]
+    rendered = clamp_transcript(rendered, max_chars)
     digest = sha256_bytes(rendered.encode("utf-8"))
     return rendered, len(turns), digest
 
@@ -1051,6 +1515,25 @@ def knowledge_relative_path(value: str) -> PurePosixPath:
     ):
         return path
     raise PolicyError(f"knowledge-path-forbidden:{value[:80]}")
+
+
+KNOWLEDGE_DETERMINISTIC_FILES = ("knowledge/index.md", "knowledge/log.md")
+
+
+def compiler_write_relative_path(value: str) -> PurePosixPath:
+    """Write policy for LLM-proposed knowledge output.
+
+    Narrower than :func:`knowledge_relative_path`, which stays the *read*
+    allowlist for the knowledge snapshot.  ``index.md`` and ``log.md`` are
+    deterministic, single-writer artifacts rebuilt from the canonical concept
+    and connection files after a successful promotion; a model must never
+    propose their contents, otherwise two hosts end up doing divergent
+    whole-file rewrites of the same synced markdown.
+    """
+    path = knowledge_relative_path(value)
+    if str(path) in KNOWLEDGE_DETERMINISTIC_FILES:
+        raise PolicyError(f"knowledge-deterministic-file-not-model-writable:{path}")
+    return path
 
 
 def summary_json_schema() -> dict[str, Any]:

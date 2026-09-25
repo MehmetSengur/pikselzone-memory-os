@@ -12,7 +12,8 @@ from unittest import mock
 
 import memory_v1.core as core_module
 from memory_v1.adapters import (
-    checkpoint_hook, drain_checkpoint, flush_hook, normalize_event_name,
+    checkpoint_hook, drain_checkpoint, find_pending_turn_checkpoint, flush_hook,
+    normalize_event_name,
 )
 from memory_v1.context import build_context
 from memory_v1.core import (
@@ -89,6 +90,17 @@ class MemoryFixture(unittest.TestCase):
         ]
         if extra:
             records.extend(extra)
+        path.write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
+        return path
+
+    def transcript_pairs(self, name, pairs):
+        path = self.root / name
+        records = []
+        for user, assistant in pairs:
+            records.extend((
+                {"message": {"role": "user", "content": user}},
+                {"message": {"role": "assistant", "content": assistant}},
+            ))
         path.write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
         return path
 
@@ -473,6 +485,220 @@ class EventTests(MemoryFixture):
         self.assertEqual(
             value["source_digest"], parse_event_artifact(event.read_text())["source_sha256"]
         )
+
+    def test_stop_checkpoint_is_raw_idempotent_and_provider_free(self):
+        payload = {
+            "hook_event_name": "Stop", "session_id": "turn-session",
+            "turn_id": "turn-001", "transcript_path": str(self.transcript()),
+        }
+        first = checkpoint_hook(self.config(), runtime="codex", payload=payload)
+        second = checkpoint_hook(self.config(), runtime="codex", payload=payload)
+        self.assertEqual(first, second)
+        value = json.loads(first.read_text())
+        self.assertEqual("turn", value["checkpoint_kind"])
+        self.assertEqual("turn_complete", value["event"])
+        self.assertEqual("turn-001", value["turn_id"])
+        self.assertNotIn("Decision recorded.\nUSER:", value["normalized_transcript"])
+        self.assertFalse(list((self.vault / "daily").rglob("*.md")))
+
+    def test_precompact_consumes_pending_turn_without_second_promotion(self):
+        calls = 0
+
+        class CountingProvider(FakeProvider):
+            def request(inner_self, **kwargs):
+                nonlocal calls
+                calls += 1
+                return super().request(**kwargs)
+
+        source = self.transcript()
+        raw = checkpoint_hook(self.config(), runtime="codex", payload={
+            "hook_event_name": "Stop", "session_id": "turn-to-precompact",
+            "turn_id": "turn-001", "transcript_path": str(source),
+        })
+        boundary = checkpoint_hook(self.config(), runtime="codex", payload={
+            "hook_event_name": "PreCompact", "session_id": "turn-to-precompact",
+            "transcript_path": str(source),
+        })
+        event = drain_checkpoint(self.config(), boundary, provider=CountingProvider())
+        self.assertEqual(1, calls)
+        self.assertFalse(raw.exists())
+        self.assertFalse(boundary.exists())
+        parsed = parse_event_artifact(event.read_text())
+        self.assertEqual(["pre_compact"], parsed["events_seen"])
+
+    def test_sessionend_after_identical_precompact_merges_without_provider_or_pipeline_replay(self):
+        calls = 0
+
+        class CountingProvider(FakeProvider):
+            def request(inner_self, **kwargs):
+                nonlocal calls
+                calls += 1
+                return super().request(**kwargs)
+
+        source = self.transcript()
+        precompact = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "PreCompact", "session_id": "boundary-dedup", "transcript_path": str(source),
+        })
+        event = drain_checkpoint(self.config(), precompact, provider=CountingProvider())
+        session_end = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "SessionEnd", "session_id": "boundary-dedup", "transcript_path": str(source),
+        })
+        same_event = drain_checkpoint(self.config(), session_end, provider=CountingProvider())
+        self.assertEqual(event, same_event)
+        self.assertEqual(1, calls)
+        self.assertEqual(
+            ["pre_compact", "session_end"],
+            parse_event_artifact(event.read_text())["events_seen"],
+        )
+
+    def test_sessionend_no_memory_settles_raw_and_terminal_without_vault_mutation(self):
+        empty = {"status": "empty", **{key: [] for key in SUMMARY if key != "status"}}
+        provider = FakeProvider(empty)
+        source = self.transcript()
+        raw = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "Stop", "session_id": "empty-terminal", "turn_id": "turn-001",
+            "transcript_path": str(source),
+        })
+        terminal = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "SessionEnd", "session_id": "empty-terminal",
+            "transcript_path": str(source),
+        })
+
+        with self.assertRaises(NoMemory):
+            drain_checkpoint(self.config(), terminal, provider=provider)
+
+        self.assertEqual(1, len(provider.calls))
+        self.assertFalse(raw.exists())
+        self.assertFalse(terminal.exists())
+        self.assertIsNone(find_pending_turn_checkpoint(
+            self.config(), runtime="codex", session_id="empty-terminal",
+        ))
+        self.assertEqual([], list(self.vault.rglob("*")))
+
+    def test_provider_failure_preserves_selected_then_no_memory_settles(self):
+        class FailingProvider:
+            def request(self, **kwargs):
+                raise ProviderBlocked("test-provider-failure")
+
+        source = self.transcript()
+        raw = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "Stop", "session_id": "empty-retry", "turn_id": "turn-001",
+            "transcript_path": str(source),
+        })
+        terminal = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "SessionEnd", "session_id": "empty-retry",
+            "transcript_path": str(source),
+        })
+        with self.assertRaises(ProviderBlocked):
+            drain_checkpoint(self.config(), terminal, provider=FailingProvider())
+        self.assertTrue(raw.exists())
+        self.assertTrue(terminal.exists())
+
+        empty = {"status": "empty", **{key: [] for key in SUMMARY if key != "status"}}
+        with self.assertRaises(NoMemory):
+            drain_checkpoint(self.config(), terminal, provider=FakeProvider(empty))
+        self.assertFalse(raw.exists())
+        self.assertFalse(terminal.exists())
+
+    def test_precompact_no_memory_settles_snapshot_but_not_later_turn(self):
+        empty = {"status": "empty", **{key: [] for key in SUMMARY if key != "status"}}
+        provider = FakeProvider(empty)
+        source = self.transcript_pairs("empty-precompact.jsonl", [("first", "one")])
+        turn_one = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "Stop", "session_id": "empty-precompact", "turn_id": "turn-001",
+            "transcript_path": str(source),
+        })
+        source = self.transcript_pairs("empty-precompact.jsonl", [("first", "one"), ("second", "two")])
+        turn_two = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "Stop", "session_id": "empty-precompact", "turn_id": "turn-002",
+            "transcript_path": str(source),
+        })
+        boundary = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "PreCompact", "session_id": "empty-precompact", "transcript_path": str(source),
+        })
+
+        with self.assertRaises(NoMemory):
+            drain_checkpoint(self.config(), boundary, provider=provider)
+        self.assertEqual(1, len(provider.calls))
+        self.assertFalse(turn_one.exists())
+        self.assertFalse(turn_two.exists())
+        self.assertFalse(boundary.exists())
+        self.assertEqual([], list(self.vault.rglob("*")))
+
+        source = self.transcript_pairs(
+            "empty-precompact.jsonl", [("first", "one"), ("second", "two"), ("third", "three")],
+        )
+        turn_three = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "Stop", "session_id": "empty-precompact", "turn_id": "turn-003",
+            "transcript_path": str(source),
+        })
+        self.assertTrue(turn_three.exists())
+        self.assertEqual(turn_three, find_pending_turn_checkpoint(
+            self.config(), runtime="codex", session_id="empty-precompact",
+        ))
+
+    def test_identical_empty_precompact_then_sessionend_skips_provider(self):
+        empty = {"status": "empty", **{key: [] for key in SUMMARY if key != "status"}}
+        provider = FakeProvider(empty)
+        source = self.transcript()
+        precompact = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "PreCompact", "session_id": "empty-boundary-dedup", "transcript_path": str(source),
+        })
+        source_digest = json.loads(precompact.read_text(encoding="utf-8"))["source_digest"]
+        with self.assertRaises(NoMemory):
+            drain_checkpoint(self.config(), precompact, provider=provider)
+        session_end = checkpoint_hook(self.config(), runtime="codex", payload={
+            "event": "SessionEnd", "session_id": "empty-boundary-dedup", "transcript_path": str(source),
+        })
+        with self.assertRaises(NoMemory) as ctx:
+            drain_checkpoint(self.config(), session_end, provider=provider)
+
+        self.assertIn("already-classified-empty", str(ctx.exception))
+        self.assertEqual(1, len(provider.calls))
+        self.assertFalse(session_end.exists())
+        state_path = self.state / "sessions" / "codex" / f"{session_key('empty-boundary-dedup')}.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual("empty", state["status"])
+        self.assertEqual(source_digest, state["source_digest"])
+        self.assertEqual(["pre_compact", "session_end"], state["events_seen"])
+        self.assertEqual([], list(self.vault.rglob("*")))
+
+    def test_crash_recovery_promotes_pending_turn_once(self):
+        calls = 0
+
+        class CountingProvider(FakeProvider):
+            def request(inner_self, **kwargs):
+                nonlocal calls
+                calls += 1
+                return super().request(**kwargs)
+
+        payload = {
+            "event": "Stop", "session_id": "crash-recovery", "turn_id": "turn-001",
+            "transcript_path": str(self.transcript()),
+        }
+        queued = checkpoint_hook(self.config(), runtime="codex", payload=payload)
+        recovered = drain_checkpoint(self.config(), queued, provider=CountingProvider())
+        self.assertEqual(1, calls)
+        self.assertFalse(queued.exists())
+        self.assertEqual(["checkpoint_recovery"], parse_event_artifact(recovered.read_text())["events_seen"])
+        repeated = checkpoint_hook(self.config(), runtime="codex", payload=payload)
+        same_event = drain_checkpoint(self.config(), repeated, provider=CountingProvider())
+        self.assertEqual(recovered, same_event)
+        self.assertEqual(1, calls)
+
+    def test_turn_checkpoint_retention_is_bounded_without_provider(self):
+        source = self.transcript()
+        for index in range(32):
+            checkpoint_hook(self.config(), runtime="codex", payload={
+                "event": "Stop", "session_id": "turn-retention", "turn_id": f"turn-{index}",
+                "transcript_path": str(source),
+            })
+        with self.assertRaises(PolicyError) as ctx:
+            checkpoint_hook(self.config(), runtime="codex", payload={
+                "event": "Stop", "session_id": "turn-retention", "turn_id": "turn-overflow",
+                "transcript_path": str(source),
+            })
+        self.assertIn("retention", str(ctx.exception))
 
     def test_checkpoint_retry_after_event_write_is_idempotent(self):
         payload = {

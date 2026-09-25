@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import datetime as dt
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -155,7 +158,10 @@ class RuntimeNativeTests(unittest.TestCase):
     def test_codex_bundled_discovery(self):
         cfg = self._make_config()
         discovered = discover_codex_binary(cfg)
-        if Path("/Applications/ChatGPT.app/Contents/Resources/codex").is_file():
+        if (
+            Path("/Applications/ChatGPT.app/Contents/Resources/codex").is_file()
+            and not shutil.which("codex")
+        ):
             self.assertEqual("/Applications/ChatGPT.app/Contents/Resources/codex", discovered)
 
     # 7. Codex exec command construction
@@ -604,6 +610,54 @@ class RuntimeNativeTests(unittest.TestCase):
         evidence_file.write_text(json.dumps(valid_evidence))
         self.assertFalse(_activation_evidence_valid(cfg, "hermes", evidence_file, None))
 
+    # 25b. A Hermes profile session is keyed by its SessionDB as well as its id
+    def test_doctor_accepts_profile_scoped_hermes_evidence(self):
+        import hashlib
+        from memory_v1.doctor import _activation_evidence_valid
+        from memory_v1.events import EventWriter
+        cfg = self._make_config(role="memory-engine")
+        evidence_dir = self.state / "evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        evidence_file = evidence_dir / "hermes-lifecycle-smoke.json"
+        database = cfg.transcript_roots["hermes"][0] / "profiles" / "pz-sengur" / "state.db"
+        database.parent.mkdir(parents=True)
+        database.write_bytes(b"")
+        owner = hashlib.sha256(str(database).encode()).hexdigest()
+        profile_key = hashlib.sha256((str(database) + "\0sess-profile").encode()).hexdigest()[:32]
+        rendered = EventWriter._render(
+            runtime="hermes", agent_id="hermes-main", session_id="sess-profile",
+            event="session_finalize", events_seen=["session_finalize"],
+            created_at="2026-09-24T23:20:48+03:00", source_model="gpt-6-luna",
+            source_provider="openai-codex", root_task_id="unknown", kanban_ids=[],
+            source_digest="0" * 64,
+            summary={"context": ["Test."], "important_conversations": [], "decisions": [],
+                     "learnings": [], "open_items": [], "evidence": []},
+            redaction_count=0,
+        )
+        head, _, body = rendered.partition("\n---\n")
+        scope = json.dumps({"owner": owner, "project": "unscoped", "visibility": "private"})
+        event_dir = self.vault / "daily" / "2026-09-24"
+        event_dir.mkdir(parents=True, exist_ok=True)
+        event_file = event_dir / ("hermes-" + profile_key + "-" + "0" * 16 + ".md")
+        event_file.write_text(head + "\nmemory_scope: " + scope + "\n---\n" + body, encoding="utf-8")
+        evidence = {
+            "schema": "pikselzone-memory-activation-evidence-v1", "runtime": "hermes",
+            "status": "pass", "runtime_version": "0.19.0", "hook_config_sha256": "0" * 64,
+            "smoke_session_key": profile_key, "checkpoint_id": event_file.name,
+            "provenance": "automatic-lifecycle-drain", "source_provider": "openai-codex",
+            "checkpoint_mode": "0600", "event_path": str(event_file),
+            "event_sha256": hashlib.sha256(event_file.read_bytes()).hexdigest(),
+            "duplicate_files": 0,
+            "observed_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        evidence_file.write_text(json.dumps(evidence))
+        self.assertTrue(_activation_evidence_valid(cfg, "hermes", evidence_file, None))
+
+        # A key from a SessionDB this runtime does not own is still refused.
+        evidence["smoke_session_key"] = hashlib.sha256(b"/elsewhere/state.db\0sess-profile").hexdigest()[:32]
+        evidence_file.write_text(json.dumps(evidence))
+        self.assertFalse(_activation_evidence_valid(cfg, "hermes", evidence_file, None))
+
     # 32. Detached worker invocation construction
     def test_detached_worker_invocation_construction(self):
         from memory_v1.hook_runner import build_drain_command
@@ -621,6 +675,61 @@ class RuntimeNativeTests(unittest.TestCase):
         self.assertIn("drain", cmd)
         self.assertIn("--queue", cmd)
         self.assertEqual(str(q_path.resolve()), cmd[cmd.index("--queue") + 1])
+
+    def test_codex_stop_hook_checkpoints_without_spawning_provider_worker(self):
+        cfg = self._make_config()
+        repo = self.root / "repo"
+        repo.mkdir()
+        from memory_v1 import project_registry
+        project_registry.register(cfg.state_path, repo, "demo")
+        transcript_file = self.root / "stop-hook.jsonl"
+        transcript_file.write_text(
+            json.dumps({"role": "user", "content": "Keep this."}) + "\n"
+            + json.dumps({"role": "assistant", "content": "Checkpointed."}) + "\n",
+            encoding="utf-8",
+        )
+        payload = json.dumps({
+            "session_id": "sess-stop-hook-1", "turn_id": "turn-001",
+            "transcript_path": str(transcript_file), "cwd": str(repo),
+        })
+        with mock.patch.object(hook_runner.MemoryConfig, "load", return_value=cfg), \
+             mock.patch.object(hook_runner, "_spawn_drain") as spawn, \
+             mock.patch("sys.stdin", io.StringIO(payload)):
+            rc = hook_runner.main([
+                "--config", str(self.root / "config.json"),
+                "--runtime", "codex", "--event", "Stop",
+                "--project", "demo", "--project-root", str(repo),
+            ])
+        self.assertEqual(0, rc)
+        spawn.assert_not_called()
+        pending = list((self.state / "queue" / "pending").glob("*.json"))
+        self.assertEqual(1, len(pending))
+        checkpoint = json.loads(pending[0].read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint["project"], "demo")
+        self.assertEqual(checkpoint["continuity_scope"], "demo")
+
+    def test_stop_hook_capture_off_without_registration(self):
+        cfg = self._make_config()
+        transcript_file = self.root / "unreg.jsonl"
+        transcript_file.write_text(
+            json.dumps({"role": "user", "content": "x"}) + "\n"
+            + json.dumps({"role": "assistant", "content": "y"}) + "\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(hook_runner.MemoryConfig, "load", return_value=cfg), \
+             mock.patch.object(hook_runner, "_spawn_drain") as spawn, \
+             mock.patch("sys.stdin", io.StringIO(json.dumps({
+                 "session_id": "s", "transcript_path": str(transcript_file),
+             }))):
+            rc = hook_runner.main([
+                "--config", str(self.root / "config.json"),
+                "--runtime", "codex", "--event", "Stop",
+            ])
+        self.assertEqual(0, rc)
+        spawn.assert_not_called()
+        self.assertFalse((self.state / "queue" / "pending").exists())
+        health = json.loads((self.state / "health" / "capture-codex.json").read_text(encoding="utf-8"))
+        self.assertEqual(health["status"], "off")
 
     # 33. Automatic worker receipt and evidence generation
     def test_automatic_worker_receipt_and_evidence_generation(self):
@@ -675,6 +784,40 @@ class RuntimeNativeTests(unittest.TestCase):
         self.assertEqual(evidence_data["event_sha256"], receipt["event_sha256"])
 
         # Doctor activation evidence check must PASS
+        self.assertTrue(_activation_evidence_valid(cfg, "codex", evidence_path, hooks_path))
+
+    def test_worker_receipt_binds_the_session_model_not_the_flush_model(self):
+        # A gpt-6-astra Codex session flushed by luna: the event records the
+        # session model, so a receipt carrying the flush model never verified.
+        from memory_v1.doctor import _activation_evidence_valid
+
+        mock_codex_out = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(SAMPLE_SUMMARY)}}) + "\n"
+        evidence_path = self.state / "evidence" / "codex-smoke.json"
+        hooks_path = self.root / "hooks.json"
+        hooks_path.write_text(json.dumps({"hooks": {}}))
+        cfg = MemoryConfig.from_dict({
+            "role": "workstation", "vault_path": str(self.vault), "state_path": str(self.state),
+            "runtimes": ["codex", "claude"],
+            "transcript_roots": {"codex": [str(self.root)], "claude": [str(self.root)]},
+            "can_write_event_memory": True, "can_run_compiler": False,
+            "models": {"flush": "gpt-5.6-luna", "compiler": "gpt-5.6-terra"}, "provider": {},
+            "activation": {"codex_hooks_path": str(hooks_path), "codex_smoke_evidence_path": str(evidence_path)},
+        })
+        provider = RuntimeNativeProvider(
+            cfg, codex_runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=mock_codex_out, stderr=""),
+        )
+        transcript_file = self.root / "codex-astra-session.jsonl"
+        transcript_file.write_text(json.dumps({"role": "user", "content": "Model ayrımı testi."}) + "\n")
+        qpath = checkpoint_hook(cfg, runtime="codex", payload={
+            "session_id": "sess-astra-1", "transcript_path": str(transcript_file),
+            "event": "session_end", "model": "gpt-6-astra",
+        })
+        event_path = drain_checkpoint(cfg, qpath, provider=provider)
+
+        receipt = json.loads(evidence_path.read_text(encoding="utf-8"))["worker_receipt"]
+        self.assertIn('source_model: "gpt-6-astra"', event_path.read_text(encoding="utf-8"))
+        self.assertEqual("gpt-6-astra", receipt["source_model"])
+        self.assertTrue(receipt["flush_model"])
         self.assertTrue(_activation_evidence_valid(cfg, "codex", evidence_path, hooks_path))
 
     # 34. Fabricated smoke evidence rejected by doctor
@@ -869,4 +1012,3 @@ class RuntimeNativeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

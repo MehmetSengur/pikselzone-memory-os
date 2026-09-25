@@ -94,7 +94,16 @@ class TestIntegratedPipeline(unittest.TestCase):
         )
         self.assertTrue(event_path.is_file())
 
-        # 1. Rule Learner check
+        # 1. Rule Learner check. The workstation queues what it learned; the
+        #    memory-engine host is the only writer of Kurallar.md and Journal.md.
+        from memory_v1.learning_inbox import merge_learning_inbox, pending_observations
+        self.assertTrue(pending_observations(self.config))
+        engine = MemoryConfig.from_dict({
+            "role": "memory-engine", "vault_path": str(self.vault), "state_path": str(self.root / "engine-state"),
+            "runtimes": ["hermes"], "transcript_roots": {"hermes": [str(self.root)]},
+            "can_write_event_memory": True, "can_run_compiler": True, "provider": {"mode": "runtime-native"},
+        })
+        merge_learning_inbox(engine)
         rules_text = (self.vault / "companion" / "Kurallar.md").read_text(encoding="utf-8")
         self.assertIn("JSON yapısını zorunlu kıl", rules_text)
 
@@ -106,20 +115,13 @@ class TestIntegratedPipeline(unittest.TestCase):
         journal_text = (self.vault / "companion" / "Journal.md").read_text(encoding="utf-8")
         self.assertIn("Session end Özeti", journal_text)
 
-        # 3. Knowledge Graph auto-growth check (Concepts & Connection)
-        self.assertTrue((self.vault / "knowledge" / "concepts" / "fastapi.md").is_file())
-        self.assertTrue((self.vault / "knowledge" / "concepts" / "redis.md").is_file())
-        self.assertTrue((self.vault / "knowledge" / "concepts" / "postgresql.md").is_file())
-
-        # Check connection file between co-occurring concepts
-        connections = list((self.vault / "knowledge" / "connections").glob("*.md"))
-        self.assertTrue(len(connections) >= 1)
-
-        # Check knowledge/index.md and knowledge/log.md
-        index_text = (self.vault / "knowledge" / "index.md").read_text(encoding="utf-8")
-        self.assertIn("fastapi", index_text)
-        log_text = (self.vault / "knowledge" / "log.md").read_text(encoding="utf-8")
-        self.assertIn("CREATE_CONCEPT", log_text)
+        # 3. A session flush must NOT touch the shared knowledge graph.
+        #    concepts/, connections/, index.md and log.md have a single
+        #    canonical writer (the VPS compiler + deterministic rebuild).
+        self.assertFalse((self.vault / "knowledge" / "concepts" / "fastapi.md").exists())
+        self.assertFalse((self.vault / "knowledge" / "concepts" / "redis.md").exists())
+        self.assertFalse((self.vault / "knowledge" / "index.md").exists())
+        self.assertFalse((self.vault / "knowledge" / "log.md").exists())
 
         # 4. Skill candidate observation (Repeat same workflow in Session 2 to trigger auto-synthesis)
         writer.flush(

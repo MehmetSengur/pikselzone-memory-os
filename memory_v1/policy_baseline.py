@@ -33,21 +33,20 @@ def load_expected_baseline(baseline_path: Path | None = None) -> list[tuple[str,
 def verify_local_git_against_baseline(repo_root: Path | None = None) -> tuple[bool, str]:
     root = repo_root or Path(__file__).resolve().parent.parent
     plugin_root = root / "hermes_plugins" / "pz-memory-v1"
-    init_sha = hashlib.sha256((plugin_root / "__init__.py").read_bytes()).hexdigest()
-    yaml_sha = hashlib.sha256((plugin_root / "plugin.yaml").read_bytes()).hexdigest()
-    kg_sha = hashlib.sha256((plugin_root / "knowledge_generator.py").read_bytes()).hexdigest()
-
-    expected_shas = {
-        "__init__.py": init_sha,
-        "plugin.yaml": yaml_sha,
-        "knowledge_generator.py": kg_sha,
-    }
 
     rows = load_expected_baseline()
     for want_sha, want_og, want_mode, rel in rows:
         fname = Path(rel).name
-        if expected_shas.get(fname) != want_sha:
-            return False, f"git-source-sha-drift:{fname}:want-{want_sha}-got-{expected_shas.get(fname)}"
+        # Derive the sha from the row itself rather than a fixed file list, so
+        # a plugin module added later is pinned as soon as the baseline names
+        # it.  A row naming a file the repository does not ship is drift in its
+        # own right, never a silent pass.
+        source = plugin_root / fname
+        if not source.is_file():
+            return False, f"baseline-source-missing:{fname}"
+        got_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        if got_sha != want_sha:
+            return False, f"git-source-sha-drift:{fname}:want-{want_sha}-got-{got_sha}"
         if want_og != "pzhermes:pzvault":
             return False, f"invalid-expected-owner:{want_og}"
         if want_mode != "0640":

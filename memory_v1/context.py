@@ -10,6 +10,8 @@ from pathlib import Path
 from .core import MemoryConfig, PolicyError, secure_read_text, session_key
 from .events import parse_event_artifact
 from .graph_engine import is_conflicted_copy_path
+from .recall_access import source_reason
+from .memory_policy import config_policy
 
 
 CONTINUITY_FILES = (
@@ -20,6 +22,8 @@ CONTINUITY_FILES = (
 
 def build_context(config: MemoryConfig, *, budget: int | None = None) -> str:
     """Return metadata only; derived free text is never injected automatically."""
+    if not config_policy(config)['recall']:
+        return json.dumps({'schema':'pikselzone-memory-context-projection-v1','status':'disabled','reason':'automatic-recall-disabled'}) + '\n'
     limit = budget or config.context_budget_chars
     if limit < 1000 or limit > config.context_budget_chars:
         raise PolicyError("context-budget-out-of-range")
@@ -44,6 +48,8 @@ def build_context(config: MemoryConfig, *, budget: int | None = None) -> str:
         text, digest = secure_read_text(
             path, root=config.vault_path, max_bytes=2 * 1024 * 1024
         )
+        if source_reason(config, relative, text=text):
+            continue
         sources.append({
             "relative_path": relative,
             "sha256": digest,
@@ -59,6 +65,8 @@ def build_context(config: MemoryConfig, *, budget: int | None = None) -> str:
             text, digest = secure_read_text(
                 path, root=daily, max_bytes=2 * 1024 * 1024
             )
+            if source_reason(config, str(path.relative_to(config.vault_path)), text=text):
+                continue
             event = parse_event_artifact(text)
             events.append({
                 "runtime": event["runtime"],
@@ -106,6 +114,8 @@ def _knowledge_inventory(config: MemoryConfig) -> dict[str, int | str]:
                 or info.st_nlink != 1
             ):
                 raise PolicyError("context-knowledge-unsafe-file")
+            if source_reason(config, str(path.relative_to(config.vault_path))):
+                continue
             relative = path.relative_to(root)
             bucket = relative.parts[0] if relative.parts else "other"
             if bucket == "concepts":

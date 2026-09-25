@@ -44,6 +44,79 @@ class RuleItem:
 
 
 @dataclasses.dataclass
+class RuleCandidate:
+    text: str
+    reason: str = ""
+    sources: list[str] = dataclasses.field(default_factory=list)
+
+
+ACTIVE_RULES_HEADER = "## Aktif Kurallar"
+CANDIDATE_RULES_HEADER = "## Kural Adayları (Candidate Rules)"
+ARCHIVED_RULES_HEADER = "## Arşivlenmiş / Geçersiz Kılınmış Kurallar"
+# A candidate becomes an active rule once this many separate sessions repeat it.
+CANDIDATE_PROMOTION_SESSIONS = 2
+_CANDIDATE_PREFIX = "- **aday:**"
+_OVERLAP_STOP_WORDS = {
+    "bir", "bu", "ve", "ile", "için", "olan", "olarak", "daha", "en", "çok",
+    "the", "a", "an", "and", "or", "to", "in", "on", "of", "for", "with",
+}
+
+
+def token_overlap(text1: str, text2: str) -> float:
+    """Jaccard overlap of meaningful words; the dedup/merge measure for rules."""
+    def words(text: str) -> set[str]:
+        return {
+            w for w in re.findall(r"\w+", text.lower(), re.UNICODE)
+            if len(w) > 2 and w not in _OVERLAP_STOP_WORDS
+        }
+    t1, t2 = words(text1), words(text2)
+    if not t1 or not t2:
+        return 0.0
+    return len(t1 & t2) / len(t1 | t2)
+
+
+def parse_rule_candidates(text: str) -> list[RuleCandidate]:
+    candidates: list[RuleCandidate] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(_CANDIDATE_PREFIX):
+            continue
+        parts = [p.strip() for p in stripped[len(_CANDIDATE_PREFIX):].split("|")]
+        candidate = RuleCandidate(text=parts[0])
+        for part in parts[1:]:
+            if part.startswith("**neden:**"):
+                candidate.reason = part[len("**neden:**"):].strip()
+            elif part.startswith("**kaynaklar:**"):
+                candidate.sources = [s.strip() for s in part[len("**kaynaklar:**"):].split(",") if s.strip()]
+        if candidate.text:
+            candidates.append(candidate)
+    return candidates
+
+
+def render_candidate_line(candidate: RuleCandidate) -> str:
+    return (
+        f"{_CANDIDATE_PREFIX} {candidate.text} | **neden:** {candidate.reason} | "
+        f"**kaynaklar:** {', '.join(candidate.sources)} | "
+        f"**gözlem:** {len(candidate.sources)} | **durum:** aday"
+    )
+
+
+def insert_under_header(lines: list[str], header: str, entry: str, *, before: str | None = None) -> list[str]:
+    """Insert ``entry`` right under ``header``, creating the header if needed."""
+    out = list(lines)
+    for index, line in enumerate(out):
+        if line.strip() == header:
+            out.insert(index + 1, entry)
+            return out
+    if before:
+        for index, line in enumerate(out):
+            if line.strip() == before:
+                out[index:index] = [header, entry, ""]
+                return out
+    return out + ["", header, entry]
+
+
+@dataclasses.dataclass
 class LastSessionData:
     runtime: str
     session_id: str
@@ -187,12 +260,26 @@ Memory V1'in aşırı korumacı ve pasif yapısı terk edilerek Second Brain V2 
 """
 
 
-class CompanionManager:
-    """Manages reading, updating, and reconciling companion memory files."""
+_CONTINUITY_SCOPE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 
-    def __init__(self, vault_path: Path) -> None:
+
+class CompanionManager:
+    """Manages reading, updating, and reconciling companion memory files.
+
+    When ``continuity_scope`` is given (a project slug, or "hermes"), the
+    operational-continuity documents (Last-Session, Threads, Threads-Archive) are
+    routed to ``<vault>/continuity/<scope>.md`` and ``<vault>/threads/<scope>.md``
+    so per-project active state never bleeds across projects.  Identity (Core),
+    learned rules (Kurallar) and the Journal always stay shared in
+    ``companion/``.  ``continuity_scope=None`` keeps the pre-V2.3 shared layout.
+    """
+
+    def __init__(self, vault_path: Path, continuity_scope: str | None = None) -> None:
         self.vault_path = vault_path.resolve()
         self.companion_dir = self._resolve_companion_dir()
+        if continuity_scope is not None and not _CONTINUITY_SCOPE_RE.fullmatch(continuity_scope):
+            raise SchemaError(f"continuity-scope-invalid:{continuity_scope[:64]}")
+        self.continuity_scope = continuity_scope
 
     def _resolve_companion_dir(self) -> Path:
         # Check standard Avenox directory first, else use standard companion
@@ -202,8 +289,32 @@ class CompanionManager:
         standard = self.vault_path / "companion"
         return standard
 
+    @property
+    def _last_session_path(self) -> Path:
+        if self.continuity_scope:
+            return self.vault_path / "continuity" / f"{self.continuity_scope}.md"
+        return self.companion_dir / "Last-Session.md"
+
+    @property
+    def _threads_path(self) -> Path:
+        if self.continuity_scope:
+            return self.vault_path / "threads" / f"{self.continuity_scope}.md"
+        return self.companion_dir / "Threads.md"
+
+    @property
+    def _threads_archive_path(self) -> Path:
+        if self.continuity_scope:
+            return self.vault_path / "threads" / f"{self.continuity_scope}-Archive.md"
+        return self.companion_dir / "Threads-Archive.md"
+
     def ensure_companion_files(self) -> None:
-        """Create initial companion seed documents if not present."""
+        """Create initial companion seed documents if not present.
+
+        Core / Kurallar / Journal are always shared.  Last-Session and Threads
+        are seeded in ``companion/`` only for the unscoped layout; a scoped
+        manager seeds ``continuity/<scope>.md`` and ``threads/<scope>.md``
+        instead so it never drops an unused shared file.
+        """
         ensure_safe_directory(self.companion_dir, create=True)
         now_str = iso_now()
         date_str = dt.datetime.now().strftime("%Y-%m-%d")
@@ -211,15 +322,30 @@ class CompanionManager:
         seeds = {
             "Core.md": DEFAULT_CORE_SEED.format(now=now_str),
             "Kurallar.md": DEFAULT_RULES_SEED.format(now=now_str),
-            "Last-Session.md": DEFAULT_LAST_SESSION_SEED.format(now=now_str),
-            "Threads.md": DEFAULT_THREADS_SEED.format(now=now_str, date=date_str),
             "Journal.md": DEFAULT_JOURNAL_SEED.format(now=now_str),
         }
+        if not self.continuity_scope:
+            seeds["Last-Session.md"] = DEFAULT_LAST_SESSION_SEED.format(now=now_str)
+            seeds["Threads.md"] = DEFAULT_THREADS_SEED.format(now=now_str, date=date_str)
 
         for filename, content in seeds.items():
             target = self.companion_dir / filename
             if not target.exists():
                 atomic_write(target, content, mode=0o660)
+
+        if self.continuity_scope:
+            ensure_safe_directory(self.vault_path / "continuity", create=True)
+            ensure_safe_directory(self.vault_path / "threads", create=True)
+            if not self._last_session_path.exists():
+                atomic_write(
+                    self._last_session_path,
+                    DEFAULT_LAST_SESSION_SEED.format(now=now_str), mode=0o660,
+                )
+            if not self._threads_path.exists():
+                atomic_write(
+                    self._threads_path,
+                    DEFAULT_THREADS_SEED.format(now=now_str, date=date_str), mode=0o660,
+                )
 
     # -------------------------------------------------------------------------
     # Core / Identity Management
@@ -320,18 +446,87 @@ class CompanionManager:
         atomic_write(rules_path, "\n".join(new_lines) + "\n", mode=0o660)
         return True
 
+    def read_rule_candidates(self) -> list[RuleCandidate]:
+        rules_path = self.companion_dir / "Kurallar.md"
+        if not rules_path.is_file():
+            return []
+        text, _ = secure_read_text(rules_path, root=self.vault_path, max_bytes=256 * 1024)
+        return parse_rule_candidates(text)
+
+    def record_rule_candidate(self, rule_text: str, reason: str = "", source: str = "") -> str:
+        """Track a preference seen without an explicit standing marker.
+
+        It is written under "Kural Adayları", never into the active list, and
+        is promoted only when a *different* session repeats it. Returns one of
+        ``added``, ``observed``, ``promoted``, ``same-session``,
+        ``already-active`` or ``empty``.
+        """
+        rules_path = self.companion_dir / "Kurallar.md"
+        if not rules_path.is_file():
+            self.ensure_companion_files()
+        text, _ = secure_read_text(rules_path, root=self.vault_path, max_bytes=256 * 1024)
+        clean_rule, _ = redact_sensitive_text(rule_text.strip())
+        clean_reason, _ = redact_sensitive_text(reason.strip())
+        if not clean_rule:
+            return "empty"
+        for rule in self.read_rules():
+            if token_overlap(clean_rule, rule.text) > 0.65 or clean_rule.lower() in rule.text.lower():
+                return "already-active"
+
+        source = source or "oturum"
+        lines = text.splitlines()
+        match = next(
+            (c for c in parse_rule_candidates(text)
+             if c.text.lower() == clean_rule.lower() or token_overlap(clean_rule, c.text) >= 0.65),
+            None,
+        )
+        if match is None:
+            candidate = RuleCandidate(
+                text=clean_rule, reason=clean_reason or "Kullanıcı tercihi", sources=[source],
+            )
+            lines = insert_under_header(
+                lines, CANDIDATE_RULES_HEADER, render_candidate_line(candidate),
+                before=ARCHIVED_RULES_HEADER,
+            )
+            atomic_write(rules_path, "\n".join(lines) + "\n", mode=0o660)
+            return "added"
+        if source in match.sources:
+            return "same-session"
+
+        match.sources.append(source)
+        own_prefix = f"{_CANDIDATE_PREFIX} {match.text} |"
+        lines = [line for line in lines if not line.strip().startswith(own_prefix)]
+        if len(match.sources) >= CANDIDATE_PROMOTION_SESSIONS:
+            # Remove the candidate and add the active rule in ONE write: two
+            # writes could leave neither if the process stopped in between.
+            rule_line = (
+                f"- **kural:** {match.text} | "
+                f"**neden:** {match.reason} ({len(match.sources)} ayrı oturumda tekrarlandı) | "
+                f"**kaynak:** {', '.join(match.sources)} | **durum:** aktif"
+            )
+            lines = insert_under_header(lines, ACTIVE_RULES_HEADER, rule_line, before=CANDIDATE_RULES_HEADER)
+            atomic_write(rules_path, "\n".join(lines) + "\n", mode=0o660)
+            return "promoted"
+        lines = insert_under_header(
+            lines, CANDIDATE_RULES_HEADER, render_candidate_line(match), before=ARCHIVED_RULES_HEADER,
+        )
+        atomic_write(rules_path, "\n".join(lines) + "\n", mode=0o660)
+        return "observed"
+
     # -------------------------------------------------------------------------
     # Last-Session (Operational Continuity)
     # -------------------------------------------------------------------------
     def read_last_session(self) -> str:
-        p = self.companion_dir / "Last-Session.md"
+        p = self._last_session_path
         if not p.is_file():
             self.ensure_companion_files()
         text, _ = secure_read_text(p, root=self.vault_path, max_bytes=256 * 1024)
         return text
 
     def write_last_session(self, data: LastSessionData) -> None:
-        p = self.companion_dir / "Last-Session.md"
+        p = self._last_session_path
+        if self.continuity_scope:
+            ensure_safe_directory(self.vault_path / "continuity", create=True)
         now_str = data.updated_at or iso_now()
 
         completed_str = "\n".join(f"- {item}" for item in data.completed_items) or "- Belirtilmedi."
@@ -375,14 +570,14 @@ updated_at: {now_str}
     # Threads Management
     # -------------------------------------------------------------------------
     def read_threads(self) -> str:
-        p = self.companion_dir / "Threads.md"
+        p = self._threads_path
         if not p.is_file():
             self.ensure_companion_files()
         text, _ = secure_read_text(p, root=self.vault_path, max_bytes=256 * 1024)
         return text
 
     def update_thread(self, thread: ThreadItem) -> None:
-        p = self.companion_dir / "Threads.md"
+        p = self._threads_path
         if not p.is_file():
             self.ensure_companion_files()
         text, _ = secure_read_text(p, root=self.vault_path, max_bytes=256 * 1024)
@@ -420,8 +615,8 @@ updated_at: {now_str}
 
     def archive_resolved_threads(self) -> int:
         """Move resolved threads from Threads.md to Threads-Archive.md."""
-        threads_path = self.companion_dir / "Threads.md"
-        archive_path = self.companion_dir / "Threads-Archive.md"
+        threads_path = self._threads_path
+        archive_path = self._threads_archive_path
         if not threads_path.is_file():
             return 0
         text, _ = secure_read_text(threads_path, root=self.vault_path, max_bytes=256 * 1024)
@@ -458,19 +653,32 @@ updated_at: {now_str}
     # -------------------------------------------------------------------------
     # Journal (Narrative Reflections)
     # -------------------------------------------------------------------------
-    def append_journal_entry(self, title: str, narrative: str, runtime: str = "system") -> None:
+    def append_journal_entry(
+        self, title: str, narrative: str, runtime: str = "system", *, marker: str | None = None,
+    ) -> bool:
+        """Append one entry. With ``marker`` the append happens at most once.
+
+        The marker (an observation id) is written inside the entry, so a merge
+        that is re-run after a crash can see that its append already landed.
+        """
         p = self.companion_dir / "Journal.md"
         if not p.is_file():
             self.ensure_companion_files()
         text, _ = secure_read_text(p, root=self.vault_path, max_bytes=512 * 1024)
+        marker_line = f"<!-- pz-obs:{marker} -->" if marker else ""
+        if marker_line and marker_line in text:
+            return False
 
         now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
         clean_narrative, _ = redact_sensitive_text(narrative.strip())
         clean_title, _ = redact_sensitive_text(title.strip())
 
         entry = f"\n\n## {now_str} — [{runtime}] {clean_title}\n{clean_narrative}\n"
+        if marker_line:
+            entry += f"{marker_line}\n"
         updated = text.rstrip() + entry
         atomic_write(p, updated, mode=0o660)
+        return True
 
     def read_latest_journal_entry(self, max_lines: int = 15) -> str:
         p = self.companion_dir / "Journal.md"

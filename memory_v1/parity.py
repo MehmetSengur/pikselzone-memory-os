@@ -61,7 +61,9 @@ class SharedBrainParityManager:
 
         # 1. Base directories
         self.companion.ensure_companion_files()
-        self.graph.ensure_graph_dirs()
+        # Directories only: index.md / log.md are written solely by the
+        # compiler's deterministic post-promotion rebuild.
+        self.graph.ensure_graph_dirs(seed_anchors=False)
         self.skills.ensure_skills_dirs()
 
         # 2. Router parity (CLAUDE.md <-> AGENTS.md)

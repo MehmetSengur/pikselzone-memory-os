@@ -31,6 +31,89 @@ Transform Pikselzone Memory OS from a passive, overly restrictive session logger
 ## Current Status
 COMPLETED: Pikselzone Memory OS has been successfully transformed into Second Brain V2 (fully autonomous, self-evolving, learning, relationship-building, rule-extracting, skill-generating, and self-healing memory operating system).
 
+## V2.2 Checkpoint Contract
+
+V2.2 adds a bounded raw-turn checkpoint layer without replacing `PreCompact`
+or `SessionEnd`.  Completed turns are captured cheaply outside the shared
+Obsidian vault; durable promotion remains boundary-driven and idempotent.
+“Ortak hafıza” means the Pikselzone Memory OS shared brain when handled by
+Memory OS-aware instructions.  Codex native memory is a separate store and is
+not read, imported, or silently synchronized.  Codex Desktop/App lifecycle
+was observed on 2026-09-15 (codex 0.153.4), under bounded conditions.  User
+threads send `Stop` where the project's Stop hook is trusted.  SessionEnd runs
+only under the documented conditions: archive/delete, normal close, or 30
+minutes idle while open in no client.  With the App kept running, those
+conditions were rarely met (1 of 32 threads).  Pending turns are therefore
+promoted by idle finalize at the next registered SessionStart; it is not a
+timer (see `docs/MEMORY-V1-ARCHITECTURE.md`, "Idle finalize").
+
+A successful `NoMemory` classification is semantic settlement: the exact
+boundary snapshot is consumed without a daily artifact or Second Brain
+mutation.  The existing `status=empty` and `source_digest` session state is
+the idempotency record for later identical boundaries, which merge their event
+without another provider call.  Provider failures leave pending material
+retryable. V2.2 is not production activated; Hermes native turn-durability
+recovery is closed, while the separate stale recall-evidence production gate
+remains pending.
+
+Deployed Hermes 0.19.0 invokes plugin registration once per CLI process after
+the active `HERMES_HOME` has been selected, but does not invoke
+`on_session_start` when a CLI merely reaches its initial input prompt. That
+hook runs during the first new user turn after system-prompt construction; it
+does not run on exact-session continuation. `pre_llm_call` runs in each actual
+user-turn prologue. Therefore plugin registration performs only bounded,
+provider-free raw discovery for identities already present in the 128-entry
+local cursor. It exact-reads those stored database/session identities, rather
+than scanning recent history, so a tracked crash can remain recoverable after
+it falls outside a recent-session window. Unrelated historical sessions are
+never armed or exported by registration.
+
+A real Hermes `on_session_start` remains the sole authority to arm a new
+session from the public active Hermes home even before Hermes persists a
+SessionDB row: the initial cursor digest is `null`. If that row already exists
+at first sighting, its current final-turn digest is baseline-only and is never
+replayed. Registration and SessionStart discovery stage only the canonical raw
+checkpoint and never invokes `PluginLlm`. In deployed Hermes 0.19.0,
+`on_session_end` is the completed per-`run_conversation()` turn boundary, so
+raw settlement is scoped to the normalized source digest rather than to the
+whole session: an identical digest is idempotent, while a later digest in the
+same session remains eligible. Hermes has no reliable native whole-session
+finalize call site; terminal semantic batching is therefore deferred and is
+not a V2.2 turn-durability blocker.
+
+The failed native canary `20260901_134450_bf9e17` exposed the
+SessionStart-before-SessionDB persistence ordering. The failed native canary
+`20260902_172739_4b7b32` exposed that initial CLI input-prompt readiness does
+not itself invoke SessionStart. Both are contract-discovery evidence only, not
+native-acceptance PASS.
+
+### Hermes native turn-durability acceptance — 2026-09-03
+
+Clean native acceptance at source `1eb9da61693e59296211ba742f4807cedadaef8c`
+proved two completed turns in one real `pz-orchestrator` Hermes session. Each
+native `on_session_end` staged its own isolated canonical raw checkpoint with
+a distinct source digest; the first digest did not suppress the second. Both
+turns made zero per-turn `PluginLlm` calls and no semantic event, the second
+checkpoint survived a SIGKILL of the temporary CLI child, and an exact-session
+resume with zero user input ran native plugin registration without creating a
+duplicate checkpoint. `PZ_MEMORY_BASE_DIR` kept receipts, trace, checkpoints,
+and recall evidence isolated from production. Candidate policy was derived
+from the active manifest while preserving unrelated guarded entries, and the
+five plugin scopes and manifest were restored before policy guard verification.
+
+V2.2 Hermes native turn durability and digest-scoped settlement are closed.
+Terminal semantic batching remains deferred because Hermes 0.19.0 has no
+reliable native whole-session terminal callback. Production V2.2 activation
+remains forbidden; the accepted outstanding production gate is the existing
+stale `companion/Kurallar.md` recall-evidence mismatch.
+
+`PZ_MEMORY_BASE_DIR` redirects every mutable Hermes Memory OS runtime artifact
+for bounded tests and canaries: inbox, cursor, receipts, locks, checkpoints,
+events, and evidence outboxes. It does not redirect Hermes SessionDB, which
+remains the active Hermes profile's `get_hermes_home()/state.db`. Canary
+preflight at source `35332b4` found a fixed recall-evidence path that would
+have contaminated production; execution stopped before the first CLI turn.
+
 ## Completed Checkpoints
 - **SB2-PRE**: Repository initialization & branch setup (`feat/self-evolving-second-brain-v2`), upstream `avenoxbeyin` architecture comparative analysis, and living state document establishment.
 - **SB2-01**: Codex old + new rollout format compatibility (both legacy `user_message`/`agent_message` and modern `item_completed` with `UserMessage`/`AgentMessage`, case-insensitive `text`/`Text` block extraction, complete filtering of `Reasoning`/`CommandExecution`/`FileChange`/internal events, and regression check against silent 0-turn failure with 10 targeted tests PASS).
@@ -647,3 +730,102 @@ REMAINING_BLOCKERS=explicit approval for the proven metadata capability or a sep
 - **Historical repair status:** `V2_1_HISTORICAL_REPAIR=PASS`; no manual rsync,
   hook runner, receipt write, production configuration, VPS service, ACL, or
   capability change was used.
+
+## 2026-09-18 — Memory reliability implementation and activation
+
+Implementation branch: `codex/memory-reliability`. Started from the inspected
+`fix/idle-turn-finalize` HEAD `2d9fd268ef50e08e3f38a4491afcabf4f6fb52e3`.
+The independently inspected finalize-retry / Bot Mode integration was merged as
+`46e1627`; original active checkouts were not changed. Operations counterpart:
+`pikselzone-hermes-ai-os`, branch `codex/memory-profile-integration`.
+
+Implemented candidate behavior:
+
+- One native discovery shim, installed by the managed Hermes entrypoint, selects
+  the central plugin for existing profiles and profiles created through native
+  Hermes paths. It changes in-memory plugin defaults only. Profile config, SOUL,
+  tool permissions, model and credentials are not copied or rewritten. Native
+  PluginLlm's readonly configuration reader receives the same defaults.
+- Root-owned `memory-profile-policy.json` selects native paths and explicit
+  grants keyed by absolute profile home. Owner identity is the full SessionDB
+  path hash, not the profile name or a guessed business identity. Default is
+  owner-private, unscoped; visibility `project` additionally requires explicit
+  matching project access, while `shared` is an operator decision. A normal
+  profile cannot grant itself access using `pz_memory` preferences.
+- `pz_memory.no_memory`, plugin disablement and native service-profile metadata
+  survive discovery/reconciliation. `profiles --reconcile` inventories at most
+  256 homes once; normal messages do not enumerate every profile/database.
+  Doctor distinguishes configuration from last observed native capture/recall.
+- Native normalization retains source-linked critical user claims and supported
+  Claude/Codex/Hermes tool-result envelopes without a second model call. Tool
+  results mean "the native tool reported this", not independent verification;
+  assistant assertions are never upgraded to tool evidence. Original source
+  hashes, message positions, owner, project and exact redacted spans are retained.
+  Corrections preserve earlier values and links; unresolved claims remain visible.
+  Quoted/relayed tasks and synthetic canaries do not become user preferences.
+- Critical records live in optional, backward-compatible event frontmatter and
+  are queried through normal recall. They form separate budget candidates from
+  summaries and are not truncated into misleading partial values. Schema/capacity
+  errors retain raw checkpoints and become visible failures instead of drops.
+- Startup, targeted, associative, late recall and the metadata context helper use
+  the same access gate. Known private provenance in legacy knowledge is also
+  checked. Source-less historical knowledge cannot have its original scope
+  reconstructed automatically; review it before granting it a different scope.
+  Private input cannot enter the shared learning/compiler path. No extra writer
+  to `knowledge/` was introduced.
+- `trace --query ... [--session-id ...]` reports safe references and reason codes
+  for source, checkpoint, record, summary, outbox/daily, knowledge, selection,
+  hook return and answer. A prepared bundle or hook return is not an answer PASS.
+  Queries and private claim bodies are not copied into the trace report. Scans
+  are bounded; missing/corrupt material produces partial diagnostics.
+- SessionDB ownership now participates in checkpoint and event identities.
+  Same-ID profiles cannot settle/clean each other's turns. Shared provider-call
+  guard state is reentrant and leaves unrelated native threads able to capture.
+
+Consumption contract (top-level MemoryConfig `memory`, or native profile
+`pz_memory.mode`; trusted central defaults first, profile then trusted session
+mode overrides, with no-memory sticky):
+
+| Preference | Raw capture | Automatic summary | Compiler | Automatic recall |
+|---|---|---|---|---|
+| normal | on | existing lifecycle/retry | existing sole writer | normal budget |
+| economic | on, unchanged durability | minimum 900s deferral | existing timer, deduplicated | half configured character budget, authority minimum preserved |
+| manual | on | paused; data retained | paused | paused |
+| no-memory | off | off | off for that consumer | off |
+
+`--manual` before a CLI command is explicit processing/recall and does not clear
+no-memory. For Hermes finalize backlog, return the profile to normal before using
+its existing recovery triggers. Runtime shutdown does not imply background work:
+workstation recovery uses the next SessionStart (including idle-finalize); Hermes
+uses its existing lifecycle/dispatcher/watchdog while a managed process is alive.
+No cost/token savings percentage was measured or claimed.
+
+Validation and gates:
+
+- Full local suite: **769 tests passed**, including workstation idle-finalize and
+  late recall, Hermes long-session/finalize/retry, controlled quota/failure
+  fixtures, same-ID ownership, critical values, provenance, mode and access tests.
+  Injected provider failures are isolated tests, not live outages.
+- Installed Hermes v2026.9.14 was used on Contabo with a completely separate
+  `/tmp/pz-memory-native-review` home/state. Native `create_profile` and real
+  `PluginManager` confirmed one central source, single hook registration, readonly
+  LLM trust, no credential copying, opt-out, service exclusion and repeatability.
+  Script: `scripts/native-profile-discovery-smoke.py`. Its report explicitly sets
+  `conversation_capture_publish_recall_verified=false`.
+- The user subsequently authorized publication and service maintenance. Engine
+  `9b7f82f73d74e7d28058c9377a5242a32d771ba1` was activated on Contabo and the
+  workstation on 2026-09-18. Native profile argument handling was corrected after
+  a first cutover automatically restored code; existing data was not restored.
+  A follow-up doctor fix accepts matches from source bodies and reports partial
+  source failures rather than demanding a literal phrase in every result title.
+- **Native conversation-to-answer acceptance remains blocked by provider quota.**
+  Isolated native profile discovery is not that acceptance. Publisher success,
+  service startup, historical receipts and compiler timer activity do not close
+  this gate. Exact current deployment, diagnostics and rollback locations are in
+  the operations upgrade handoff. No main merge was performed.
+- Operations runbook, immutable source manifest and evidence are maintained in
+  `deploy/contabo-autonomous/upgrades/2026-09-18/` of the operations branch. Use
+  the existing backup/quiesce/rollback process. Roll back code and wrappers only;
+  never overwrite later checkpoints, retry state, SessionDB or vault with a prior
+  data archive. Existing per-profile plugin copies remain available for rollback
+  but central discovery does not load them.

@@ -76,7 +76,11 @@ class TestSkillEngine(unittest.TestCase):
             session_id="sess-capi-1",
         )
         self.engine.record_workflow_observation(obs_1)
-        self.engine.record_workflow_observation(obs_1)  # materialized at v1.0.0
+        # Repetition has to come from a separate session to materialize (v1.0.0).
+        self.engine.record_workflow_observation(WorkflowObservation(
+            workflow_name=obs_1.workflow_name, goal=obs_1.goal, steps=list(obs_1.steps),
+            tools_or_scripts=list(obs_1.tools_or_scripts), session_id="sess-capi-2",
+        ))
 
         # User shows new edge-case and parameter
         updated = self.engine.update_skill_with_learnings(
@@ -96,6 +100,54 @@ class TestSkillEngine(unittest.TestCase):
         self.assertIn("--test-event-code TEST12345", content)
         self.assertIn("IP adresi whitelist'te değilse", content)
         self.assertIn("kurumsal proxy'yi devreye sok", content)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestSkillRepetitionProvenance(unittest.TestCase):
+    """A skill needs repetition across sessions, not calls."""
+
+    def setUp(self) -> None:
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.vault = Path(self._tmp.name).resolve()
+        self.engine = SkillEngine(self.vault)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _obs(self, session_id: str) -> WorkflowObservation:
+        return WorkflowObservation(
+            workflow_name="Staging Deploy",
+            goal="Staging ortamına dağıtım.",
+            steps=["git pull origin staging", "docker compose up -d"],
+            session_id=session_id,
+        )
+
+    def test_same_session_repetition_does_not_synthesize(self):
+        # Every synthesized skill in the live vault came from one pasted prompt
+        # observed twice inside a single session.
+        self.assertIsNone(self.engine.record_workflow_observation(self._obs("sess-a")))
+        self.assertIsNone(self.engine.record_workflow_observation(self._obs("sess-a")))
+        self.assertFalse((self.vault / "skills" / "staging-deploy" / "SKILL.md").exists())
+
+    def test_second_session_synthesizes_with_sources(self):
+        self.engine.record_workflow_observation(self._obs("sess-a"))
+        path = self.engine.record_workflow_observation(self._obs("sess-b"))
+        self.assertIsNotNone(path)
+        content = path.read_text(encoding="utf-8")
+        self.assertIn('sources: ["sess-a", "sess-b"]', content)
+
+    def test_retired_candidate_is_never_resynthesized(self):
+        import json
+        self.engine.record_workflow_observation(self._obs("sess-a"))
+        state = json.loads(self.engine.candidates_file.read_text(encoding="utf-8"))
+        state["candidates"]["staging-deploy"]["status"] = "retired"
+        self.engine.candidates_file.write_text(json.dumps(state), encoding="utf-8")
+        self.assertIsNone(self.engine.record_workflow_observation(self._obs("sess-b")))
+        self.assertFalse((self.vault / "skills" / "staging-deploy" / "SKILL.md").exists())
 
 
 if __name__ == "__main__":

@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from .core import (
-    MemoryConfig, MemoryError, PolicyError, SchemaError,
+    is_noise_concept_slug, MemoryConfig, MemoryError, PolicyError, SchemaError,
     atomic_json, atomic_write, directive_shaped, ensure_safe_directory,
-    exclusive_lock, iso_now, knowledge_relative_path, path_within,
+    KNOWLEDGE_DETERMINISTIC_FILES, exclusive_lock, iso_now, knowledge_relative_path,
+    path_within,
     redact_sensitive_text, reject_symlink_chain, safe_unlink,
     secure_read_file, secure_read_text, sha256_file, write_health,
 )
@@ -50,6 +51,9 @@ def select_and_stage_batch(
     max_input_chars: int = 300000,
 ) -> dict[str, Any] | None:
     """Discover uningested daily events and stage an untrusted batch payload into the inbox."""
+    from .memory_policy import config_policy
+    if not config_policy(config)["compile"]:
+        return None
     daily_root = config.vault_path / "daily"
     if not daily_root.exists() or not daily_root.is_dir():
         return None
@@ -78,15 +82,20 @@ def select_and_stage_batch(
         logger.debug("pz-memory-promoter: zero uningested daily events found")
         return None
 
-    selected = sorted(candidates)[:max_events]
+    selected = sorted(candidates)[:500]
     source_digests: dict[str, str] = {}
     event_chunks: list[str] = []
     used_chars = 0
     char_limit = max_input_chars // 2
 
     for path in selected:
+        if len(source_digests) >= max_events:
+            break
         text, digest = secure_read_text(path, root=daily_root, max_bytes=2 * 1024 * 1024)
-        parse_event_artifact(text)
+        artifact = parse_event_artifact(text)
+        scope = artifact.get('memory_scope', {'project':artifact.get('project','unscoped')})
+        if scope and scope.get('visibility') != 'shared' and (scope.get('owner') or scope.get('project') not in (None, '', 'unscoped')):
+            continue
         text_clean, _ = redact_sensitive_text(text)
         rel_name = path.relative_to(config.vault_path).as_posix()
         source_digests[rel_name] = digest
@@ -98,6 +107,9 @@ def select_and_stage_batch(
             break
         event_chunks.append(block)
         used_chars += len(block)
+
+    if not source_digests:
+        return None
 
     # Existing knowledge snapshot
     knowledge_root = config.vault_path / "knowledge"
@@ -116,6 +128,9 @@ def select_and_stage_batch(
             except PolicyError:
                 continue
             text, _ = secure_read_text(path, root=knowledge_root, max_bytes=2 * 1024 * 1024)
+            from .recall_access import source_reason
+            if source_reason(config, rel_name, text=text):
+                continue
             text_clean, _ = redact_sensitive_text(text)
             block = f"\n### FILE {rel_name}\n{text_clean}"
             if used_k_chars + len(block) <= char_limit:
@@ -221,6 +236,12 @@ def _validate_graph_candidate_integrity(
     }
     valid_concepts = live_concepts | candidate_concepts
     valid_connections = live_connections | candidate_connections
+
+    # A bare status/artefact word is never a durable concept; refuse the batch
+    # rather than promoting it into the shared graph.
+    for slug in sorted(candidate_concepts):
+        if is_noise_concept_slug(slug):
+            raise PolicyError(f"candidate-generic-bare-concept:{slug}")
 
     for rel, _, content_bytes in validated_payloads:
         content = content_bytes.decode("utf-8", errors="replace")
@@ -377,18 +398,29 @@ def promote_knowledge_outbox(
         # Stage 1: Validate all candidates before promoting any
         validated_payloads: list[tuple[str, Path, bytes]] = []
 
+        dropped_deterministic: list[str] = []
         for item in writes:
             rel_path = str(item.get("path", "")).strip().lstrip("/")
             expected_sha = item.get("sha256")
             if not rel_path:
                 raise SchemaError("candidate-path-empty")
 
-            # Path validation & traversal prevention
+            # Path validation & traversal prevention.
             try:
                 knowledge_relative_path(rel_path)
             except PolicyError as exc:
                 write_health(config.state_path, "compiler", "fail", str(exc))
                 raise
+            # The *write* policy is narrower than the read allowlist:
+            # knowledge/index.md and knowledge/log.md are deterministic
+            # single-writer artifacts rebuilt after promotion.  A generator
+            # whose instruction has not been updated yet may still propose
+            # them; drop those candidates instead of failing the whole batch,
+            # so the model output never becomes index/log content but the rest
+            # of the knowledge batch still flows.
+            if str(knowledge_relative_path(rel_path)) in KNOWLEDGE_DETERMINISTIC_FILES:
+                dropped_deterministic.append(rel_path)
+                continue
 
             candidate_file = candidates_dir / rel_path
             if not candidate_file.is_file():
@@ -486,6 +518,29 @@ def promote_knowledge_outbox(
         state["last_changed"] = promoted_paths
         atomic_json(state_path, state)
 
+        # Stage 5: deterministic, single-writer rebuild of the two shared files.
+        # The model never authors these; they are derived from the canonical
+        # concept/connection files that were just promoted.
+        from .knowledge_index import rebuild_after_promotion
+        if dropped_deterministic:
+            logger.info(
+                "pz-memory-promoter: dropped %d model-proposed deterministic file(s): %s",
+                len(dropped_deterministic), ", ".join(sorted(dropped_deterministic)),
+            )
+        rebuilt = rebuild_after_promotion(
+            config.vault_path,
+            batch_id=str(manifest.get("batch_id") or "batch-unknown"),
+            promoted=promoted_paths,
+        )
+
         write_health(config.state_path, "compiler", "ok")
-        logger.info("pz-memory-promoter: successfully promoted %d knowledge files", len(promoted_paths))
-        return {"status": "ok", "promoted": promoted_paths}
+        logger.info(
+            "pz-memory-promoter: successfully promoted %d knowledge files, "
+            "index rebuilt deterministically (%d rows)",
+            len(promoted_paths), rebuilt["index_rows"],
+        )
+        return {
+            "status": "ok", "promoted": promoted_paths,
+            "index_rows": rebuilt["index_rows"],
+            "dropped_deterministic": sorted(dropped_deterministic),
+        }

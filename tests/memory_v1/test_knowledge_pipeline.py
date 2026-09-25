@@ -37,8 +37,11 @@ class MockLlmSuccess:
                 "content": "---\ntitle: Memory Hardening\naliases: [hardening]\ntags: [memory, architecture]\nsources: [daily/2026-08-28/event-1.md]\ncreated: 2026-08-28\nupdated: 2026-08-28\nauthority: derived-memory-not-canonical\n---\n\n## Özet\nHardening summary.\n\n## Önemli Noktalar\n- Safe isolation\n\n## Detaylar\nDetails.\n\n## Kaynaklar\n- event-1\n",
             },
             {
-                "path": "knowledge/index.md",
-                "content": "# Knowledge Index\n\n| Article | Summary | Source | Updated |\n|---|---|---|---|\n| [[concepts/memory-hardening|Memory Hardening]] | Hardening summary | event-1 | 2026-08-28 |\n",
+                # index.md / log.md are deterministic single-writer artifacts and
+                # are rejected if a model proposes them; a batch proposes only
+                # concepts/ and connections/.
+                "path": "knowledge/concepts/isolation-boundary.md",
+                "content": "---\ntitle: Isolation Boundary\naliases: []\ntags: [memory]\nsources: [daily/2026-08-28/event-1.md]\ncreated: 2026-08-28\nupdated: 2026-08-28\nauthority: derived-memory-not-canonical\n---\n\n## Özet\nIsolation summary.\n\n## Detaylar\nDetails.\n\n## Kaynaklar\n- event-1\n",
             },
         ]
         self.model = "gpt-5.4-mini"
@@ -146,7 +149,15 @@ authority: "derived-session-memory-not-operational-truth"
         self.assertEqual("ok", res_prom["status"])
         self.assertEqual(2, len(res_prom["promoted"]))
         self.assertTrue((self.vault / "knowledge/concepts/memory-hardening.md").is_file())
-        self.assertTrue((self.vault / "knowledge/index.md").is_file())
+        self.assertTrue((self.vault / "knowledge/concepts/isolation-boundary.md").is_file())
+        # index.md is not promoted model output -- it is rebuilt deterministically
+        # from the canonical concept files after a successful promotion.
+        index_text = (self.vault / "knowledge/index.md").read_text(encoding="utf-8")
+        self.assertTrue(index_text.startswith("# Knowledge Base Index"))
+        self.assertIn("concepts/memory-hardening.md", index_text)
+        self.assertIn("concepts/isolation-boundary.md", index_text)
+        log_text = (self.vault / "knowledge/log.md").read_text(encoding="utf-8")
+        self.assertIn("PROMOTE", log_text)
 
         # Ingestion ledger must advance
         state = load_compiler_state(self.state / "compiler" / "state.json")
@@ -166,6 +177,27 @@ authority: "derived-session-memory-not-operational-truth"
         with self.assertRaisesRegex(PolicyError, "candidate-broken-or-noncanonical-wikilink"):
             promote_knowledge_outbox(self.config, outbox_root=self.outbox_root)
         self.assertFalse((self.vault / "knowledge/concepts/bad.md").exists())
+
+    def test_promoter_rejects_concept_linking_to_uncreated_connection(self):
+        # The live graph carries this exact shape: concepts promoted with
+        # [[connections/a--b]] references to connection files that were never
+        # written, leaving dangling links behind.
+        self._create_event()
+        select_and_stage_batch(self.config, outbox_root=self.outbox_root, max_events=10)
+        bad_writes = [{
+            "path": "knowledge/concepts/alpha.md",
+            "content": (
+                "---\ntitle: Alpha\naliases: []\n---\n# Alpha\n"
+                "[[connections/alpha--beta]]\n"
+            ),
+        }]
+        result = load_knowledge_generator().generate_knowledge(
+            base_dir=str(self.outbox_root), llm_client=MockLlmSuccess(writes=bad_writes)
+        )
+        self.assertEqual("ok", result["status"])
+        with self.assertRaisesRegex(PolicyError, "candidate-broken-or-noncanonical-wikilink"):
+            promote_knowledge_outbox(self.config, outbox_root=self.outbox_root)
+        self.assertFalse((self.vault / "knowledge/concepts/alpha.md").exists())
 
     def test_compiler_snapshot_excludes_observed_conflicted_copy(self):
         self._create_event()
@@ -337,7 +369,8 @@ authority: "derived-session-memory-not-operational-truth"
         load_knowledge_generator().generate_knowledge(base_dir=str(self.outbox_root), llm_client=MockLlmSuccess())
 
         # Unlink one candidate file so manifest is out-of-sync
-        cand = self.outbox_root / "outbox" / "knowledge" / "candidates" / "knowledge" / "index.md"
+        cand = (self.outbox_root / "outbox" / "knowledge" / "candidates"
+                / "knowledge" / "concepts" / "isolation-boundary.md")
         cand.unlink()
 
         with self.assertRaises(PolicyError) as cm:
@@ -363,7 +396,7 @@ authority: "derived-session-memory-not-operational-truth"
             }),
             ("no-changes-with-writes", {
                 "status": "no_changes",
-                "writes": [{"path": "knowledge/index.md", "content": "# Index\n"}],
+                "writes": [{"path": "knowledge/concepts/x.md", "content": "# X\n"}],
             }),
         ]
 
@@ -436,7 +469,7 @@ authority: "derived-session-memory-not-operational-truth"
         self.assertEqual(original_bytes, existing_concept.read_bytes())
 
         # Invariant 2: Newly created files must be cleaned up (no partial promotion)
-        self.assertFalse((self.vault / "knowledge" / "index.md").exists())
+        self.assertFalse((self.vault / "knowledge" / "concepts" / "isolation-boundary.md").exists())
 
         # Invariant 3: Ingestion ledger MUST NOT have advanced
         state = load_compiler_state(self.state / "compiler" / "state.json")
@@ -519,7 +552,7 @@ authority: "derived-session-memory-not-operational-truth"
             "source_digests": {"daily/2026-08-28/hermes-e1.md": real_sha},
             "model": "gpt-5.4-mini",
             "provider": "custom",
-            "writes": [{"path": "knowledge/index.md"}],
+            "writes": [{"path": "knowledge/concepts/isolation-boundary.md"}],
         }), encoding="utf-8")
         with self.assertRaises(SchemaError):
             promote_knowledge_outbox(self.config, outbox_root=self.outbox_root)

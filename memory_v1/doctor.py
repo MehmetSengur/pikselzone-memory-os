@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .companion import CompanionManager
+from .hook_install import MEMORY_MARKERS
 from .core import (
     MemoryConfig, MemoryError, atomic_json, atomic_write, discover_codex_binary,
     iso_now, path_within, safe_unlink, secure_read_file, secure_read_text,
@@ -23,8 +24,14 @@ from .graph_engine import KnowledgeGraphEngine, is_conflicted_copy_path
 from .provider import check_macos_keychain_presence
 
 
+# The leading \b is what keeps this from matching inside a longer word. Without
+# it, a systemd line quoted in a transcript --
+# "LoadCredential=supabase-service-role:/etc/..." -- matched on its *name* and
+# the doctor reported a FAIL for an artefact whose real values were already
+# redacted. core.SECRET_ASSIGNMENT has always carried the boundary; this is the
+# same rule, so the redactor and the reporter agree.
 VALUE_SHAPED_SECRET = re.compile(
-    r"(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
+    r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
     r"private[_-]?key|password|passwd|credential)\s*[:=]\s*[\"']?"
     r"[A-Za-z0-9_./+\-=]{12,}"
 )
@@ -58,10 +65,80 @@ def _effective_read_write_access(path: Path) -> tuple[bool, str]:
     return (True, "read-write-posix-identity") if permitted else (False, "insufficient")
 
 
+def _project_registry_rows(config: MemoryConfig) -> list[dict[str, str]]:
+    """Report V2.3 project registration: which roots are registered, and any
+    drift between the registry and the hook files actually installed in them."""
+    from .hook_install import MEMORY_EVENTS
+    from .project_registry import RegistryError, load_registry
+
+    # Project registration is a workstation contract: it exists to drive
+    # Claude/Codex hook installation inside project roots.  A memory engine
+    # that only runs Hermes has no such roots, so an empty registry there is
+    # the expected shape rather than a finding.  This is decided from the
+    # active config, never inferred from the registry file being absent.
+    hermes_only_engine = config.role == "memory-engine" and set(config.runtimes) == {"hermes"}
+
+    try:
+        entries = load_registry(config.state_path)
+    except RegistryError as exc:
+        return [_row("project_registry", "fail", str(exc))]
+
+    if not entries:
+        if hermes_only_engine:
+            return [_row("project_registry", "not-applicable", "memory-engine-hermes-only")]
+        return [_row("project_registry", "warn", "no-registered-projects")]
+
+    by_project: dict[str, list[str]] = {}
+    for entry in entries:
+        by_project.setdefault(entry.project, []).append(entry.root)
+    summary = "; ".join(
+        f"{project}={len(roots)}" for project, roots in sorted(by_project.items())
+    )
+    rows = [_row("project_registry", "pass", f"{len(entries)} roots: {summary}")]
+
+    incomplete: list[str] = []
+    for entry in entries:
+        root = Path(entry.root)
+        for runtime, rel in (
+            ("claude", ".claude/settings.local.json"),
+            ("codex", ".codex/hooks.json"),
+        ):
+            target = root / rel
+            installed = set()
+            if target.is_file():
+                try:
+                    hooks = json.loads(target.read_text(encoding="utf-8")).get("hooks", {})
+                except (OSError, ValueError):
+                    incomplete.append(f"{entry.project}:{runtime}:unreadable")
+                    continue
+                for event, groups in (hooks or {}).items():
+                    for group in groups if isinstance(groups, list) else []:
+                        for hook in (group or {}).get("hooks", []):
+                            if any(m in str(hook.get("command", "")) for m in MEMORY_MARKERS):
+                                installed.add(event)
+            missing = set(MEMORY_EVENTS) - installed
+            if missing:
+                incomplete.append(
+                    f"{entry.project}:{runtime}:missing={','.join(sorted(missing))}"
+                )
+    rows.append(_row(
+        "project_hook_install",
+        "pass" if not incomplete else "warn",
+        "complete" if not incomplete else "; ".join(incomplete[:6]),
+    ))
+    return rows
+
+
 def run_doctor(config: MemoryConfig) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
     vault = config.vault_path
     checks.append(_row("vault_path", "pass" if vault.is_dir() else "fail", str(vault)))
+    try:
+        from .sync_heartbeat import learning_inbox_row, sync_roundtrip_row
+        checks.append(sync_roundtrip_row(config))
+        checks.append(learning_inbox_row(config))
+    except Exception as exc:  # visibility rows never break the doctor
+        checks.append(_row("sync_roundtrip", "unknown", f"error:{str(exc)[:120]}"))
     checks.append(_row(
         "state_outside_vault", "pass" if not path_within(config.state_path, vault) else "fail"
     ))
@@ -78,7 +155,8 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
     if config.provider_mode == "runtime-native":
         checks.append(_row("model_routing", "pass", "runtime-native (claude=haiku, codex=subscription, compiler=vps-hermes)"))
     else:
-        valid_routing = config.flush_model == "gpt-5.6-luna" and config.compiler_model == "gpt-5.6-terra"
+        valid_routing = (config.flush_model, config.compiler_model) in {
+            ("gpt-6-luna", "gpt-6-sol"), ("gpt-5.6-luna", "gpt-5.6-terra")}
         checks.append(_row(
             "model_routing",
             "pass" if valid_routing else "fail",
@@ -156,11 +234,16 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
     checks.append(_graph_health_row(config))
     checks.extend(_event_tree_rows(config))
     checks.append(_memory_secret_row(config))
+    checks.extend(_project_registry_rows(config))
     pending = config.state_path / "queue" / "pending"
     pending_count = len(list(pending.glob("*.json"))) if pending.is_dir() else 0
     checks.append(_row(
         "pending_checkpoints", "pass" if pending_count == 0 else "warn", str(pending_count)
     ))
+    checks.append(_checkpoint_retry_row(config))
+    checks.append(_stalled_turn_sessions_row(config))
+    checks.append(_checkpoint_quarantine_row(config))
+    checks.extend(_hermes_finalize_rows(config))
     checks.extend(_recall_rows(config))
     if config.can_run_compiler:
         checks.append(_compiler_backlog_row(config))
@@ -176,6 +259,22 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
     else:
         checks.append(_row("backup_evidence", "unknown", "not-configured"))
 
+    from .profile_integration import profile_report
+    profiles = []
+    from .profile_integration import POLICY_ENV, load_policy
+    if os.environ.get(POLICY_ENV):
+        profiles.extend(profile_report(Path(load_policy()['base_dir'])))
+    else:
+        for root in config.transcript_roots.get('hermes', ()):
+            profiles.extend(profile_report(root / 'memory-v1'))
+    from .memory_policy import config_policy
+    policy = config_policy(config)
+    checks.append(_row('memory_consumption', 'pass',
+        f"mode={policy['mode']};capture={policy['capture']};summarize={policy['summarize']};compile={policy['compile']};recall={policy['recall']}"))
+    for profile in profiles:
+        checks.append(_row('hermes_profile_' + str(profile['owner'])[:16],
+            'warn' if profile['status'] == 'degraded' else 'pass',
+            f"{profile['status']};version={profile.get('version')};reason={profile['reason']};native evidence reported separately"))
     failures = sum(row["status"] == "fail" for row in checks)
     blocked = sum(row["status"] == "blocked" for row in checks)
     warnings = sum(row["status"] in {"warn", "unknown"} for row in checks)
@@ -184,7 +283,98 @@ def run_doctor(config: MemoryConfig) -> dict[str, Any]:
         "status": "fail" if failures else ("blocked" if blocked else "ok"),
         "summary": {"fail": failures, "blocked": blocked, "warning": warnings},
         "checks": checks,
+        "profiles": profiles,
     }
+
+
+def _checkpoint_retry_row(config: MemoryConfig) -> dict[str, str]:
+    """Surface bounded drain-retry state.
+
+    Reported as pass/warn only: a checkpoint waiting on backoff, or one that
+    exhausted its attempts, is operator information, not a doctor failure --
+    the raw checkpoint is still preserved either way.
+    """
+    from .retry import retry_summary
+
+    counts = retry_summary(config)
+    total = sum(counts.values())
+    detail = (
+        f"scheduled={counts['scheduled']};"
+        f"exhausted={counts['exhausted']};permanent={counts['permanent']}"
+    )
+    return _row("checkpoint_retry", "pass" if total == 0 else "warn", detail)
+
+
+def _stalled_turn_sessions_row(config: MemoryConfig) -> dict[str, str]:
+    """Sessions whose pending turns no automatic path will promote again.
+
+    A stalled session keeps capturing turns it can never drain until it hits
+    the per-session retention limit, after which its Stop hook stops capturing
+    at all.  Nothing here is lost -- the raw turns are intact -- but it needs an
+    operator: fix the cause and let it retry, or quarantine the poisoned turn.
+    """
+    from .retry import stalled_turn_sessions
+
+    stalled = stalled_turn_sessions(config)
+    if not stalled:
+        return _row("turn_batch_stalled", "pass", "0")
+    worst = max(stalled, key=lambda item: item["pending_turns"])
+    detail = (
+        f"sessions={len(stalled)};"
+        f"worst={worst['runtime']}-{worst['session_key'][:8]}"
+        f":{worst['pending_turns']}/{worst['retention_limit']}"
+        f";reason={str(worst.get('last_reason') or 'unknown')[:80]}"
+    )
+    return _row("turn_batch_stalled", "warn", detail)
+
+
+def _checkpoint_quarantine_row(config: MemoryConfig) -> dict[str, str]:
+    """Raw checkpoints an operator set aside.  Preserved, never promoted."""
+    from .retry import quarantined_checkpoints
+
+    records = quarantined_checkpoints(config)
+    if not records:
+        return _row("checkpoint_quarantine", "pass", "0")
+    return _row(
+        "checkpoint_quarantine", "warn",
+        f"quarantined={len(records)};oldest={records[0]['checkpoint_id']}",
+    )
+def _hermes_finalize_rows(config: MemoryConfig) -> list[dict[str, str]]:
+    """Report the native Hermes finalize backlog beside the latest flush row.
+
+    ``health_flush-hermes`` is last-write-wins, so one session settling
+    normally used to overwrite -- and hide -- the blocked row another session
+    left behind.  These rows are deliberately separate from it: the health row
+    means "the last flush result", these mean "everything still outstanding".
+    Warn-only, because the raw checkpoints are preserved either way.
+    """
+    from .hermes_backlog import backlog_metrics
+
+    metrics = backlog_metrics(config)
+    if not metrics["available"]:
+        return [_row("hermes_finalize_retry", "not-applicable", "no-hermes-runtime-state")]
+
+    retry_total = sum(metrics[key] for key in ("scheduled", "hold", "permanent", "exhausted"))
+    rows = [_row(
+        "hermes_finalize_retry", "pass" if retry_total == 0 else "warn",
+        f"scheduled={metrics['scheduled']};hold={metrics['hold']};"
+        f"permanent={metrics['permanent']};exhausted={metrics['exhausted']}",
+    )]
+    backlog_detail = (
+        f"unresolved_sessions={metrics['unresolved_sessions']};"
+        f"stale_after_settlement={metrics['stale_after_settlement']};"
+        f"sessions_with_checkpoints={metrics['sessions_with_checkpoints']};"
+        f"settled={metrics['settled_sessions']};"
+        f"retry_tracked={metrics['retry_tracked_sessions']}"
+    )
+    if metrics["unresolved_sample"]:
+        backlog_detail += ";oldest=" + ",".join(metrics["unresolved_sample"][:3])
+    rows.append(_row(
+        "hermes_finalize_backlog",
+        "pass" if metrics["unresolved_sessions"] == 0 else "warn",
+        backlog_detail,
+    ))
+    return rows
 
 
 WIKILINK_RE = re.compile(r"(?<!!)\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
@@ -419,7 +609,38 @@ def _activation_rows(config: MemoryConfig) -> list[dict[str, str]]:
             "verified-evidence-valid" if evidence and _activation_evidence_valid(config, "hermes", evidence, None) else "unverified",
         ))
         rows.extend(_hermes_plugin_drift_rows(config))
+        rows.append(_user_surface_guard_row(config))
     return rows
+
+
+USER_SURFACE_UNITS = ("pz-hermes-dashboard", "pz-hermes-telegram")
+
+
+def _user_surface_guard_row(config: MemoryConfig, unit_dir: Path = Path("/etc/systemd/system")) -> dict[str, str]:
+    """Do the user-facing Hermes units run with the service-profile and update guards?"""
+    if config.role != "memory-engine":
+        return _row("user_surface_guards", "not-applicable", "workstation")
+    from .hermes_guards import is_service_profile_home
+    roots = config.transcript_roots.get("hermes", [])
+    profiles_dir = Path(roots[0]) / "profiles" if roots else None
+    services = sorted(
+        p.name for p in (profiles_dir.iterdir() if profiles_dir and profiles_dir.is_dir() else [])
+        if p.is_dir() and is_service_profile_home(p)
+    )
+    unguarded = []
+    for unit in USER_SURFACE_UNITS:
+        dropins = unit_dir / f"{unit}.service.d"
+        text = ""
+        if dropins.is_dir():
+            text = "".join(f.read_text(encoding="utf-8", errors="replace") for f in sorted(dropins.glob("*.conf")))
+        if "PZ_HERMES_USER_SURFACE=1" not in text:
+            unguarded.append(unit)
+    detail = f"service_profiles={','.join(services) or 'none'}"
+    if unguarded:
+        return _row("user_surface_guards", "warn", detail + f";unguarded={','.join(unguarded)}")
+    if not services:
+        return _row("user_surface_guards", "warn", detail + ";no-service-profile-marked")
+    return _row("user_surface_guards", "pass", detail + ";units-guarded")
 
 
 def _hermes_plugin_drift_rows(config: MemoryConfig) -> list[dict[str, str]]:
@@ -448,6 +669,9 @@ def _hermes_plugin_drift_rows(config: MemoryConfig) -> list[dict[str, str]]:
         global_gen_sha = sha256_file(global_gen) if global_gen.is_file() else None
     except OSError as exc:
         return [_row("hermes_plugin_drift", "fail", f"read-error:{exc}")]
+
+    if os.environ.get("PZ_MEMORY_PROFILE_POLICY"):
+        return [_row("hermes_plugin_drift", "pass", "central-source;legacy-profile-copies-not-loaded;native-evidence-separate")]
 
     profiles_dir = data_root / "profiles"
     if not profiles_dir.is_dir():
@@ -545,11 +769,12 @@ def _hook_registration_row(
     registered = isinstance(hooks, dict)
     for event in ("SessionStart", "PreCompact", "SessionEnd"):
         commands = _commands(hooks.get(event)) if registered else []
-        expected = (
-            "memory_v1.hook_runner", f"--runtime {runtime}", f"--event {event}"
-        )
+        # Accept either launcher form: scripts/pz-memory-hook (current) or the
+        # earlier `python3 -m memory_v1.hook_runner`.
+        required = (f"--runtime {runtime}", f"--event {event}")
         if not any(
-            all(marker in command for marker in expected)
+            any(m in command for m in MEMORY_MARKERS)
+            and all(marker in command for marker in required)
             and "dangerously-bypass-hook-trust" not in command
             for command in commands
         ):
@@ -605,6 +830,26 @@ def _activation_evidence_row(
         f"{runtime}_activation_smoke", "pass" if valid else "blocked",
         "verified" if valid else "missing-or-invalid",
     )
+
+
+def _event_session_keys(config: MemoryConfig, runtime: str, event: dict[str, Any]) -> set[str]:
+    """Session keys an event may be filed under.
+
+    A Hermes profile session is keyed by its SessionDB path as well as its id, so the
+    same id in two profiles cannot collide. The event carries only the owner hash of
+    that path, so match it against the runtime's own profile databases.
+    """
+    session_id = str(event["session_id"])
+    keys = {session_key(session_id)}
+    owner = (event.get("memory_scope") or {}).get("owner") if isinstance(event.get("memory_scope"), dict) else None
+    if not owner:
+        return keys
+    for root in config.transcript_roots.get(runtime, ()):
+        for database in (root / "state.db", *sorted(root.glob("profiles/*/state.db"))):
+            name = str(database)
+            if sha256_bytes(name.encode("utf-8")) == owner:
+                keys.add(sha256_bytes((name + "\0" + session_id).encode("utf-8"))[:32])
+    return keys
 
 
 def _activation_evidence_valid(
@@ -665,7 +910,7 @@ def _activation_evidence_valid(
         if (
             event_digest != value["event_sha256"]
             or event["runtime"] != runtime
-            or session_key(event["session_id"]) != value["smoke_session_key"]
+            or value["smoke_session_key"] not in _event_session_keys(config, runtime, event)
             or event.get("source_provider") != value["source_provider"]
             or not {"session_end", "session_finalize", "session_reset"}.intersection(
                 event["events_seen"]
@@ -910,13 +1155,13 @@ def _recall_rows(config: MemoryConfig) -> list[dict[str, str]]:
                 and has_authority
                 and t_res.get("items_count", 0) > 0
                 and len(results) > 0
-                and any(
-                    "operating context" in str(r.get("title", "")).lower()
-                    or "operating context" in str(r.get("source", "")).lower()
-                    for r in results
-                )
             )
-            rows.append(_row("recall_engine", "pass" if engine_pass else "fail", "operational (lexical-deterministic)" if engine_pass else "no-items-returned"))
+            # Lexical matches can come from a body; the query need not be in
+            # the title/path. Keep partial source failures visible separately.
+            if engine_pass and t_res.get("status") == "partial":
+                rows.append(_row("recall_engine", "warn", "operational-partial:invalid-source"))
+            else:
+                rows.append(_row("recall_engine", "pass" if engine_pass else "fail", "operational (lexical-deterministic)" if engine_pass else "no-items-returned"))
     except Exception as exc:
         rows.append(_row("recall_engine", "fail", f"error:{exc}"))
         return rows
@@ -1015,31 +1260,16 @@ def run_self_healing(config: MemoryConfig) -> dict[str, Any]:
                 missing_articles.append(af)
 
         if needs_index_rebuild or missing_articles:
-            rows = [
-                "# Knowledge Base Index\n\n",
-                "Living concept and connection index for Pikselzone Second Brain.\n\n",
-                "| Article | Summary | Source | Updated |\n",
-                "|---|---|---|---|\n",
-            ]
-            seen_articles = set()
-            for af in sorted(all_articles):
-                is_concept = af.parent.name == "concepts"
-                link = f"[[concepts/{af.stem}|{af.stem}]]" if is_concept else f"[[connections/{af.stem}|{af.stem}]]"
-                if link in seen_articles:
-                    continue
-                seen_articles.add(link)
-                summary_text = "Konsept özeti." if is_concept else "Bağlantı ilişkisi."
-                try:
-                    c_text = af.read_text(encoding="utf-8")
-                    m = re.search(r"## (?:Özet|İlişki Niteliği)\s*\n([^\n#]+)", c_text)
-                    if m:
-                        summary_text = m.group(1).strip()[:100].replace("|", "-")
-                except Exception:
-                    pass
-                rows.append(f"| {link} | {summary_text} | self-heal | {today_str} |\n")
-                indexed_count += 1
-
-            atomic_write(index_file, "".join(rows))
+            # One renderer, one format: the same deterministic rebuild the
+            # compiler runs after a successful promotion.  Self-heal must never
+            # invent a second index shape (that divergence is what produced the
+            # Obsidian Sync conflicts).
+            from .knowledge_index import render_index
+            rendered = render_index(vault)
+            atomic_write(index_file, rendered)
+            indexed_count = sum(
+                1 for line in rendered.splitlines() if line.startswith("| [")
+            )
             repaired_items.append("knowledge/index.md")
             actions_summary["rebuilt_knowledge_index_entries"] = indexed_count
 
