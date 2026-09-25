@@ -44,6 +44,28 @@ def access_reason(meta: dict, policy: dict) -> str | None:
     return None
 
 
+def compile_reason(scope: dict, policy: dict) -> str | None:
+    """Why an event may not feed the shared knowledge compiler, or None.
+
+    Shared and unowned-unscoped events always may. A ``project`` event may only
+    when the compiler's own policy grants that project, which is the same
+    operator decision recall honours; a concept compiled from it still cites
+    the event, so readers without the grant never see the concept either.
+    Owner-private events never may.
+
+    Without the grant path every event written since scopes were introduced
+    (2026-09-18) was either owner-private or project-visible, so the compiler
+    selected nothing and knowledge stopped growing without any error.
+    """
+    if scope.get('visibility') == 'shared':
+        return None
+    if not scope.get('owner') and scope.get('project') in (None, '', 'unscoped'):
+        return None
+    if scope.get('visibility') == 'project':
+        return access_reason(scope, policy)
+    return 'scope-excluded'
+
+
 def config_policy(config, *, project=None):
     data = dict(config.memory)
     if project:

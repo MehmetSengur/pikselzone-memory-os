@@ -19,6 +19,7 @@ from .core import (
 )
 from .events import parse_event_artifact
 from .provider import StructuredResponsesProvider
+from .memory_policy import compile_reason
 from .knowledge_promoter import (
     load_compiler_state,
     promote_knowledge_outbox,
@@ -64,7 +65,8 @@ class TerraCompiler:
 
     def compile(self, *, max_events: int = 50, max_input_chars: int = 300000) -> list[Path]:
         from .memory_policy import config_policy
-        if not config_policy(self.config)['compile']:
+        policy = config_policy(self.config)
+        if not policy['compile']:
             return []
         if self.config.role != "memory-engine" or not self.config.can_run_compiler:
             raise PolicyError("compiler-role-forbidden")
@@ -74,13 +76,13 @@ class TerraCompiler:
         with exclusive_lock(lock_path, nonblocking=True):
             state_path = self.config.state_path / "compiler" / "state.json"
             state = self._load_state(state_path)
-            candidates = self._event_candidates(state, max_events=max_events)
+            candidates = self._event_candidates(state, policy, max_events=max_events)
             if not candidates:
                 write_health(self.config.state_path, "compiler", "ok", "no-new-events")
                 return []
             knowledge_snapshot, live_baseline = self._knowledge_snapshot(max_input_chars // 2)
             events_snapshot, source_digests = self._events_snapshot(
-                candidates, max_input_chars // 2
+                candidates, max_input_chars // 2, policy
             )
             if not source_digests:
                 return []
@@ -142,7 +144,9 @@ class TerraCompiler:
             raise SchemaError("compiler-state-invalid")
         return state
 
-    def _event_candidates(self, state: dict[str, Any], *, max_events: int) -> list[Path]:
+    def _event_candidates(
+        self, state: dict[str, Any], policy: dict[str, Any], *, max_events: int
+    ) -> list[Path]:
         daily = self.config.vault_path / "daily"
         if not daily.exists():
             return []
@@ -171,7 +175,7 @@ class TerraCompiler:
                     text, _ = secure_read_text(path, root=daily, max_bytes=2*1024*1024)
                     artifact = parse_event_artifact(text)
                     scope = artifact.get('memory_scope', {'project':artifact.get('project','unscoped')})
-                    if scope.get('visibility') != 'shared' and (scope.get('owner') or scope.get('project') not in (None,'','unscoped')):
+                    if compile_reason(scope, policy):
                         continue
                     candidates.append(path)
         return sorted(candidates)[:max_events]
@@ -211,7 +215,9 @@ class TerraCompiler:
         return "".join(chunks) or "(knowledge tree empty)", baseline
 
     @staticmethod
-    def _events_snapshot(paths: list[Path], limit: int) -> tuple[str, dict[str, str]]:
+    def _events_snapshot(
+        paths: list[Path], limit: int, policy: dict[str, Any]
+    ) -> tuple[str, dict[str, str]]:
         chunks: list[str] = []
         digests: dict[str, str] = {}
         used = 0
@@ -222,7 +228,7 @@ class TerraCompiler:
             )
             artifact = parse_event_artifact(text)
             scope = artifact.get('memory_scope', {'project':artifact.get('project','unscoped')})
-            if scope and scope.get('visibility') != 'shared' and (scope.get('owner') or scope.get('project') not in (None, '', 'unscoped')):
+            if scope and compile_reason(scope, policy):
                 continue
             text, _ = redact_sensitive_text(text)
             digests[str(path)] = digest

@@ -51,8 +51,9 @@ def select_and_stage_batch(
     max_input_chars: int = 300000,
 ) -> dict[str, Any] | None:
     """Discover uningested daily events and stage an untrusted batch payload into the inbox."""
-    from .memory_policy import config_policy
-    if not config_policy(config)["compile"]:
+    from .memory_policy import compile_reason, config_policy
+    policy = config_policy(config)
+    if not policy["compile"]:
         return None
     daily_root = config.vault_path / "daily"
     if not daily_root.exists() or not daily_root.is_dir():
@@ -82,7 +83,10 @@ def select_and_stage_batch(
         logger.debug("pz-memory-promoter: zero uningested daily events found")
         return None
 
-    selected = sorted(candidates)[:500]
+    # No cut before the scope filter below: an event it refuses is never marked
+    # ingested, so a cut taken first fills up with refused events and starves
+    # every eligible one sorted after them. The loop stops at max_events.
+    selected = sorted(candidates)
     source_digests: dict[str, str] = {}
     event_chunks: list[str] = []
     used_chars = 0
@@ -94,7 +98,7 @@ def select_and_stage_batch(
         text, digest = secure_read_text(path, root=daily_root, max_bytes=2 * 1024 * 1024)
         artifact = parse_event_artifact(text)
         scope = artifact.get('memory_scope', {'project':artifact.get('project','unscoped')})
-        if scope and scope.get('visibility') != 'shared' and (scope.get('owner') or scope.get('project') not in (None, '', 'unscoped')):
+        if scope and compile_reason(scope, policy):
             continue
         text_clean, _ = redact_sensitive_text(text)
         rel_name = path.relative_to(config.vault_path).as_posix()
@@ -175,7 +179,7 @@ def select_and_stage_batch(
     os.chmod(tmp_file, 0o660)
     os.replace(tmp_file, batch_file)
 
-    logger.info("pz-memory-promoter: staged batch %s with %d events", payload["batch_id"], len(selected))
+    logger.info("pz-memory-promoter: staged batch %s with %d events", payload["batch_id"], len(source_digests))
     return payload
 
 

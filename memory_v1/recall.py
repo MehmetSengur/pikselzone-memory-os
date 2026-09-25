@@ -1245,6 +1245,201 @@ def _concept_slug_from_index_article(article: str) -> str | None:
     return m.group(1) if m else None
 
 
+ASSOCIATIVE_DAILY_ITEMS = 1
+ASSOCIATIVE_DAILY_MAX_FILES = 400
+ASSOCIATIVE_DAILY_MIN_WEIGHT = 1.2
+ASSOCIATIVE_DAILY_BULLETS = 6
+# A word is distinctive when at most this share of the notes carries it.
+ASSOCIATIVE_DAILY_DISTINCTIVE_SHARE = 0.03
+# A Turkish case ending written after an apostrophe ("n8n'den", "Hermes'e").
+# Split on the apostrophe it became a word of its own ("den") that matched
+# every note mentioning anything "-den".
+_APOSTROPHE_SUFFIX_RE = re.compile(r"(?<=[^\W_])['\u2019][^\W\d_]+")
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?:;])\s+")
+_WORD_RE = re.compile(r"[^\W_][\w./-]*")
+
+
+def _note_names(bullets: Sequence[str]) -> set[str]:
+    """Tokens a note writes as a name: backticked, digit-bearing, or
+    capitalised inside a sentence (Higgsfield, `sengur-social`, n8n).
+
+    Rare words alone were no evidence: measured against 500 real prompts, a
+    Turkish verb form such as "yapan" or "çalıştır" is as rare in the vault as a
+    product name, and a note matching one of them was injected for 85% of the
+    prompts. A note writes a subject as a name; it does not write a verb so.
+    """
+    names: set[str] = set()
+    for bullet in bullets:
+        text = _APOSTROPHE_SUFFIX_RE.sub("", bullet)
+        for span in _BACKTICK_RE.findall(text):
+            names |= _content_tokens(span)
+        for sentence in _SENTENCE_SPLIT_RE.split(_BACKTICK_RE.sub(" ", text)):
+            for index, word in enumerate(_WORD_RE.findall(sentence)):
+                if any(ch.isdigit() for ch in word) or (index and word[0].isupper()):
+                    names |= _content_tokens(word)
+    return names
+
+
+def _daily_query_words(query: str) -> list[frozenset[str]]:
+    """The query's content words, each as the set of its forms (surface, stem).
+
+    A word counts once however many of its forms a note carries. Counting
+    tokens let "proje" score twice, as "proje" and its stem "proj", and a
+    long note that merely repeated common words outranked a short one naming
+    the prompt's one rare subject.
+    """
+    words: list[frozenset[str]] = []
+    for word in _APOSTROPHE_SUFFIX_RE.sub("", query).split():
+        # A path or URL names a location, not a subject: its parts ("users",
+        # "documents", "https") matched notes that quoted any path at all.
+        # A bare number or hash is an identifier the prompt already carries.
+        if "/" in word or "\\" in word or not any(ch.isalpha() for ch in word):
+            continue
+        forms = frozenset(_content_tokens(word))
+        if forms and forms not in words:
+            words.append(forms)
+    return words
+
+
+def _daily_match(
+    words: Sequence[frozenset[str]], tokens: set[str],
+    frequencies: dict[str, int], total: int, names: set[str] = frozenset(),
+) -> tuple[float, int, bool]:
+    """Score, matched word count, and whether a distinctive name matched.
+
+    Each matched word is worth its best form's inverse document frequency,
+    squared so one rare subject outweighs several common words. A word is a
+    distinctive name when the note writes it as a name and few notes carry it.
+    """
+    ceiling = math.log((total + 1) / 2) + 1
+    distinctive_df = max(2, int(total * ASSOCIATIVE_DAILY_DISTINCTIVE_SHARE))
+    score, matched, distinctive = 0.0, 0, False
+    for forms in words:
+        present = [f for f in forms if f in tokens]
+        if not present:
+            continue
+        df = min(frequencies.get(f, 0) for f in present)
+        matched += 1
+        distinctive = distinctive or (df <= distinctive_df and bool(forms & names))
+        score += ((math.log((total + 1) / (df + 1)) + 1) / ceiling) ** 2
+    return score, matched, distinctive
+
+
+def _associative_daily_hits(
+    config: MemoryConfig,
+    query: str,
+    *,
+    limit: int = ASSOCIATIVE_DAILY_ITEMS,
+    exclude_session_id: str | None = None,
+) -> list[RecallItem]:
+    """Daily summaries that name the prompt's rare subject, best first.
+
+    A decision recorded in one project and not (yet) compiled into a concept
+    lived only in daily/, which no automatic surface read for another project:
+    this hook read concepts only and the startup tail reads the session's own
+    project only. Every note still passes the shared access gate, so what a
+    session may see is unchanged; only where it looks is wider.
+
+    Only the summary sections are matched and delivered, never
+    critical_records: those quote raw tool output, which shares common words
+    with nearly any prompt. A note must share two content words with the
+    prompt, one of them a name few notes carry, and clear a rarity-weighted
+    score.
+    """
+    daily_root = config.vault_path / "daily"
+    words = _daily_query_words(query)
+    if limit <= 0 or len(words) < MIN_ASSOCIATIVE_SHARED_TOKENS or not daily_root.is_dir():
+        return []
+    paths: list[Path] = []
+    for day_dir in sorted(daily_root.glob("20*"), reverse=True):
+        if day_dir.is_dir():
+            paths.extend(sorted((p for p in day_dir.glob("*.md") if p.is_file()), reverse=True))
+        if len(paths) >= ASSOCIATIVE_DAILY_MAX_FILES:
+            break
+
+    notes: list[tuple[str, str, dict[str, Any], list[str], set[str], list[tuple[set[str], set[str]]]]] = []
+    for path in paths[:ASSOCIATIVE_DAILY_MAX_FILES]:
+        try:
+            reject_symlink_chain(path)
+            content, digest = secure_read_text(path, root=config.vault_path, max_bytes=2 * 1024 * 1024)
+            rel_path = path.relative_to(config.vault_path).as_posix()
+            if source_reason(config, rel_path, text=content):
+                continue
+            event = parse_event_artifact(content)
+        except Exception:
+            continue
+        if exclude_session_id and event.get("session_id") == exclude_session_id:
+            continue
+        # A note is matched one section at a time. A long note touching many
+        # subjects otherwise matched every prompt by spreading the prompt's
+        # words across unrelated sections, and on the live vault one such
+        # note was the top daily hit for a third of all prompts.
+        project_tokens = _content_tokens(str(event.get("project", "")))
+        bullets: list[str] = []
+        passages: list[tuple[set[str], set[str]]] = []
+        for field in DAILY_RECALL_FIELDS:
+            section = [
+                sanitize_untrusted_memory(b)[0]
+                for b in (event["sections"].get(field) or []) if b and b != "unknown"
+            ]
+            if section:
+                bullets.extend(section)
+                passages.append((
+                    project_tokens | _content_tokens(_APOSTROPHE_SUFFIX_RE.sub("", "\n".join(section))),
+                    _note_names(section),
+                ))
+        if bullets:
+            tokens = set().union(*(passage for passage, _ in passages))
+            notes.append((rel_path, digest, event, bullets, tokens, passages))
+    if not notes:
+        return []
+
+    frequencies: dict[str, int] = {}
+    for *_, tokens, _passages in notes:
+        for term in tokens:
+            frequencies[term] = frequencies.get(term, 0) + 1
+    total = len(notes)
+    hits: list[RecallItem] = []
+    for rel_path, digest, event, bullets, tokens, passages in notes:
+        score, matched, distinctive = max(
+            _daily_match(words, passage, frequencies, total, names)
+            for passage, names in passages
+        )
+        if (
+            matched < MIN_ASSOCIATIVE_SHARED_TOKENS
+            or not distinctive
+            or score < ASSOCIATIVE_DAILY_MIN_WEIGHT
+        ):
+            continue
+        # The bullets that carry the match, kept in the note's own order.
+        bullet_scores = [
+            _daily_match(
+                words, _content_tokens(_APOSTROPHE_SUFFIX_RE.sub("", b)), frequencies, total
+            )[0]
+            for b in bullets
+        ]
+        ranked = sorted(range(len(bullets)), key=lambda i: -bullet_scores[i])
+        keep = sorted(i for i in ranked[:ASSOCIATIVE_DAILY_BULLETS] if bullet_scores[i] > 0)
+        created = str(event.get("created_at", ""))[:10]
+        hits.append(RecallItem(
+            item_id=f"assoc-daily-{Path(rel_path).stem}",
+            item_type="daily_event",
+            title=(
+                f"Daily {created} · {event.get('runtime', '')} · project: "
+                f"{event.get('project', 'unscoped')} (knowledge'a terfi etmemiş olabilir)"
+            ),
+            content="\n".join(f"- {bullets[i]}" for i in keep),
+            source_file=rel_path,
+            source_sha256=digest,
+            relevance_score=round(score, 4),
+            derived=True,
+            created_at=event.get("created_at"),
+        ))
+    hits.sort(key=lambda it: (-it.relevance_score, it.source_file))
+    return hits[:limit]
+
+
 def associative_recall_fast(
     config: MemoryConfig,
     query: str,
@@ -1252,12 +1447,15 @@ def associative_recall_fast(
     max_items: int = 3,
     min_score: float = ASSOCIATIVE_MIN_SCORE,
     budget_chars: int = ASSOCIATIVE_RECALL_BUDGET,
+    exclude_session_id: str | None = None,
 ) -> str:
     """Bounded, index-first, synchronous cross-project associative recall.
 
     Called from the UserPromptSubmit hook.  Returns the ``additionalContext``
     text to inject, or "" for no injection.  Never scans ``concepts/`` or
-    ``connections/`` wholesale, never walks the graph, never writes.
+    ``connections/`` wholesale, never walks the graph, never writes.  Reads
+    the summary sections of at most ``ASSOCIATIVE_DAILY_MAX_FILES`` recent
+    daily notes; ``exclude_session_id`` keeps the asking session's own note out.
     Read-only; failures are the caller's responsibility (fail-open).
     """
     if not config_policy(config)["recall"]:
@@ -1272,20 +1470,26 @@ def associative_recall_fast(
     ):
         return ""
 
+    # 0. Daily summaries not compiled into a concept. A hit takes one of the
+    #    `max_items` slots, so the injection never grows past its old size.
+    daily_hits = _associative_daily_hits(
+        config, query, limit=min(ASSOCIATIVE_DAILY_ITEMS, max_items),
+        exclude_session_id=exclude_session_id,
+    )
+    concept_slots = max_items - len(daily_hits)
+
     # 1. Candidate narrowing: score index.md rows only (one file).
     index_items = _load_knowledge_index_entries(config, query=query)
     scored = sorted(
         (it for it in index_items if it.relevance_score > 0),
         key=lambda it: -it.relevance_score,
     )[:5]
-    if not scored:
-        return ""
 
     # 2. Open at most `max_items` candidate concept files and re-score them.
     concepts_dir = config.vault_path / "knowledge" / "concepts"
     picked: list[RecallItem] = []
     seen: set[str] = set()
-    for it in scored:
+    for it in scored if concept_slots > 0 else ():
         slug = _concept_slug_from_index_article(it.content.split(":", 1)[0])
         if not slug or slug in seen:
             continue
@@ -1328,10 +1532,10 @@ def associative_recall_fast(
             relevance_score=score,
             derived=True,
         ))
-        if len(picked) >= max_items:
+        if len(picked) >= concept_slots:
             break
 
-    picked, _ = filter_items(config, picked)
+    picked, _ = filter_items(config, picked + daily_hits)
     if not picked:
         return ""
 
@@ -1351,7 +1555,8 @@ def associative_recall_fast(
             return ""
 
 
-    picked.sort(key=lambda it: -it.relevance_score)
+    # Concept and daily scores are on different scales; concepts lead.
+    picked.sort(key=lambda it: (it.item_type == "daily_event", -it.relevance_score))
     lines = [
         "=== PIKSELZONE ASSOCIATIVE RECALL (cross-project) ===",
         f"Schema: {ASSOCIATIVE_RECALL_SCHEMA}",
