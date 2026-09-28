@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -165,8 +166,47 @@ def _last_completed_turn(normalized: str) -> str:
     result = lines[start:]
     if not any(line.startswith("ASSISTANT: ") for line in result):
         raise SchemaError("checkpoint-turn-incomplete")
-    text = "\n".join(result).strip()
-    if len(text) > MAX_TURN_CHECKPOINT_CHARS:
+    return _fit_turn(result)
+
+
+#: Below this a tool result is dropped rather than cut to a stub.
+_MIN_TOOL_LINE_CHARS = 400
+
+
+def _fit_turn(lines: list[str], max_chars: int = MAX_TURN_CHECKPOINT_CHARS) -> str:
+    """Fit one turn under the ceiling by cutting its tool results, never its prose.
+
+    2026-09-28: a turn whose tool results passed 256 KiB was clamped from the
+    front, which dropped its own USER line; three turns of one SEO session,
+    one of them a decision, were refused as ``checkpoint-turn-incomplete``.
+    Tool results are evidence, the prompt and the answers are the turn, so the
+    largest results give way first, each keeping its head and tail.
+    """
+    text = "\n".join(lines).strip()
+    if len(text) <= max_chars:
+        return text
+    tools = sorted(
+        (index for index, line in enumerate(lines) if line.startswith("TOOL[")),
+        key=lambda index: len(lines[index]),
+    )
+    fitted = list(lines)
+    remaining = max_chars - (len(text) - sum(len(lines[i]) for i in tools))
+    for position, index in enumerate(tools):
+        share = max(remaining, 0) // (len(tools) - position)
+        line = lines[index]
+        if len(line) <= share:
+            remaining -= len(line)
+            continue
+        if share < _MIN_TOOL_LINE_CHARS:
+            fitted[index] = ""
+            continue
+        role, _, body = line.partition(": ")
+        marker = f" …[{len(body)} karakterden kısaltıldı]… "
+        keep = max(share - len(role) - 2 - len(marker), 0)
+        fitted[index] = f"{role}: {body[:keep // 2]}{marker}{body[len(body) - (keep - keep // 2):]}"
+        remaining -= len(fitted[index])
+    text = "\n".join(line for line in fitted if line).strip()
+    if len(text) > max_chars:
         raise PolicyError("checkpoint-turn-too-large")
     return text
 
@@ -185,7 +225,10 @@ def turn_segment_digests(normalized: str) -> list[str]:
         end = starts[position + 1] if position + 1 < len(starts) else len(lines)
         segment = lines[start:end]
         if any(line.startswith("ASSISTANT: ") for line in segment):
-            text = "\n".join(segment).strip()
+            try:
+                text = _fit_turn(segment)
+            except PolicyError:
+                continue
             digests.append(hashlib.sha256(text.encode("utf-8")).hexdigest())
     return digests
 
@@ -336,9 +379,16 @@ def checkpoint_hook(
     if not event_raw or not session_id or not transcript:
         raise SchemaError("checkpoint-input-missing")
     event = normalize_event_name(event_raw)
+    # A turn is cut out of the whole read and then fitted: clamping the
+    # session to the ceiling first could drop the turn's own prompt.
+    turn_window = (
+        {"max_turns": sys.maxsize, "max_chars": sys.maxsize}
+        if event == TURN_CHECKPOINT_EVENT else {}
+    )
     normalized, turn_count, digest = normalize_transcript(
         _validated_transcript_path(config, runtime, transcript),
         allowed_roots=config.transcript_roots.get(runtime, ()), include_tool_results=True,
+        **turn_window,
     )
     if turn_count == 0:
         raise SchemaError("checkpoint-transcript-empty")
