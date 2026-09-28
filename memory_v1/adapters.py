@@ -446,6 +446,40 @@ def checkpoint_hook(
     return queue_path
 
 
+#: Retries of a flush the summarizer refused as too long, each at half the size.
+_PROMPT_TOO_LONG_RETRIES = 3
+
+
+def _flush_shrinking(
+    flush: Any, transcript: NormalizedTranscript,
+) -> Path:
+    """Flush, and when the summarizer refuses the prompt as too long, retry smaller.
+
+    2026-09-28: a 256 KiB turn of dense tool output (JSON, ids, Turkish HTML)
+    passed Haiku's context, and every drain failed the same way. Characters do
+    not bound tokens, so the size is found by halving: tool results give way
+    first (``_fit_turn``), and only a transcript whose prose alone is too long
+    loses its oldest part.
+    """
+    budget = len(transcript.text)
+    for attempt in range(_PROMPT_TOO_LONG_RETRIES + 1):
+        try:
+            return flush(transcript)
+        except MemoryError as exc:
+            if "prompt-too-long" not in str(exc) or attempt == _PROMPT_TOO_LONG_RETRIES:
+                raise
+        budget //= 2
+        lines = transcript.text.splitlines()
+        try:
+            text = _fit_turn(lines, budget)
+        except PolicyError:
+            text = clamp_transcript(transcript.text, budget)
+        transcript = NormalizedTranscript.from_checkpoint(
+            text, hashlib.sha256(text.encode("utf-8")).hexdigest()
+        )
+    raise AssertionError("unreachable")
+
+
 def _hook_config_sha(config: MemoryConfig, runtime: str) -> str:
     path = (
         config.codex_hooks_path if runtime == "codex"
@@ -783,11 +817,12 @@ def _drain_locked_checkpoint(
             if digest not in processed_turn_digests:
                 processed_turn_digests.append(digest)
     active_provider = provider or create_provider(config)
-    try:
-        event_path = EventWriter(config, active_provider).flush(
+
+    def flush(transcript: NormalizedTranscript) -> Path:
+        return EventWriter(config, active_provider).flush(
             runtime=flush_value["runtime"], agent_id=flush_value["agent_id"],
             session_id=flush_value["session_id"], event=effective_event,
-            transcript=normalized_transcript,
+            transcript=transcript,
             source_model=flush_value["source_model"], root_task_id=flush_value["root_task_id"],
             kanban_ids=flush_value["kanban_ids"],
             project=flush_value.get("project"),
@@ -795,6 +830,9 @@ def _drain_locked_checkpoint(
             merge_sections=(event == TURN_CHECKPOINT_EVENT or not terminal_replaces),
             settled_turn_digests=processed_turn_digests,
         )
+
+    try:
+        event_path = _flush_shrinking(flush, normalized_transcript)
     except DuplicateEvent as exc:
         event_path = Path(str(exc))
         if (

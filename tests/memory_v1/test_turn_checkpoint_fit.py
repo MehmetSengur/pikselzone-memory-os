@@ -118,5 +118,55 @@ class LongTurnCheckpointTest(unittest.TestCase):
         self.assertIn(hashlib.sha256(text.encode("utf-8")).hexdigest(), turn_segment_digests(rendered))
 
 
+class PromptTooLongTest(unittest.TestCase):
+    """2026-09-28: a 256 KiB turn of dense tool output passed Haiku's context;
+    the CLI said so only in stdout, and every drain failed the same way."""
+
+    def test_the_claude_provider_names_an_over_long_prompt(self) -> None:
+        from types import SimpleNamespace
+        from memory_v1.core import ProviderBlocked
+        from memory_v1.provider import summarize_with_claude
+        stdout = json.dumps({"is_error": True, "terminal_reason": "prompt_too_long"})
+        runner = lambda *a, **k: SimpleNamespace(returncode=1, stdout=stdout, stderr="")
+        with self.assertRaisesRegex(ProviderBlocked, "claude-prompt-too-long"):
+            summarize_with_claude(instruction="i", untrusted_input="u", schema={}, runner=runner)
+
+    def test_a_refused_flush_is_retried_with_tool_results_shrunk(self) -> None:
+        from memory_v1.adapters import _flush_shrinking
+        from memory_v1.core import NormalizedTranscript, ProviderBlocked
+        import hashlib
+        text = "\n".join(["USER: " + _PROMPT, "TOOL[01]: " + "x" * 100_000, "ASSISTANT: Tamam."])
+        seen: list[str] = []
+
+        def flush(transcript):
+            seen.append(transcript.text)
+            if len(transcript.text) > 30_000:
+                raise ProviderBlocked("claude-prompt-too-long")
+            return Path("/ok")
+
+        first = NormalizedTranscript.from_checkpoint(text, hashlib.sha256(text.encode()).hexdigest())
+        self.assertEqual(_flush_shrinking(flush, first), Path("/ok"))
+        self.assertEqual(seen[0], text)
+        self.assertLessEqual(len(seen[-1]), 30_000)
+        self.assertTrue(seen[-1].startswith("USER: " + _PROMPT))
+        self.assertTrue(seen[-1].endswith("ASSISTANT: Tamam."))
+
+    def test_other_provider_failures_are_not_retried(self) -> None:
+        from memory_v1.adapters import _flush_shrinking
+        from memory_v1.core import NormalizedTranscript, ProviderBlocked
+        import hashlib
+        text = "USER: a\nASSISTANT: b"
+        calls = []
+
+        def flush(transcript):
+            calls.append(1)
+            raise ProviderBlocked("claude-timeout")
+
+        first = NormalizedTranscript.from_checkpoint(text, hashlib.sha256(text.encode()).hexdigest())
+        with self.assertRaisesRegex(ProviderBlocked, "claude-timeout"):
+            _flush_shrinking(flush, first)
+        self.assertEqual(len(calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
