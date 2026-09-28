@@ -180,6 +180,46 @@ class CrossProjectDailyRecallTest(_Vault):
         self.assertLessEqual(len(out), 2400)
 
 
+class DailyRecallLatencyTest(_Vault):
+    """2026-09-28: the prompt hook re-parsed every daily note on every prompt;
+    at ~330 notes it took ~2 s idle and passed Claude's 5 s hook timeout under
+    load, which discarded the hook's whole output."""
+
+    def _cfg(self):
+        return self.config(project="pikselzone-orchestrator", projects=["pikselzone-memory-os"])
+
+    def test_an_unchanged_note_is_parsed_once(self) -> None:
+        from unittest import mock
+        from memory_v1 import recall
+        first = associative_recall_fast(self._cfg(), _QUERY)
+        with mock.patch.object(recall, "_daily_note_features",
+                               side_effect=AssertionError("re-parsed")):
+            self.assertEqual(associative_recall_fast(self._cfg(), _QUERY), first)
+
+    def test_an_edited_note_is_parsed_again(self) -> None:
+        associative_recall_fast(self._cfg(), _QUERY)
+        edited = dict(_SENGUR_SOCIAL, decisions=["Higgsfield işlerinde yeni karar: Veo hattı açıldı."])
+        self.target.write_text(_event("s-social", "pikselzone-memory-os", edited), encoding="utf-8")
+        self.assertIn("Veo hattı", associative_recall_fast(self._cfg(), _QUERY))
+
+    def test_a_cached_note_still_passes_the_access_gate(self) -> None:
+        self.assertIn("codex-sengur-social", associative_recall_fast(self._cfg(), _QUERY))
+        ungranted = self.config(project="pikselzone-orchestrator")
+        self.assertNotIn("codex-sengur-social", associative_recall_fast(ungranted, _QUERY))
+
+    def test_an_overrun_scan_injects_no_daily_note(self) -> None:
+        from unittest import mock
+        from memory_v1 import recall
+        with mock.patch.object(recall, "ASSOCIATIVE_DAILY_BUDGET_SECONDS", -1):
+            self.assertNotIn("daily/", associative_recall_fast(self._cfg(), _QUERY))
+
+    def test_a_corrupt_cache_is_ignored(self) -> None:
+        cache = self.root / "state" / "recall" / "associative-daily-cache.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text("{not json", encoding="utf-8")
+        self.assertIn("codex-sengur-social", associative_recall_fast(self._cfg(), _QUERY))
+
+
 if __name__ == "__main__":
     unittest.main()
 

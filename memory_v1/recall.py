@@ -25,6 +25,7 @@ import os
 import posixpath
 import re
 import stat
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -1251,6 +1252,12 @@ ASSOCIATIVE_DAILY_MIN_WEIGHT = 1.2
 ASSOCIATIVE_DAILY_BULLETS = 6
 # A word is distinctive when at most this share of the notes carries it.
 ASSOCIATIVE_DAILY_DISTINCTIVE_SHARE = 0.03
+# The prompt hook runs under a 5 s runtime timeout that discards its output.
+# Parsing the notes is the slow part, so a note's parsed form is kept by its
+# content hash, and a scan that still overruns this budget injects nothing
+# rather than lose the whole hook's output.
+ASSOCIATIVE_DAILY_BUDGET_SECONDS = 2.0
+ASSOCIATIVE_DAILY_CACHE_VERSION = 1
 # A Turkish case ending written after an apostrophe ("n8n'den", "Hermes'e").
 # Split on the apostrophe it became a word of its own ("den") that matched
 # every note mentioning anything "-den".
@@ -1326,6 +1333,74 @@ def _daily_match(
     return score, matched, distinctive
 
 
+def _daily_note_features(content: str) -> dict[str, Any]:
+    """What matching needs from a daily note, in a JSON-storable form.
+
+    A note is matched one section at a time. A long note touching many
+    subjects otherwise matched every prompt by spreading the prompt's words
+    across unrelated sections, and on the live vault one such note was the
+    top daily hit for a third of all prompts.
+    """
+    event = parse_event_artifact(content)
+    project_tokens = _content_tokens(str(event.get("project", "")))
+    bullets: list[str] = []
+    passages: list[list[list[str]]] = []
+    for field in DAILY_RECALL_FIELDS:
+        section = [
+            sanitize_untrusted_memory(b)[0]
+            for b in (event["sections"].get(field) or []) if b and b != "unknown"
+        ]
+        if section:
+            bullets.extend(section)
+            passages.append([
+                sorted(project_tokens | _content_tokens(_APOSTROPHE_SUFFIX_RE.sub("", "\n".join(section)))),
+                sorted(_note_names(section)),
+            ])
+    return {
+        "event": {
+            key: str(event[key])
+            for key in ("session_id", "project", "runtime", "created_at")
+            if event.get(key) is not None
+        },
+        "bullets": bullets,
+        "passages": passages,
+    }
+
+
+def _daily_cache_path(config: MemoryConfig) -> Path:
+    return config.state_path / "recall" / "associative-daily-cache.json"
+
+
+def _load_daily_cache(config: MemoryConfig) -> dict[str, dict[str, Any]]:
+    """Parsed notes by content hash; empty when missing, stale or unreadable."""
+    try:
+        path = _daily_cache_path(config)
+        reject_symlink_chain(path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict) or payload.get("version") != ASSOCIATIVE_DAILY_CACHE_VERSION:
+        return {}
+    notes = payload.get("notes")
+    return notes if isinstance(notes, dict) else {}
+
+
+def _save_daily_cache(config: MemoryConfig, notes: dict[str, dict[str, Any]], *, changed: bool) -> None:
+    """Keep only the notes this scan saw, so the cache never outgrows the scan."""
+    if not changed:
+        return
+    try:
+        atomic_write(
+            _daily_cache_path(config),
+            json.dumps(
+                {"version": ASSOCIATIVE_DAILY_CACHE_VERSION, "notes": notes},
+                ensure_ascii=False, separators=(",", ":"),
+            ),
+        )
+    except Exception:
+        pass
+
+
 def _associative_daily_hits(
     config: MemoryConfig,
     query: str,
@@ -1358,40 +1433,34 @@ def _associative_daily_hits(
         if len(paths) >= ASSOCIATIVE_DAILY_MAX_FILES:
             break
 
+    deadline = time.monotonic() + ASSOCIATIVE_DAILY_BUDGET_SECONDS
+    cache = _load_daily_cache(config)
+    fresh: dict[str, dict[str, Any]] = {}
     notes: list[tuple[str, str, dict[str, Any], list[str], set[str], list[tuple[set[str], set[str]]]]] = []
     for path in paths[:ASSOCIATIVE_DAILY_MAX_FILES]:
+        if time.monotonic() > deadline:
+            _save_daily_cache(config, {**cache, **fresh}, changed=bool(fresh))
+            return []
         try:
             reject_symlink_chain(path)
             content, digest = secure_read_text(path, root=config.vault_path, max_bytes=2 * 1024 * 1024)
             rel_path = path.relative_to(config.vault_path).as_posix()
             if source_reason(config, rel_path, text=content):
                 continue
-            event = parse_event_artifact(content)
+            features = cache.get(digest)
+            if features is None:
+                features = _daily_note_features(content)
+            event, bullets = dict(features["event"]), list(features["bullets"])
+            passages = [(set(tokens), set(names)) for tokens, names in features["passages"]]
+            fresh[digest] = features
         except Exception:
             continue
         if exclude_session_id and event.get("session_id") == exclude_session_id:
             continue
-        # A note is matched one section at a time. A long note touching many
-        # subjects otherwise matched every prompt by spreading the prompt's
-        # words across unrelated sections, and on the live vault one such
-        # note was the top daily hit for a third of all prompts.
-        project_tokens = _content_tokens(str(event.get("project", "")))
-        bullets: list[str] = []
-        passages: list[tuple[set[str], set[str]]] = []
-        for field in DAILY_RECALL_FIELDS:
-            section = [
-                sanitize_untrusted_memory(b)[0]
-                for b in (event["sections"].get(field) or []) if b and b != "unknown"
-            ]
-            if section:
-                bullets.extend(section)
-                passages.append((
-                    project_tokens | _content_tokens(_APOSTROPHE_SUFFIX_RE.sub("", "\n".join(section))),
-                    _note_names(section),
-                ))
         if bullets:
             tokens = set().union(*(passage for passage, _ in passages))
             notes.append((rel_path, digest, event, bullets, tokens, passages))
+    _save_daily_cache(config, fresh, changed=fresh.keys() != cache.keys())
     if not notes:
         return []
 
