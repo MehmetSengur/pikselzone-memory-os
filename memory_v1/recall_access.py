@@ -10,7 +10,14 @@ from .memory_policy import access_reason, config_policy
 def source_meta(text: str, relative: str) -> dict:
     meta = {}
     if text.startswith('---\n'):
-        for line in text.split('---', 2)[1].splitlines():
+        # The header ends at the first line that is exactly '---', as in
+        # events.parse_event_artifact. Splitting on the first '---' anywhere
+        # stopped inside critical_records, whose JSON quotes tool output, before
+        # memory_scope was reached: the scope read as empty and a project- or
+        # owner-private event passed the gate as unscoped.
+        lines = text.splitlines()
+        end = lines.index('---', 1) if '---' in lines[1:] else len(lines)
+        for line in lines[1:end]:
             if ':' not in line:
                 continue
             k, v = line.split(':', 1)

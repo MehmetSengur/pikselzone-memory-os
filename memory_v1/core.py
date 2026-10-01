@@ -1414,6 +1414,11 @@ def transcript_turns(
             candidates_count += 1
         if role not in {"user", "assistant"}:
             continue
+        if record.get("isMeta") is True:
+            # Claude's own injected text (a loaded skill's body, a command
+            # caveat) is not something the user wrote. As a USER line it
+            # also became the turn's start and hid the prompt before it.
+            continue
         text = " ".join(_text_blocks(content))
         redacted, _ = redact_sensitive_text(text)
         flattened = re.sub(r"\s+", " ", redacted).strip()

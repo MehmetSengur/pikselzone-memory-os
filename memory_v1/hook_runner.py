@@ -194,7 +194,10 @@ def main(argv: list[str] | None = None) -> int:
             rendered = ""
             try:
                 if prompt:
-                    rendered = associative_recall_fast(config, prompt)
+                    rendered = associative_recall_fast(
+                        config, prompt,
+                        exclude_session_id=_payload_session_id(gate_payload) or None,
+                    )
             except Exception as exc:  # fail-open: a slow/broken recall never blocks the turn
                 try:
                     write_health(

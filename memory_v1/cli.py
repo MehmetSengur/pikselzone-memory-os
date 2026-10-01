@@ -129,6 +129,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+COMPILER_COMMANDS = frozenset({"compile", "stage-knowledge-batch", "promote-knowledge"})
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if os.environ.get("PZ_MEMORY_INVOKED_BY") == "memory-v1" and args.command in {"flush", "checkpoint", "drain"}:
@@ -137,7 +140,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = MemoryConfig.load(args.config)
         from .profile_integration import active_settings
-        settings = active_settings()
+        # The compiler is one system job, not a chat profile. Applying the
+        # profile of whatever HERMES_HOME it runs under replaced the operator's
+        # project grants in memory-config.json with that profile's, which are
+        # empty for the root home.
+        settings = None if args.command in COMPILER_COMMANDS else active_settings()
         if settings:
             import dataclasses
             config = dataclasses.replace(config, memory={**config.memory,

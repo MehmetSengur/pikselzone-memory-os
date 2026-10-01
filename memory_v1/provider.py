@@ -350,6 +350,14 @@ def summarize_with_claude(
         raise ProviderBlocked(f"claude-exec-error:{exc.__class__.__name__}") from None
 
     if res.returncode != 0:
+        # The CLI reports an over-long prompt only in its stdout result, with
+        # empty stderr; name it so the drain can shrink the input and retry.
+        try:
+            reason = json.loads(res.stdout).get("terminal_reason")
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            reason = None
+        if reason == "prompt_too_long":
+            raise ProviderBlocked("claude-prompt-too-long")
         raise ProviderBlocked(
             f"claude-process-failed:{res.returncode}{_stderr_hint(res.stderr)}"
         )

@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -165,8 +166,47 @@ def _last_completed_turn(normalized: str) -> str:
     result = lines[start:]
     if not any(line.startswith("ASSISTANT: ") for line in result):
         raise SchemaError("checkpoint-turn-incomplete")
-    text = "\n".join(result).strip()
-    if len(text) > MAX_TURN_CHECKPOINT_CHARS:
+    return _fit_turn(result)
+
+
+#: Below this a tool result is dropped rather than cut to a stub.
+_MIN_TOOL_LINE_CHARS = 400
+
+
+def _fit_turn(lines: list[str], max_chars: int = MAX_TURN_CHECKPOINT_CHARS) -> str:
+    """Fit one turn under the ceiling by cutting its tool results, never its prose.
+
+    2026-09-28: a turn whose tool results passed 256 KiB was clamped from the
+    front, which dropped its own USER line; three turns of one SEO session,
+    one of them a decision, were refused as ``checkpoint-turn-incomplete``.
+    Tool results are evidence, the prompt and the answers are the turn, so the
+    largest results give way first, each keeping its head and tail.
+    """
+    text = "\n".join(lines).strip()
+    if len(text) <= max_chars:
+        return text
+    tools = sorted(
+        (index for index, line in enumerate(lines) if line.startswith("TOOL[")),
+        key=lambda index: len(lines[index]),
+    )
+    fitted = list(lines)
+    remaining = max_chars - (len(text) - sum(len(lines[i]) for i in tools))
+    for position, index in enumerate(tools):
+        share = max(remaining, 0) // (len(tools) - position)
+        line = lines[index]
+        if len(line) <= share:
+            remaining -= len(line)
+            continue
+        if share < _MIN_TOOL_LINE_CHARS:
+            fitted[index] = ""
+            continue
+        role, _, body = line.partition(": ")
+        marker = f" …[{len(body)} karakterden kısaltıldı]… "
+        keep = max(share - len(role) - 2 - len(marker), 0)
+        fitted[index] = f"{role}: {body[:keep // 2]}{marker}{body[len(body) - (keep - keep // 2):]}"
+        remaining -= len(fitted[index])
+    text = "\n".join(line for line in fitted if line).strip()
+    if len(text) > max_chars:
         raise PolicyError("checkpoint-turn-too-large")
     return text
 
@@ -185,7 +225,10 @@ def turn_segment_digests(normalized: str) -> list[str]:
         end = starts[position + 1] if position + 1 < len(starts) else len(lines)
         segment = lines[start:end]
         if any(line.startswith("ASSISTANT: ") for line in segment):
-            text = "\n".join(segment).strip()
+            try:
+                text = _fit_turn(segment)
+            except PolicyError:
+                continue
             digests.append(hashlib.sha256(text.encode("utf-8")).hexdigest())
     return digests
 
@@ -336,9 +379,16 @@ def checkpoint_hook(
     if not event_raw or not session_id or not transcript:
         raise SchemaError("checkpoint-input-missing")
     event = normalize_event_name(event_raw)
+    # A turn is cut out of the whole read and then fitted: clamping the
+    # session to the ceiling first could drop the turn's own prompt.
+    turn_window = (
+        {"max_turns": sys.maxsize, "max_chars": sys.maxsize}
+        if event == TURN_CHECKPOINT_EVENT else {}
+    )
     normalized, turn_count, digest = normalize_transcript(
         _validated_transcript_path(config, runtime, transcript),
         allowed_roots=config.transcript_roots.get(runtime, ()), include_tool_results=True,
+        **turn_window,
     )
     if turn_count == 0:
         raise SchemaError("checkpoint-transcript-empty")
@@ -394,6 +444,40 @@ def checkpoint_hook(
         "hook_config_sha256": hook_cfg_sha,
     })
     return queue_path
+
+
+#: Retries of a flush the summarizer refused as too long, each at half the size.
+_PROMPT_TOO_LONG_RETRIES = 3
+
+
+def _flush_shrinking(
+    flush: Any, transcript: NormalizedTranscript,
+) -> Path:
+    """Flush, and when the summarizer refuses the prompt as too long, retry smaller.
+
+    2026-09-28: a 256 KiB turn of dense tool output (JSON, ids, Turkish HTML)
+    passed Haiku's context, and every drain failed the same way. Characters do
+    not bound tokens, so the size is found by halving: tool results give way
+    first (``_fit_turn``), and only a transcript whose prose alone is too long
+    loses its oldest part.
+    """
+    budget = len(transcript.text)
+    for attempt in range(_PROMPT_TOO_LONG_RETRIES + 1):
+        try:
+            return flush(transcript)
+        except MemoryError as exc:
+            if "prompt-too-long" not in str(exc) or attempt == _PROMPT_TOO_LONG_RETRIES:
+                raise
+        budget //= 2
+        lines = transcript.text.splitlines()
+        try:
+            text = _fit_turn(lines, budget)
+        except PolicyError:
+            text = clamp_transcript(transcript.text, budget)
+        transcript = NormalizedTranscript.from_checkpoint(
+            text, hashlib.sha256(text.encode("utf-8")).hexdigest()
+        )
+    raise AssertionError("unreachable")
 
 
 def _hook_config_sha(config: MemoryConfig, runtime: str) -> str:
@@ -733,11 +817,12 @@ def _drain_locked_checkpoint(
             if digest not in processed_turn_digests:
                 processed_turn_digests.append(digest)
     active_provider = provider or create_provider(config)
-    try:
-        event_path = EventWriter(config, active_provider).flush(
+
+    def flush(transcript: NormalizedTranscript) -> Path:
+        return EventWriter(config, active_provider).flush(
             runtime=flush_value["runtime"], agent_id=flush_value["agent_id"],
             session_id=flush_value["session_id"], event=effective_event,
-            transcript=normalized_transcript,
+            transcript=transcript,
             source_model=flush_value["source_model"], root_task_id=flush_value["root_task_id"],
             kanban_ids=flush_value["kanban_ids"],
             project=flush_value.get("project"),
@@ -745,6 +830,9 @@ def _drain_locked_checkpoint(
             merge_sections=(event == TURN_CHECKPOINT_EVENT or not terminal_replaces),
             settled_turn_digests=processed_turn_digests,
         )
+
+    try:
+        event_path = _flush_shrinking(flush, normalized_transcript)
     except DuplicateEvent as exc:
         event_path = Path(str(exc))
         if (
